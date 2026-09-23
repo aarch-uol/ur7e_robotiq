@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="robotiq_2f85_control">
+  <!-- Gripper-only description for /robotiq_controller_manager.
+       The patched robotiq_driver (patches/robotiq_driver_tcp_transport.patch)
+       connects straight to the robot's tool TCP port (tcp_host:tcp_port) and
+       reconnects by itself if the robot drops the link. The upstream macro
+       only knows COM_port/baudrate, so its ros2_control block is disabled
+       and a TCP one is written out below. -->
+  <xacro:arg name="tcp_host" default=""/>
+  <xacro:arg name="tcp_port" default="54321"/>
+  <xacro:arg name="gripper_closed_position" default="0.7929"/>
+
+  <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
+
+  <!-- This description is consumed only by the dedicated gripper
+       controller_manager. It is not published to TF. -->
+  <link name="robotiq_control_root"/>
+
+  <xacro:robotiq_gripper
+      name="robotiq_2f85"
+      prefix=""
+      parent="robotiq_control_root"
+      include_ros2_control="false">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:robotiq_gripper>
+
+  <!-- Mirrors robotiq_description's 2f_85.ros2_control.xacro real-hardware
+       branch (joint/gpio interfaces unchanged), with a <hardware> block that
+       names robotiq_driver's TCP transport instead of COM_port/baudrate. -->
+  <ros2_control name="robotiq_2f85" type="system">
+    <hardware>
+      <param name="use_dummy">false</param>
+      <plugin>robotiq_driver/RobotiqGripperHardwareInterface</plugin>
+      <param name="gripper_closed_position">$(arg gripper_closed_position)</param>
+      <param name="tcp_host">$(arg tcp_host)</param>
+      <param name="tcp_port">$(arg tcp_port)</param>
+      <param name="gripper_speed_multiplier">1.0</param>
+      <param name="gripper_force_multiplier">0.5</param>
+      <param name="gripper_max_speed">0.150</param>
+      <param name="gripper_max_force">235.0</param>
+    </hardware>
+    <joint name="robotiq_85_left_knuckle_joint">
+      <command_interface name="position"/>
+      <state_interface name="position">
+        <param name="initial_value">$(arg gripper_closed_position)</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="motor_current"/>
+      <state_interface name="object_status"/>
+      <state_interface name="gripper_fault"/>
+      <state_interface name="gripper_fault_severity"/>
+    </joint>
+    <gpio name="reactivate_gripper">
+      <command_interface name="reactivate_gripper_cmd"/>
+      <command_interface name="reactivate_gripper_response"/>
+    </gpio>
+  </ros2_control>
+</robot>

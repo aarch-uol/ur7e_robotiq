@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur7e_robotiq">
+  <!--
+    Reuse the official UR driver description, including the UR ros2_control
+    hardware interface. The arguments consumed by this file are intentionally
+    the same arguments as ur_robot_driver/urdf/ur.urdf.xacro.
+  -->
+  <xacro:include filename="$(find ur_robot_driver)/urdf/ur.urdf.xacro"/>
+
+  <!-- Visual/kinematic Robotiq model. Its ros2_control hardware is started by
+       a separate controller_manager so a gripper communication failure cannot
+       take down the UR arm controller. -->
+  <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
+
+  <!-- Attach to tool0 (ROS-I all-zeros tool frame: X+ left, Y+ up, Z+ front).
+       The 2F-85 macro models +Z as the approach direction and +X as the
+       finger-open axis, which matches tool0. Parenting to flange with identity
+       would rotate the gripper 90 degrees off (flange != tool0).
+       If a physical UR-to-Robotiq coupler plate is installed, either add its
+       thickness to xyz, or use robotiq_description's ur_to_robotiq macro. -->
+  <xacro:robotiq_gripper
+      name="robotiq_2f85"
+      prefix=""
+      parent="$(arg tf_prefix)tool0"
+      include_ros2_control="false">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:robotiq_gripper>
+</robot>

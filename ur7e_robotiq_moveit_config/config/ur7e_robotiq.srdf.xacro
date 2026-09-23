@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur7e_robotiq">
+  <!-- Arm group, named states and arm-only disable_collisions: reused as-is
+       from ur_moveit_config, which ships exactly this macro for that
+       purpose. Nothing here overrides it; the gripper content below is
+       additive. -->
+  <xacro:include filename="$(find ur_moveit_config)/srdf/ur_macro.srdf.xacro"/>
+  <xacro:ur_srdf/>
+
+  <!-- Single-joint group driving the gripper: the four mimic joints below
+       follow robotiq_85_left_knuckle_joint automatically (see passive_joint
+       tags), so the actuated DOF is exactly this one. Matches the
+       MoveIt ParallelGripperCommand controller handle, which commands one
+       named joint from the group's first (only) joint. -->
+  <group name="gripper">
+    <joint name="robotiq_85_left_knuckle_joint"/>
+  </group>
+  <end_effector name="robotiq_2f85" parent_link="tool0" group="gripper" parent_group="ur_manipulator"/>
+
+  <group_state name="open" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.0"/>
+  </group_state>
+  <group_state name="closed" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.79"/>
+  </group_state>
+
+  <!-- Arm in front of the robot (shoulder_pan 90°), gripper pointing straight
+       down. wrist_2 is 270° rather than the equivalent -90° to match how
+       this robot's wrist is usually wound, so reaching it never spins the
+       wrist a full turn. -->
+  <group_state name="ready" group="ur_manipulator">
+    <joint name="shoulder_pan_joint" value="1.5708"/>
+    <joint name="shoulder_lift_joint" value="-1.5708"/>
+    <joint name="elbow_joint" value="1.5708"/>
+    <joint name="wrist_1_joint" value="-1.5708"/>
+    <joint name="wrist_2_joint" value="4.7124"/>
+    <joint name="wrist_3_joint" value="0.0"/>
+  </group_state>
+
+  <!-- Mimic joints: not independently commanded, so not planning DOF. -->
+  <passive_joint name="robotiq_85_right_knuckle_joint"/>
+  <passive_joint name="robotiq_85_left_inner_knuckle_joint"/>
+  <passive_joint name="robotiq_85_right_inner_knuckle_joint"/>
+  <passive_joint name="robotiq_85_left_finger_tip_joint"/>
+  <passive_joint name="robotiq_85_right_finger_tip_joint"/>
+
+  <!-- Adjacent (direct URDF parent/child) pairs, from the joint tree in
+       ur7e_robotiq.urdf.xacro's rendered output. -->
+  <disable_collisions link1="tool0" link2="robotiq_85_base_link" reason="Adjacent"/>
+  <!-- tool0 is a zero-size virtual link between them, so wrist_3_link and
+       robotiq_85_base_link sit directly against each other despite not
+       being direct URDF parent/child — confirmed touching at the default
+       state by move_group's own CheckStartStateCollision. -->
+  <disable_collisions link1="wrist_3_link" link2="robotiq_85_base_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_left_knuckle_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_right_knuckle_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_left_inner_knuckle_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_right_inner_knuckle_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_left_knuckle_link" link2="robotiq_85_left_finger_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_right_knuckle_link" link2="robotiq_85_right_finger_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_left_finger_link" link2="robotiq_85_left_finger_tip_link" reason="Adjacent"/>
+  <disable_collisions link1="robotiq_85_right_finger_link" link2="robotiq_85_right_finger_tip_link" reason="Adjacent"/>
+
+  <!-- Non-adjacent pairs that are in contact (or very close) through the
+       4-bar linkage's normal range of motion. First pass by inspection, not
+       a full sampled computation — MoveIt only warns (does not fail) about
+       any self-touching pair missing from this list; re-run through
+       moveit_setup_assistant's "auto compute default collisions" to
+       tighten it if those warnings are a problem. -->
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_left_finger_link" reason="Default"/>
+  <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_right_finger_link" reason="Default"/>
+  <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_left_finger_link" reason="Default"/>
+  <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_left_finger_tip_link" reason="Default"/>
+  <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_link" reason="Default"/>
+  <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_tip_link" reason="Default"/>
+</robot>

@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ur7e_robotiq_bringup</name>
+  <version>0.2.0</version>
+  <description>ROS 2 Jazzy bringup (drivers, MoveIt, RViz) for a UR7e with a Robotiq 2F-85 on the wrist RS-485 port.</description>
+  <maintainer email="cenkcetix@gmail.com">cenk</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>parallel_gripper_controller</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>robotiq_controllers</exec_depend>
+  <exec_depend>robotiq_description</exec_depend>
+  <exec_depend>robotiq_driver</exec_depend>
+  <exec_depend>ur_calibration</exec_depend>
+  <exec_depend>ur_description</exec_depend>
+  <exec_depend>ur_robot_driver</exec_depend>
+  <exec_depend>ur7e_robotiq_moveit_config</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

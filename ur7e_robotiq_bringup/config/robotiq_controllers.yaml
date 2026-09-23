@@ -1,0 +1,44 @@
+robotiq_controller_manager:
+  ros__parameters:
+    update_rate: 500
+
+    # Don't connect at startup; drivers.launch.py activates the gripper once
+    # the robot's tool TCP port is reachable.
+    hardware_components_initial_state:
+      unconfigured:
+        - robotiq_2f85
+      shutdown_on_initial_state_failure: false
+
+    robotiq_joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    robotiq_gripper_controller:
+      type: parallel_gripper_action_controller/GripperActionController
+
+    robotiq_activation_controller:
+      type: robotiq_controllers/RobotiqActivationController
+
+    robotiq_gripper_status_broadcaster:
+      type: robotiq_controllers/GripperStatusBroadcaster
+
+robotiq_joint_state_broadcaster:
+  ros__parameters:
+    # Keep the standard root /joint_states topic so the single combined
+    # robot_state_publisher receives both UR arm and gripper joint updates.
+    use_local_topics: false
+
+robotiq_gripper_controller:
+  ros__parameters:
+    joint: robotiq_85_left_knuckle_joint
+    max_effort_interface: robotiq_85_left_knuckle_joint/set_gripper_max_effort
+    max_effort: 50.0
+    max_velocity_interface: robotiq_85_left_knuckle_joint/set_gripper_max_velocity
+    max_velocity: 0.5
+    state_interfaces: [position, velocity]
+    allow_stalling: true
+    stall_timeout: 0.05
+    goal_tolerance: 0.02
+
+robotiq_activation_controller:
+  ros__parameters:
+    default: true
