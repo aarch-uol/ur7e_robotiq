@@ -9,11 +9,11 @@
     │                    │     scaled_joint_trajectory_controller ──► arm joints
     │                    │                                                   │
     └────────────────────┼─► /robotiq_controller_manager    (gripper only)
-                         │     robotiq_gripper_controller ──► patched robotiq_driver
-                         │                                      │  TCP robot_ip:54321
+                         │     robotiq_gripper_controller ──► robotiq_driver
+                         │                                      │  /tmp/ttyUR
                          └──────────────────────────────────────┼────────────┘
                                                                 ▼
-                                             robot's RS485 URCap ─► wrist ─► 2F-85
+                                 official UR tool forwarder ─► wrist ─► 2F-85
 ```
 
 - **Two controller managers.** The arm and gripper run separately, so a gripper connection problem can never stop the arm.
@@ -22,30 +22,24 @@
 
 ## Why the Robotiq driver is patched
 
-The Robotiq driver normally opens a serial port like `/dev/ttyUSB0`. Here the gripper sits behind the robot's wrist, and the robot exposes that wire as a **TCP port (54321)**. The usual approach is a tool that turns that TCP port into a fake serial device (`/tmp/ttyUR`), but:
+The UR driver runs its supported tool-communication forwarder and creates
+`/tmp/ttyUR`. Robotiq's bundled libserialport rejects PTYs under
+`/dev/pts/*`, so `patches/robotiq_driver_pty_transport.patch` replaces only
+the serial-device opener with POSIX `open()`/termios. The Robotiq protocol,
+controllers, and SDK exchange loop remain upstream. There is no direct
+Robotiq TCP client.
 
-1. **Robotiq's serial library (`libserialport`) refuses fake serial devices** (`/dev/pts/*`). So the gripper could never connect that way.
-2. **The robot drops the TCP connection** now and then, for example while the gripper is quiet during its activation sweep. The fake-serial bridge doesn't recover when that happens.
+## Tool-port ownership
 
-`patches/robotiq_driver_tcp_transport.patch` adds one small connection type to `robotiq_driver`, **`TcpSerial`** (`src/tcp_serial.cpp`). When the `tcp_host` parameter is set, the driver uses it instead of a serial port. It:
-
-- talks to `robot_ip:54321` directly
-- waits for each full gripper reply, even when the robot forwards it in several pieces
-- **reconnects automatically** (at most every 200 ms) when the robot drops the connection
-
-Without `tcp_host` the driver behaves exactly like upstream (USB serial). The gripper protocol, controllers and topics are all upstream.
-
-The install steps clone Robotiq's repo at the exact tested commit (`8d7b841`) and apply the patch.
-
-## Why ROS doesn't configure the tool port
-
-The UR driver *can* set the tool voltage and RS-485 settings itself (`use_tool_communication`). Here it's turned **off**, and the settings come from the pendant (**Installation → Tool I/O**) instead. This way there's one place to configure it, and ROS never starts a second, competing connection to the gripper port.
+The UR driver configures 24 V, 115200 baud, no parity, one stop bit, and the
+1.5/3.5-character idle times. The Robotiq Grippers URCap must remain disabled;
+only the RS485 forwarding URCap may own the wrist serial device.
 
 ## Startup order (drivers.launch.py)
 
 1. The UR driver starts. The arm controllers load but stay **inactive** until you press **Play** on the pendant.
 2. The gripper's controller manager starts with the gripper **not connected**.
-3. `wait_for_gripper` waits until `robot_ip:54321` accepts connections **and** the gripper's controller manager has loaded the gripper.
+3. `wait_for_gripper` waits for `/tmp/ttyUR` and for the gripper controller manager to load the hardware.
 4. The gripper hardware is activated. It connects, resets and calibrates (the fingers move once).
 5. The gripper controllers start.
 
