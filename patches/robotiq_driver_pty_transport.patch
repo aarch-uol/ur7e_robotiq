@@ -1,0 +1,412 @@
+diff --git a/grippers/robotiq_driver/CMakeLists.txt b/grippers/robotiq_driver/CMakeLists.txt
+index 082f92a..38d80a7 100644
+--- a/grippers/robotiq_driver/CMakeLists.txt
++++ b/grippers/robotiq_driver/CMakeLists.txt
+@@ -58,6 +58,7 @@ add_library(
+   include/robotiq_driver/gripper_scaling.hpp
+   include/robotiq_driver/hardware_interface.hpp
+   include/robotiq_driver/hardware_parameters.hpp
++  include/robotiq_driver/posix_serial.hpp
+   include/robotiq_driver/rclcpp_logger.hpp
+   # Humble EOL: delete the next line with the header.
+   include/robotiq_driver/ros2_control_compat.hpp
+@@ -79,6 +80,7 @@ add_library(
+   include/robotiq_driver/serial_factory.hpp
+   src/hardware_interface.cpp
+   src/hardware_parameters.cpp
++  src/posix_serial.cpp
+   src/rclcpp_logger.cpp
+ )
+ target_include_directories(
+diff --git a/grippers/robotiq_driver/include/robotiq_driver/posix_serial.hpp b/grippers/robotiq_driver/include/robotiq_driver/posix_serial.hpp
+new file mode 100644
+index 0000000..704df43
+--- /dev/null
++++ b/grippers/robotiq_driver/include/robotiq_driver/posix_serial.hpp
+@@ -0,0 +1,69 @@
++// Copyright (c) 2026 Robotiq, Inc.
++//
++// Licensed under the BSD-3-Clause license; see LICENSE for details.
++
++//! \brief A Robotiq::Serial transport opened with plain POSIX open()/termios,
++//! bypassing libserialport.
++//!
++//! DefaultSerial (libserialport) refuses to open a pty: sp_get_port_by_name()
++//! rejects /dev/pts/* by device major, regardless of whether the path exists
++//! or is genuinely readable/writable — proven directly against libserialport
++//! 0.1.1 (sp_get_port_by_name succeeds on /dev/ttyS0, fails on /dev/pts/N).
++//! A pty is otherwise a perfectly ordinary POSIX character device, so plain
++//! open()/tcsetattr()/read()/write() works on it exactly as it would on a
++//! real /dev/ttyUSB0 — this class only skips libserialport's own port-name
++//! gatekeeping, not serial I/O.
++
++#pragma once
++
++#include <Robotiq/gripper/serial.hpp>
++
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace robotiq_driver {
++
++class PosixSerial : public Robotiq::Serial
++{
++public:
++   PosixSerial(std::string path, uint32_t baudrate, std::chrono::milliseconds timeout);
++   ~PosixSerial() override;
++
++   PosixSerial(const PosixSerial&) = delete;
++   PosixSerial& operator=(const PosixSerial&) = delete;
++
++   //! \throw Robotiq::SerialIOException if the path cannot be opened or
++   //! configured, or if baudrate has no POSIX termios encoding.
++   void open() override;
++   [[nodiscard]] bool isOpen() const override;
++   void close() override;
++
++   //! \throw Robotiq::SerialIOException on a device-level read failure. A
++   //! plain timeout returns fewer bytes than requested (or none), matching
++   //! Serial::read's contract — it does not throw.
++   [[nodiscard]] std::vector<uint8_t> read(size_t size, std::chrono::milliseconds timeout) override;
++
++   //! \throw Robotiq::SerialIOException on a device-level write failure or a
++   //! write that does not complete within getTimeout().
++   void write(const std::vector<uint8_t>& data) override;
++
++   [[nodiscard]] std::chrono::milliseconds getTimeout() const override;
++
++private:
++   //! Reconnect if the link has dropped and the backoff has elapsed;
++   //! swallows a failed attempt (there is always another exchange cycle to
++   //! retry on) rather than throwing. Returns isOpen() after trying.
++   bool ensureOpen();
++
++   std::string path_;
++   uint32_t baudrate_;
++   std::chrono::milliseconds timeout_;
++   int fd_ = -1;
++   std::chrono::steady_clock::time_point next_reconnect_attempt_{};
++};
++
++} // namespace robotiq_driver
++
+diff --git a/grippers/robotiq_driver/src/hardware_interface.cpp b/grippers/robotiq_driver/src/hardware_interface.cpp
+index fef270a..cbff0c4 100644
+--- a/grippers/robotiq_driver/src/hardware_interface.cpp
++++ b/grippers/robotiq_driver/src/hardware_interface.cpp
+@@ -42,9 +42,11 @@
+ 
+ #include <robotiq_driver/gripper_scaling.hpp>
+ #include <robotiq_driver/hardware_interface.hpp>
++#include <robotiq_driver/posix_serial.hpp>
+ #include <robotiq_driver/rclcpp_logger.hpp>
+ 
+ #include <Robotiq/gripper/fake/gripper_factory.hpp>
++#include <Robotiq/gripper/platform.hpp>
+ #include <Robotiq/gripper/to_string.hpp>
+ #include <Robotiq/gripper/wait.hpp>
+ 
+@@ -129,6 +131,17 @@ bool hasFinished(const std::future<Robotiq::ActivationResult>& recovery)
+ {
+    return recovery.valid() && recovery.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+ }
++
++// Mirrors the SDK's private exchangePeriodFromFrequency helper.
++std::chrono::microseconds exchangePeriodFromFrequency(double hz)
++{
++   if(hz == 0.0)
++   {
++      return std::chrono::microseconds{0};
++   }
++   const double supported = std::clamp(hz, 0.1, 1000.0);
++   return std::chrono::microseconds{std::llround(1000000.0 / supported)};
++}
+ } // namespace
+ 
+ RobotiqGripperHardwareInterface::RobotiqGripperHardwareInterface() = default;
+@@ -142,7 +155,17 @@ std::unique_ptr<Robotiq::Gripper> RobotiqGripperHardwareInterface::createGripper
+       RCLCPP_WARN(kLogger, "You are connected to a dummy driver, not a real gripper.");
+       return Robotiq::makeFakeGripper(parameters_.connection, logger_);
+    }
+-   return std::make_unique<Robotiq::Gripper>(parameters_.connection, logger_);
++   // libserialport rejects PTYs such as /tmp/ttyUR. Open the configured
++   // COM_port with POSIX termios so the official UR tool-communication
++   // forwarder can be consumed like a normal serial device.
++   RCLCPP_INFO(kLogger, "connecting to a gripper over %s", describeLink(parameters_.connection).c_str());
++   auto serial = std::make_unique<PosixSerial>(
++      parameters_.connection.serial.port, parameters_.connection.serial.baudrate, parameters_.connection.serial.timeout);
++   return std::make_unique<Robotiq::Gripper>(std::move(serial),
++                                              parameters_.connection.modbusSlaveAddress,
++                                              exchangePeriodFromFrequency(parameters_.connection.connectionFrequency),
++                                              Robotiq::makeDefaultPlatform(),
++                                              logger_);
+ }
+ 
+ hardware_interface::CallbackReturn RobotiqGripperHardwareInterface::on_init(const OnInitParams& params)
+diff --git a/grippers/robotiq_driver/src/posix_serial.cpp b/grippers/robotiq_driver/src/posix_serial.cpp
+new file mode 100644
+index 0000000..2d9e574
+--- /dev/null
++++ b/grippers/robotiq_driver/src/posix_serial.cpp
+@@ -0,0 +1,257 @@
++// Copyright (c) 2026 Robotiq, Inc.
++//
++// Licensed under the BSD-3-Clause license; see LICENSE for details.
++
++#include <robotiq_driver/posix_serial.hpp>
++
++#include <Robotiq/gripper/serial_io_exception.hpp>
++
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++
++#include <fcntl.h>
++#include <poll.h>
++#include <termios.h>
++#include <unistd.h>
++
++namespace robotiq_driver {
++namespace {
++
++// The exchange thread calls read()/write() every cycle, so a dropped link
++// needs a floor on reconnect attempts rather than hammering open().
++constexpr std::chrono::milliseconds kReconnectBackoff{200};
++
++std::string describeErrno(int code)
++{
++   return std::strerror(code);
++}
++
++// termios speed_t has no numeric constructor from an arbitrary integer baud
++// rate; only the fixed B-constants it defines. The gripper only ever ships
++// at one of the standard rates below (115200 by default), so this is a
++// closed set, not a limitation in practice.
++speed_t termiosSpeed(uint32_t baudrate)
++{
++   switch(baudrate)
++   {
++   case 1200:
++      return B1200;
++   case 2400:
++      return B2400;
++   case 4800:
++      return B4800;
++   case 9600:
++      return B9600;
++   case 19200:
++      return B19200;
++   case 38400:
++      return B38400;
++   case 57600:
++      return B57600;
++   case 115200:
++      return B115200;
++   case 230400:
++      return B230400;
++   default:
++      throw Robotiq::SerialIOException(std::to_string(baudrate)
++                                       + " bps has no POSIX termios encoding (supported: 1200-230400 in the usual "
++                                         "steps)");
++   }
++}
++
++} // namespace
++
++PosixSerial::PosixSerial(std::string path, uint32_t baudrate, std::chrono::milliseconds timeout)
++   : path_(std::move(path))
++   , baudrate_(baudrate)
++   , timeout_(timeout)
++{
++}
++
++PosixSerial::~PosixSerial()
++{
++   PosixSerial::close();
++}
++
++void PosixSerial::open()
++{
++   if(fd_ >= 0)
++   {
++      return;
++   }
++   if(path_.empty())
++   {
++      throw Robotiq::SerialIOException("Cannot open serial port: path is empty");
++   }
++
++   // O_NONBLOCK on open() only: a pty's open() would otherwise block waiting
++   // for the peer (socat's `waitslave`) to be ready. Cleared right after, so
++   // the reads/writes below block normally and are paced by poll().
++   const int fd = ::open(path_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
++   if(fd < 0)
++   {
++      throw Robotiq::SerialIOException("opening '" + path_ + "': " + describeErrno(errno));
++   }
++
++   const speed_t speed = termiosSpeed(baudrate_);
++
++   struct termios tio{};
++   if(::tcgetattr(fd, &tio) != 0)
++   {
++      const int savedErrno = errno;
++      ::close(fd);
++      throw Robotiq::SerialIOException("tcgetattr on '" + path_ + "': " + describeErrno(savedErrno));
++   }
++
++   ::cfmakeraw(&tio); // 8N1, no echo/signals/line-editing, no CR/LF translation.
++   ::cfsetispeed(&tio, speed);
++   ::cfsetospeed(&tio, speed);
++   tio.c_cflag |= CLOCAL | CREAD; // Ignore modem control lines; enable receiver.
++   // Reads below are timed with poll(), not termios VMIN/VTIME: return
++   // whatever is already buffered rather than block in read() itself.
++   tio.c_cc[VMIN] = 0;
++   tio.c_cc[VTIME] = 0;
++
++   if(::tcsetattr(fd, TCSANOW, &tio) != 0)
++   {
++      const int savedErrno = errno;
++      ::close(fd);
++      throw Robotiq::SerialIOException("tcsetattr on '" + path_ + "': " + describeErrno(savedErrno));
++   }
++
++   const int flags = ::fcntl(fd, F_GETFL, 0);
++   ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
++
++   fd_ = fd;
++}
++
++bool PosixSerial::isOpen() const
++{
++   return fd_ >= 0;
++}
++
++bool PosixSerial::ensureOpen()
++{
++   if(fd_ >= 0)
++   {
++      return true;
++   }
++   if(std::chrono::steady_clock::now() < next_reconnect_attempt_)
++   {
++      return false;
++   }
++   next_reconnect_attempt_ = std::chrono::steady_clock::now() + kReconnectBackoff;
++   try
++   {
++      open();
++   }
++   catch(const Robotiq::SerialIOException&)
++   {
++      // Swallowed: the exchange loop will retry after the backoff.
++   }
++   return fd_ >= 0;
++}
++
++void PosixSerial::close()
++{
++   if(fd_ >= 0)
++   {
++      ::close(fd_);
++      fd_ = -1;
++   }
++}
++
++std::vector<uint8_t> PosixSerial::read(size_t size, std::chrono::milliseconds timeout)
++{
++   if(!ensureOpen())
++   {
++      // Between reconnect attempts: the SDK's own timeout/retry policy
++      // already tolerates this exactly like a device that hasn't answered
++      // yet, so it needs no exception — just nothing to read this cycle.
++      return {};
++   }
++
++   struct pollfd pfd{};
++   pfd.fd = fd_;
++   pfd.events = POLLIN;
++   const int pollResult = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
++   if(pollResult == 0)
++   {
++      return {}; // Nothing arrived within the timeout — not an error.
++   }
++   if(pollResult < 0)
++   {
++      throw Robotiq::SerialIOException("polling '" + path_ + "' for read: " + describeErrno(errno));
++   }
++   if((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
++   {
++      close(); // So the next call reconnects instead of repeating this.
++      throw Robotiq::SerialIOException("'" + path_ + "' closed while waiting to read");
++   }
++
++   std::vector<uint8_t> data(size);
++   const ssize_t received = ::read(fd_, data.data(), size);
++   if(received < 0)
++   {
++      close();
++      throw Robotiq::SerialIOException("reading from '" + path_ + "': " + describeErrno(errno));
++   }
++   data.resize(static_cast<size_t>(received));
++   return data;
++}
++
++void PosixSerial::write(const std::vector<uint8_t>& data)
++{
++   if(!ensureOpen())
++   {
++      throw Robotiq::SerialIOException("write called while reconnecting");
++   }
++
++   const auto deadline = std::chrono::steady_clock::now() + timeout_;
++   size_t sent = 0;
++   while(sent < data.size())
++   {
++      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
++      if(remaining.count() <= 0)
++      {
++         throw Robotiq::SerialIOException("write timeout: wrote " + std::to_string(sent) + " of "
++                                          + std::to_string(data.size()) + " bytes");
++      }
++
++      struct pollfd pfd{};
++      pfd.fd = fd_;
++      pfd.events = POLLOUT;
++      const int pollResult = ::poll(&pfd, 1, static_cast<int>(remaining.count()));
++      if(pollResult == 0)
++      {
++         throw Robotiq::SerialIOException("write timeout: wrote " + std::to_string(sent) + " of "
++                                          + std::to_string(data.size()) + " bytes");
++      }
++      if(pollResult < 0)
++      {
++         throw Robotiq::SerialIOException("polling '" + path_ + "' for write: " + describeErrno(errno));
++      }
++      if((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
++      {
++         close();
++         throw Robotiq::SerialIOException("'" + path_ + "' closed while writing");
++      }
++
++      const ssize_t written = ::write(fd_, data.data() + sent, data.size() - sent);
++      if(written < 0)
++      {
++         close();
++         throw Robotiq::SerialIOException("writing to '" + path_ + "': " + describeErrno(errno));
++      }
++      sent += static_cast<size_t>(written);
++   }
++}
++
++std::chrono::milliseconds PosixSerial::getTimeout() const
++{
++   return timeout_;
++}
++
++} // namespace robotiq_driver
++
+
