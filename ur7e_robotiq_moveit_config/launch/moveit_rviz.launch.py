@@ -6,6 +6,10 @@ Normally started through ur7e_robotiq_bringup's moveit.launch.py.
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
 from moveit_configs_utils.launches import generate_moveit_rviz_launch
 
@@ -19,7 +23,11 @@ def generate_launch_description():
         MoveItConfigsBuilder("ur7e_robotiq", package_name="ur7e_robotiq_moveit_config")
         .robot_description(
             file_path=combined_xacro,
-            mappings={"name": "ur7e_robotiq", "ur_type": "ur7e"},
+            mappings={
+                "name": "ur7e_robotiq",
+                "ur_type": "ur7e",
+                "kinematics_params": LaunchConfiguration("kinematics_params_file"),
+            },
         )
         .robot_description_semantic(file_path="config/ur7e_robotiq.srdf.xacro")
         .robot_description_kinematics(file_path="config/kinematics.yaml")
@@ -29,4 +37,19 @@ def generate_launch_description():
         .to_moveit_configs()
     )
 
-    return generate_moveit_rviz_launch(moveit_config)
+    rviz = generate_moveit_rviz_launch(moveit_config)
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "kinematics_params_file",
+                default_value=PathJoinSubstitution(
+                    [
+                        FindPackageShare("ur7e_robotiq_bringup"),
+                        "config",
+                        "ur7e_calibration.yaml",
+                    ]
+                ),
+            ),
+            *rviz.entities,
+        ]
+    )

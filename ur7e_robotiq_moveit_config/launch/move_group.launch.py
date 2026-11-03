@@ -8,6 +8,10 @@ moveit.launch.py.
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
 from moveit_configs_utils.launches import generate_move_group_launch
 
@@ -21,12 +25,13 @@ def generate_launch_description():
         MoveItConfigsBuilder("ur7e_robotiq", package_name="ur7e_robotiq_moveit_config")
         .robot_description(
             file_path=combined_xacro,
-            # Only what actually affects geometry/kinematics: robot_ip and
-            # the tool-communication/hardware-interface args ur.urdf.xacro
-            # also takes are all in the <ros2_control> block, which
-            # move_group never reads (it loads no hardware plugins), so
-            # their defaults are fine left unset here.
-            mappings={"name": "ur7e_robotiq", "ur_type": "ur7e"},
+            # Keep MoveIt's UR kinematics identical to the driver model. The
+            # hardware-only arguments can still use their xacro defaults.
+            mappings={
+                "name": "ur7e_robotiq",
+                "ur_type": "ur7e",
+                "kinematics_params": LaunchConfiguration("kinematics_params_file"),
+            },
         )
         .robot_description_semantic(file_path="config/ur7e_robotiq.srdf.xacro")
         .robot_description_kinematics(file_path="config/kinematics.yaml")
@@ -36,4 +41,19 @@ def generate_launch_description():
         .to_moveit_configs()
     )
 
-    return generate_move_group_launch(moveit_config)
+    move_group = generate_move_group_launch(moveit_config)
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                "kinematics_params_file",
+                default_value=PathJoinSubstitution(
+                    [
+                        FindPackageShare("ur7e_robotiq_bringup"),
+                        "config",
+                        "ur7e_calibration.yaml",
+                    ]
+                ),
+            ),
+            *move_group.entities,
+        ]
+    )
