@@ -4,8 +4,8 @@ moveit.launch.py starts this plus MoveIt and RViz.
 Starts:
   * the official UR driver (arm) on /controller_manager
   * a second, gripper-only controller manager on /robotiq_controller_manager
-    that talks to the gripper through the robot's wrist RS-485 port, exposed
-    by the robot at robot_ip:tool_tcp_port.
+    that talks to the gripper through /tmp/ttyUR, created by the official UR
+    tool-communication forwarder for the wrist RS-485 port.
 
 The two are separate so a gripper link problem never takes the arm down.
 """
@@ -17,6 +17,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     RegisterEventHandler,
 )
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
@@ -35,10 +36,18 @@ def generate_launch_description():
     kinematics_params_file = LaunchConfiguration("kinematics_params_file")
     launch_rviz = LaunchConfiguration("launch_rviz")
     headless_mode = LaunchConfiguration("headless_mode")
+    tool_device_name = LaunchConfiguration("tool_device_name")
     tool_tcp_port = LaunchConfiguration("tool_tcp_port")
+    load_ft_sensor = LaunchConfiguration("load_ft_sensor")
+    ft_ip_address = LaunchConfiguration("ft_ip_address")
+    ft_sampling_rate = LaunchConfiguration("ft_sampling_rate")
+    ft_hardware_biasing = LaunchConfiguration("ft_hardware_biasing")
+    activate_joint_controller = LaunchConfiguration("activate_joint_controller")
+    ur_controllers_file = LaunchConfiguration("ur_controllers_file")
 
     pkg_share = FindPackageShare("ur7e_robotiq_bringup")
     controllers_yaml = PathJoinSubstitution([pkg_share, "config", "robotiq_controllers.yaml"])
+    ft_controllers_yaml = PathJoinSubstitution([pkg_share, "config", "ft_controllers.yaml"])
 
     ur_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -49,12 +58,19 @@ def generate_launch_description():
             "robot_ip": robot_ip,
             "description_launchfile": PathJoinSubstitution([pkg_share, "launch", "combined_rsp.launch.py"]),
             "kinematics_params_file": kinematics_params_file,
+            "controllers_file": ur_controllers_file,
             "launch_rviz": launch_rviz,
             "headless_mode": headless_mode,
-            # The tool port is configured on the pendant (Installation > Tool I/O)
-            # and the gripper driver connects to it over TCP directly, so the
-            # UR driver's own tool-communication bridge stays off.
-            "use_tool_communication": "false",
+            "activate_joint_controller": activate_joint_controller,
+            "use_tool_communication": "true",
+            "tool_device_name": tool_device_name,
+            "tool_tcp_port": tool_tcp_port,
+            "tool_voltage": "24",
+            "tool_baud_rate": "115200",
+            "tool_parity": "0",
+            "tool_stop_bits": "1",
+            "tool_rx_idle_chars": "1.5",
+            "tool_tx_idle_chars": "3.5",
         }.items(),
     )
 
@@ -64,10 +80,9 @@ def generate_launch_description():
                 PathJoinSubstitution([FindExecutable(name="xacro")]),
                 " ",
                 PathJoinSubstitution([pkg_share, "urdf", "robotiq_2f85_control.urdf.xacro"]),
-                " tcp_host:=",
-                robot_ip,
-                " tcp_port:=",
-                tool_tcp_port,
+                " com_port:=",
+                tool_device_name,
+                " baudrate:=115200",
             ]
         ),
         value_type=str,
@@ -97,10 +112,70 @@ def generate_launch_description():
         remappings=[("robot_description", "/robotiq/robot_description")],
     )
 
+    # ATI Gamma runs in its own controller manager. This keeps F/T network or
+    # sensor faults isolated from the UR arm and Robotiq controller managers.
+    # The combined robot model already contains the physical Gamma frames; this
+    # small description contains only the ros2_control sensor hardware.
+    ft_description = ParameterValue(
+        Command(
+            [
+                PathJoinSubstitution([FindExecutable(name="xacro")]),
+                " ",
+                PathJoinSubstitution([pkg_share, "urdf", "ati_gamma_control.urdf.xacro"]),
+                " ip_address:=",
+                ft_ip_address,
+                " rdt_sampling_rate:=",
+                ft_sampling_rate,
+                " use_hardware_biasing:=",
+                ft_hardware_biasing,
+            ]
+        ),
+        value_type=str,
+    )
+
+    ft_robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        namespace="ft",
+        name="robot_state_publisher",
+        output="screen",
+        parameters=[{"robot_description": ft_description}],
+        remappings=[
+            ("/tf", "/ft/discard_tf"),
+            ("/tf_static", "/ft/discard_tf_static"),
+        ],
+        condition=IfCondition(load_ft_sensor),
+    )
+
+    ft_controller_manager = Node(
+        package="controller_manager",
+        executable="ros2_control_node",
+        namespace="ft",
+        name="controller_manager",
+        output="screen",
+        parameters=[ft_controllers_yaml],
+        remappings=[("robot_description", "/ft/robot_description")],
+        condition=IfCondition(load_ft_sensor),
+    )
+
+    ft_broadcaster_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        output="screen",
+        arguments=[
+            "force_torque_sensor_broadcaster",
+            "--controller-manager",
+            "/ft/controller_manager",
+            "--controller-manager-timeout",
+            "30",
+            "--param-file",
+            ft_controllers_yaml,
+        ],
+        condition=IfCondition(load_ft_sensor),
+    )
+
     # Before activating the gripper, wait until:
-    #  1. the robot's tool port accepts connections. The first connect must
-    #     succeed (later drops reconnect automatically). The probe only opens a
-    #     socket and never sends bytes to the gripper.
+    #  1. the official UR tool-communication process has created the PTY.
     #  2. the gripper controller manager has loaded the gripper from its
     #     description. hardware_spawner exits "successfully" without doing
     #     anything if it runs before that.
@@ -109,12 +184,11 @@ def generate_launch_description():
             "bash",
             "-c",
             [
-                'echo "waiting for the tool TCP port ', robot_ip, ":", tool_tcp_port, '"',
-                "; until (exec 3<>/dev/tcp/", robot_ip, "/", tool_tcp_port,
-                ") 2>/dev/null; do sleep 0.2; done",
+                'echo "waiting for the UR tool device ', tool_device_name, '"',
+                "; until test -e ", tool_device_name, "; do sleep 0.2; done",
                 "; until ros2 control list_hardware_components -c /robotiq_controller_manager 2>/dev/null"
                 " | grep -q robotiq_2f85; do sleep 0.5; done",
-                "; echo tool port reachable and gripper loaded",
+                "; echo UR tool device ready and gripper loaded",
             ],
         ],
         name="wait_for_gripper",
@@ -154,20 +228,64 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "kinematics_params_file",
                 default_value=PathJoinSubstitution(
-                    [FindPackageShare("ur_description"), "config", "ur7e", "default_kinematics.yaml"]
+                    [
+                        FindPackageShare("ur7e_robotiq_bringup"),
+                        "config",
+                        "ur7e_calibration.yaml",
+                    ]
                 ),
                 description="Calibration YAML extracted from your robot (see docs/INSTALL.md)",
             ),
             DeclareLaunchArgument("launch_rviz", default_value="false"),
             DeclareLaunchArgument("headless_mode", default_value="false"),
             DeclareLaunchArgument(
+                "activate_joint_controller",
+                default_value="true",
+                description="Activate the UR driver's normal initial joint controller",
+            ),
+            DeclareLaunchArgument(
+                "ur_controllers_file",
+                default_value=PathJoinSubstitution(
+                    [FindPackageShare("ur_robot_driver"), "config", "ur_controllers.yaml"]
+                ),
+                description="Controller parameter file for the UR arm controller manager",
+            ),
+            DeclareLaunchArgument(
+                "tool_device_name",
+                default_value="/tmp/ttyUR",
+                description="Local PTY created by the official UR tool-communication forwarder",
+            ),
+            DeclareLaunchArgument(
                 "tool_tcp_port",
                 default_value="54321",
                 description="TCP port where the robot exposes the wrist RS-485 port",
             ),
+            DeclareLaunchArgument(
+                "load_ft_sensor",
+                default_value="true",
+                description="Start the ATI Gamma Net F/T sensor driver and broadcaster",
+            ),
+            DeclareLaunchArgument(
+                "ft_ip_address",
+                default_value="192.168.1.1",
+                description="ATI Gamma Net F/T sensor IP address",
+            ),
+            DeclareLaunchArgument(
+                "ft_sampling_rate",
+                default_value="1000",
+                description="ATI Gamma RDT sampling rate in Hz",
+            ),
+            DeclareLaunchArgument(
+                "ft_hardware_biasing",
+                default_value="false",
+                description="Use ATI hardware biasing on activation",
+            ),
             ur_driver,
             robotiq_robot_state_publisher,
             gripper_manager,
+            ft_robot_state_publisher,
+            ft_controller_manager,
+            ft_broadcaster_spawner,
             wait_for_gripper,
             RegisterEventHandler(
                 OnProcessExit(target_action=wait_for_gripper, on_exit=[gripper_hardware_spawner])

@@ -2,21 +2,29 @@
 <package format="3">
   <name>ur7e_robotiq_bringup</name>
   <version>0.2.0</version>
-  <description>ROS 2 Jazzy bringup (drivers, MoveIt, RViz) for a UR7e with a Robotiq 2F-85 on the wrist RS-485 port.</description>
+  <description>ROS 2 Jazzy bringup for a UR7e with ATI Gamma F/T sensor and Robotiq 2F-85.</description>
   <maintainer email="cenkcetix@gmail.com">cenk</maintainer>
   <license>BSD-3-Clause</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <exec_depend>control_msgs</exec_depend>
+  <exec_depend>admittance_controller</exec_depend>
+  <exec_depend>cartesian_impedance_controller</exec_depend>
   <exec_depend>controller_manager</exec_depend>
+  <exec_depend>force_torque_sensor_broadcaster</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>kinematics_interface_kdl</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>net_ft_driver</exec_depend>
   <exec_depend>parallel_gripper_controller</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>topic_sensor_bridge</exec_depend>
   <exec_depend>robotiq_controllers</exec_depend>
   <exec_depend>robotiq_description</exec_depend>
   <exec_depend>robotiq_driver</exec_depend>

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ati_gamma_control">
+  <!-- Standalone ros2_control description for the ATI Gamma Net F/T sensor.
+       The physical Gamma geometry lives in ur7e_robotiq.urdf.xacro; this model
+       is consumed only by /ft/controller_manager. -->
+  <xacro:arg name="ip_address" default="192.168.1.1"/>
+  <xacro:arg name="rdt_sampling_rate" default="1000"/>
+  <xacro:arg name="internal_filter_rate" default="0"/>
+  <xacro:arg name="use_hardware_biasing" default="false"/>
+
+  <link name="ft_driver_root"/>
+
+  <ros2_control name="NetFtHardwareInterface" type="sensor">
+    <hardware>
+      <plugin>net_ft_driver/NetFtHardwareInterface</plugin>
+      <param name="sensor_type">ati</param>
+      <param name="ip_address">$(arg ip_address)</param>
+      <param name="rdt_sampling_rate">$(arg rdt_sampling_rate)</param>
+      <param name="internal_filter_rate">$(arg internal_filter_rate)</param>
+      <param name="use_hardware_biasing">$(arg use_hardware_biasing)</param>
+    </hardware>
+
+    <sensor name="tcp_fts_sensor">
+      <state_interface name="force.x"/>
+      <state_interface name="force.y"/>
+      <state_interface name="force.z"/>
+      <state_interface name="torque.x"/>
+      <state_interface name="torque.y"/>
+      <state_interface name="torque.z"/>
+    </sensor>
+
+    <gpio name="diagnostic">
+      <state_interface name="packet_count"/>
+      <state_interface name="lost_packets"/>
+      <state_interface name="out_of_order_count"/>
+      <state_interface name="status"/>
+    </gpio>
+  </ros2_control>
+</robot>

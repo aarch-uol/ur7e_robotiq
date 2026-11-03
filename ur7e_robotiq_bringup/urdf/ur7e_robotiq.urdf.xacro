@@ -12,17 +12,196 @@
        take down the UR arm controller. -->
   <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
 
-  <!-- Attach to tool0 (ROS-I all-zeros tool frame: X+ left, Y+ up, Z+ front).
-       The 2F-85 macro models +Z as the approach direction and +X as the
-       finger-open axis, which matches tool0. Parenting to flange with identity
-       would rotate the gripper 90 degrees off (flange != tool0).
-       If a physical UR-to-Robotiq coupler plate is installed, either add its
-       thickness to xyz, or use robotiq_description's ur_to_robotiq macro. -->
+  <!--
+    Physical end-effector stack, along tool0 +Z:
+
+      tool0
+        -> 10 mm robot-side interface plate (still to be measured)
+        -> 33.3 mm ATI Gamma DAQ/NET assembly
+        -> 1 mm measured gap to the Robotiq coupling
+        -> 16.9 mm Robotiq GRP-CPL-062 coupling
+        -> Robotiq 2F-85
+
+    ATI drawing 9230-05-1329 places the sensing reference origin 0.6 mm
+    behind the tool-side interface face and defines +Z toward the tool side.
+    Robotiq specifies the 2F-85 TCP at Z=174 mm from the coupling mounting
+    reference with the coupling included.
+  -->
+  <xacro:property name="ati_robot_plate_thickness" value="0.010"/>
+  <xacro:property name="ati_gamma_height" value="0.0333"/>
+  <xacro:property name="ati_gamma_sensing_origin_z" value="0.0327"/>
+  <xacro:property name="ati_gamma_tool_face_offset" value="0.0006"/>
+  <xacro:property name="sensor_to_coupling_gap" value="0.001"/>
+  <xacro:property name="robotiq_coupling_thickness" value="0.0169"/>
+  <xacro:property name="ati_gamma_radius" value="0.0377"/>
+  <xacro:property name="robotiq_coupling_radius" value="0.0375"/>
+  <xacro:property name="robotiq_tcp_from_base" value="0.1571"/>
+
+  <!-- Robot-side plate. Link frames are placed on interface faces; geometry is
+       offset by half its thickness so the fixed-joint dimensions stay obvious. -->
+  <joint name="ati_robot_plate_joint" type="fixed">
+    <parent link="$(arg tf_prefix)tool0"/>
+    <child link="ati_robot_plate_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="ati_robot_plate_link">
+    <visual>
+      <origin xyz="0 0 ${ati_robot_plate_thickness / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${ati_gamma_radius}" length="${ati_robot_plate_thickness}"/>
+      </geometry>
+      <material name="ati_adapter_grey">
+        <color rgba="0.65 0.65 0.65 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${ati_robot_plate_thickness / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${ati_gamma_radius}" length="${ati_robot_plate_thickness}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ATI Gamma DAQ/NET assembly including its standard interface plates. -->
+  <joint name="ati_gamma_body_joint" type="fixed">
+    <parent link="ati_robot_plate_link"/>
+    <child link="ati_gamma_body_link"/>
+    <origin xyz="0 0 ${ati_robot_plate_thickness}" rpy="0 0 0"/>
+  </joint>
+  <link name="ati_gamma_body_link">
+    <visual>
+      <origin xyz="0 0 ${ati_gamma_height / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${ati_gamma_radius}" length="${ati_gamma_height}"/>
+      </geometry>
+      <material name="ati_gamma_teal">
+        <color rgba="0.10 0.45 0.45 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${ati_gamma_height / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${ati_gamma_radius}" length="${ati_gamma_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 ${ati_gamma_height / 2.0}" rpy="0 0 0"/>
+      <mass value="0.255"/>
+      <inertia ixx="0.00011568" ixy="0" ixz="0"
+               iyy="0.00011568" iyz="0" izz="0.00017930"/>
+    </inertial>
+  </link>
+
+  <!-- ATI factory sensing frame. With the mounting side toward the robot,
+       the drawing defines +Z toward the tool side. The installation assumes
+       the Gamma +X mark is aligned with tool0 +X; verify only the remaining
+       rotation about Z on the physical assembly. -->
+  <joint name="ft_fts_joint" type="fixed">
+    <parent link="ati_gamma_body_link"/>
+    <child link="ft_fts_link"/>
+    <origin xyz="0 0 ${ati_gamma_sensing_origin_z}" rpy="0 0 0"/>
+  </joint>
+  <link name="ft_fts_link"/>
+
+  <!-- The physical customer tool interface is 0.6 mm beyond ATI's sensing
+       reference origin according to drawing 9230-05-1329. -->
+  <joint name="ft_tool_mount_joint" type="fixed">
+    <parent link="ft_fts_link"/>
+    <child link="ft_tool_mount_link"/>
+    <origin xyz="0 0 ${ati_gamma_tool_face_offset}" rpy="0 0 0"/>
+  </joint>
+  <link name="ft_tool_mount_link"/>
+  <joint name="ati_sensor_alias_joint" type="fixed">
+    <parent link="ft_fts_link"/>
+    <child link="ati_sensor"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="ati_sensor"/>
+
+  <!-- Measured physical spacing between the Gamma tool face and the front
+       mounting face of the Robotiq coupling. There is no 10 mm adapter here. -->
+  <joint name="sensor_to_coupling_gap_joint" type="fixed">
+    <parent link="ft_tool_mount_link"/>
+    <child link="robotiq_coupling_mount_link"/>
+    <origin xyz="0 0 ${sensor_to_coupling_gap}" rpy="0 0 0"/>
+  </joint>
+  <link name="robotiq_coupling_mount_link"/>
+
+  <joint name="robotiq_coupling_joint" type="fixed">
+    <parent link="robotiq_coupling_mount_link"/>
+    <child link="robotiq_coupling_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="robotiq_coupling_link">
+    <visual>
+      <origin xyz="0 0 ${robotiq_coupling_thickness / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${robotiq_coupling_radius}" length="${robotiq_coupling_thickness}"/>
+      </geometry>
+      <material name="robotiq_coupling_black">
+        <color rgba="0.08 0.08 0.08 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${robotiq_coupling_thickness / 2.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${robotiq_coupling_radius}" length="${robotiq_coupling_thickness}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="robotiq_mount_joint" type="fixed">
+    <parent link="robotiq_coupling_link"/>
+    <child link="robotiq_mount_link"/>
+    <origin xyz="0 0 ${robotiq_coupling_thickness}" rpy="0 0 0"/>
+  </joint>
+  <link name="robotiq_mount_link"/>
+
+  <!-- The 2F-85 macro models +Z as its approach direction and +X as the
+       finger-closing axis, matching tool0 in this installation. -->
   <xacro:robotiq_gripper
       name="robotiq_2f85"
       prefix=""
-      parent="$(arg tf_prefix)tool0"
+      parent="robotiq_mount_link"
       include_ros2_control="false">
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </xacro:robotiq_gripper>
+
+  <!-- Robotiq specifies the 2F-85 TCP at Z=174.0 mm from the coupling
+       mounting reference, coupling included. Since GRP-CPL-062 is 16.9 mm
+       thick, the TCP is 157.1 mm beyond robotiq_85_base_link. -->
+  <joint name="robotiq_tcp_joint" type="fixed">
+    <parent link="robotiq_85_base_link"/>
+    <child link="robotiq_tcp"/>
+    <origin xyz="0 0 ${robotiq_tcp_from_base}" rpy="0 0 0"/>
+  </joint>
+  <link name="robotiq_tcp"/>
+
+  <!-- The physical Gamma is driven by the separate /ft controller manager.
+       This read-only hardware component mirrors its WrenchStamped topic into
+       the UR arm controller manager so admittance_controller can claim the
+       ATI state interfaces without colliding with the UR driver's built-in
+       tcp_fts_sensor. -->
+  <ros2_control name="TopicSensorBridge" type="sensor">
+    <hardware>
+      <plugin>topic_sensor_bridge/TopicSensorHardware</plugin>
+      <param name="sensor_name">ati_fts_sensor</param>
+      <param name="topic_name">/ft/force_torque_sensor_broadcaster/wrench</param>
+      <param name="force_bias_x">0.0</param>
+      <param name="force_bias_y">0.0</param>
+      <param name="force_bias_z">0.0</param>
+      <param name="torque_bias_x">0.0</param>
+      <param name="torque_bias_y">0.0</param>
+      <param name="torque_bias_z">0.0</param>
+      <param name="max_sample_age_sec">0.1</param>
+    </hardware>
+    <sensor name="ati_fts_sensor">
+      <state_interface name="force.x"/>
+      <state_interface name="force.y"/>
+      <state_interface name="force.z"/>
+      <state_interface name="torque.x"/>
+      <state_interface name="torque.y"/>
+      <state_interface name="torque.z"/>
+    </sensor>
+  </ros2_control>
 </robot>
