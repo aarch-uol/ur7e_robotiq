@@ -1,0 +1,10 @@
+<library path="topic_sensor_bridge">
+  <class name="topic_sensor_bridge/TopicSensorHardware"
+         type="topic_sensor_bridge::TopicSensorHardware"
+         base_class_type="hardware_interface::SensorInterface">
+    <description>
+      Hardware interface that subscribes to a WrenchStamped topic
+      and exposes force/torque as state interfaces.
+    </description>
+  </class>
+</library>
