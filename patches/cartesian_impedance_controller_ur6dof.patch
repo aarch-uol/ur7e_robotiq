@@ -1,0 +1,50 @@
+diff --git a/src/cartesian_impedance_controller.cpp b/src/cartesian_impedance_controller.cpp
+index aa9c124..6f23fac 100644
+--- a/src/cartesian_impedance_controller.cpp
++++ b/src/cartesian_impedance_controller.cpp
+@@ -274,7 +274,9 @@ Eigen::VectorXd CartesianImpedanceController::calculateCommandedTorques()
+                                              this->cartesian_damping_ * (this->jacobian_ * this->dq_));
+   // Torque for joint impedance control with respect to a desired configuration and projected in the null-space of the
+   // robot's Jacobian, so it should not affect the Cartesian motion of the robot's end-effector.
+-  tau_nullspace << (Eigen::MatrixXd::Identity(7, 7) - this->jacobian_.transpose() * jacobian_transpose_pinv) *
++  tau_nullspace <<
++      (Eigen::MatrixXd::Identity(this->n_joints_, this->n_joints_) -
++       this->jacobian_.transpose() * jacobian_transpose_pinv) *
+                        (this->nullspace_stiffness_ * (this->q_d_nullspace_ - this->q_) -
+                         this->nullspace_damping_ * this->dq_);
+   // Torque to achieve the desired external force command in the frame of the EE of the robot.
+diff --git a/src/cartesian_impedance_controller_ros.cpp b/src/cartesian_impedance_controller_ros.cpp
+index b4b50dc..14343b8 100644
+--- a/src/cartesian_impedance_controller_ros.cpp
++++ b/src/cartesian_impedance_controller_ros.cpp
+@@ -272,17 +272,25 @@ namespace cartesian_impedance_controller
+       joint_command_handles_[index] = &interface;
+     }
+ 
+-    update(rclcpp::Time(0), rclcpp::Duration(0, 0));
+-    initDesiredPose(position_, orientation_);
+-    initNullspaceConfig(q_);
+     for (size_t i = 0; i < dof_; i++)
+     {
+-      if (!joint_command_handles_[i])
++      if (!joint_command_handles_[i] || !joint_position_state_[i] || !joint_velocity_state_[i] ||
++          !joint_effort_state_[i])
+       {
+-        RCLCPP_ERROR(logger, "Command handle for joint %zu is null!", i);
++        RCLCPP_ERROR(logger, "Command or state handle for joint %zu is null!", i);
+         return CallbackReturn::ERROR;
+       }
+     }
++
++    // Initialize the impedance equilibrium from the measured robot state before
++    // the first effort command is written. Calling update() before this point
++    // computes torque relative to the default (zero) Cartesian reference and
++    // can produce a large activation transient on real torque-controlled arms.
++    read_state_from_hardware();
++    initDesiredPose(position_, orientation_);
++    initNullspaceConfig(q_);
++    tau_c_.setZero();
++    write_command_to_hardware();
+     RCLCPP_INFO(logger, "Controller activated successfully.");
+     return CallbackReturn::SUCCESS;
+   }

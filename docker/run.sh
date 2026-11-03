@@ -11,7 +11,9 @@ xhost +local:root >/dev/null 2>&1 || true
 docker run -it --rm \
   --name ur7e_robotiq \
   --net=host \
+  -e ROS_DOMAIN_ID="${UR7E_ROS_DOMAIN_ID:-42}" \
   -e DISPLAY="${DISPLAY:-:0}" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "$HOME/ur7e_data:/data" \
+  -v "$HOME/ws:/ws" \
   ur7e_robotiq:jazzy bash

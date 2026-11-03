@@ -1,0 +1,18 @@
+diff --git a/net_ft_driver/src/hardware_interface.cpp b/net_ft_driver/src/hardware_interface.cpp
+index de57d77..2975b45 100644
+--- a/net_ft_driver/src/hardware_interface.cpp
++++ b/net_ft_driver/src/hardware_interface.cpp
+@@ -107,10 +107,10 @@ NetFtHardwareInterface::on_activate(const rclcpp_lifecycle::State& /*previous_st
+         RCLCPP_FATAL(kLogger, "Couldn't zero sensor with software bias!");
+         return hardware_interface::CallbackReturn::ERROR;
+       }
+-    } else {
++    } else if (use_hardware_biasing != "false" && use_hardware_biasing != "False") {
+       if (!driver_->clear_bias()) {
+-        RCLCPP_FATAL(kLogger, "Couldn't clear sensor software bias!");
+-        return hardware_interface::CallbackReturn::ERROR;
++        RCLCPP_WARN(kLogger, "Couldn't clear sensor software bias!");
++        // return hardware_interface::CallbackReturn::ERROR; // specific fix: don't fail on this
+       }
+     }
+     std::unique_ptr<SensorData> data = driver_->receive_data();
