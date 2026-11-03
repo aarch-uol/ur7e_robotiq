@@ -1,0 +1,11 @@
+# Read by MoveIt GUI's policy preflight (the runner rejects unknown keys in its own config).
+# A real policy run is refused until `ready: true`. Set it deliberately, after measuring everything below.
+ready: false
+unavailable:
+  - F/T payload compensation (mass, CoG, static bias)
+  - F/T observation sign convention (ft_obs_scale)
+  - observation position biases (obs_position_bias_xyz*)
+  - euler_offset / tool orientation against the simulator
+  - spatula_tip in TF for the runner
+  - action/observation frame sign checks against the simulator
+  - safety limits and scraping geometry for this workcell

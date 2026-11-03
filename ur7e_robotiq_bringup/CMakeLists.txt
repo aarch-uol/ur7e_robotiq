@@ -15,6 +15,7 @@ install(FILES README.md DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/gripper.sh
   scripts/moveit_test.py
+  scripts/servo_reference_state.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

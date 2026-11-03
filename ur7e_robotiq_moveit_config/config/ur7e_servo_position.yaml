@@ -1,0 +1,37 @@
+# MoveIt Servo for Position-mode jogging in the GUI (/position_servo_node).
+# Output path: Servo -> JointTrajectory -> joint_trajectory_controller (activated by the GUI only while a jog is
+# held; MoveIt keeps using scaled_joint_trajectory_controller).
+# Why trajectories and not Float64MultiArray -> forward_position_controller (UR's config for newer MoveIt):
+# MoveIt 2.12 servo_node starts every Float64MultiArray step from the MEASURED joint state, so on the real UR,
+# which follows its commands with a lag, each step lands just ahead of where the arm already is and the arm
+# hardly moves. With JointTrajectory output Servo continues from its own commanded states (rolling window).
+# Same values as ur7e_servo.yaml (the admittance Servo, which moves the arm), except the joint and output topics.
+publish_period: 0.01
+max_expected_latency: 0.1
+command_in_type: speed_units
+scale:
+  linear: 0.4
+  rotational: 0.8
+  joint: 0.5
+command_out_type: trajectory_msgs/JointTrajectory
+publish_joint_positions: true
+publish_joint_velocities: true
+publish_joint_accelerations: false
+use_smoothing: true
+smoothing_filter_plugin_name: online_signal_smoothing::AccelerationLimitedPlugin
+is_primary_planning_scene_monitor: false
+check_octomap_collisions: false
+move_group_name: ur_manipulator
+lower_singularity_threshold: 17.0
+hard_stop_singularity_threshold: 30.0
+leaving_singularity_threshold_multiplier: 2.0
+joint_limit_margins: [0.1]
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /joint_states
+status_topic: ~/status
+command_out_topic: /joint_trajectory_controller/joint_trajectory
+check_collisions: true
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02

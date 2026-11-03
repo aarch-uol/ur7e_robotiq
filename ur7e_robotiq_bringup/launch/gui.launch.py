@@ -1,0 +1,95 @@
+"""UR7e + ATI Gamma + Robotiq bringup for MoveIt GUI: every arm mode loaded, Position active.
+
+  active    scaled_joint_trajectory_controller (the driver's default)
+  inactive  admittance_controller, admittance_trajectory_controller, cartesian_impedance_controller
+  separate  /robotiq_controller_manager, /ft/controller_manager (drivers.launch.py)
+
+MoveIt knows both trajectory controllers (moveit_controllers_gui.yaml); the GUI names the active one
+per goal, so Position <-> Admittance needs no MoveIt restart. The commissioning launches are unchanged.
+Direct torque stays off unless a real activation is requested: the impedance controller is only configured.
+"""
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    def launch_file(package, name):
+        return PythonLaunchDescriptionSource(PathJoinSubstitution([FindPackageShare(package), "launch", name]))
+
+    kinematics = {"kinematics_params_file": LaunchConfiguration("kinematics_params_file")}.items()
+    drivers = IncludeLaunchDescription(
+        launch_file("ur7e_robotiq_bringup", "drivers.launch.py"),
+        launch_arguments={
+            "robot_ip": LaunchConfiguration("robot_ip"),
+            "kinematics_params_file": LaunchConfiguration("kinematics_params_file"),
+            "headless_mode": LaunchConfiguration("headless_mode"),
+            "activate_joint_controller": "true",
+            "ur_controllers_file": PathJoinSubstitution(
+                [FindPackageShare("ur7e_robotiq_bringup"), "config", "ur_controllers_gui.yaml"]
+            ),
+            "load_ft_sensor": "true",
+            "ft_ip_address": LaunchConfiguration("ft_ip_address"),
+            "ft_sampling_rate": LaunchConfiguration("ft_sampling_rate"),
+            "ft_hardware_biasing": LaunchConfiguration("ft_hardware_biasing"),
+        }.items(),
+    )
+
+    inactive_modes = Node(
+        package="controller_manager",
+        executable="spawner",
+        output="screen",
+        arguments=[
+            "admittance_controller",
+            "admittance_trajectory_controller",
+            "cartesian_impedance_controller",
+            "--inactive",
+            "--controller-manager",
+            "/controller_manager",
+            "--controller-manager-timeout",
+            "60",
+        ],
+    )
+
+    move_group = IncludeLaunchDescription(
+        launch_file("ur7e_robotiq_moveit_config", "move_group_gui.launch.py"),
+        launch_arguments=kinematics,
+    )
+    servo = IncludeLaunchDescription(
+        launch_file("ur7e_robotiq_moveit_config", "servo.launch.py"),
+        launch_arguments=kinematics,
+        condition=IfCondition(LaunchConfiguration("servo")),
+    )
+    rviz = IncludeLaunchDescription(
+        launch_file("ur7e_robotiq_moveit_config", "moveit_rviz.launch.py"),
+        launch_arguments=kinematics,
+        condition=IfCondition(LaunchConfiguration("rviz")),
+    )
+
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument("robot_ip", description="IP address of the UR7e controller"),
+            DeclareLaunchArgument(
+                "kinematics_params_file",
+                default_value=PathJoinSubstitution(
+                    [FindPackageShare("ur7e_robotiq_bringup"), "config", "ur7e_calibration.yaml"]
+                ),
+            ),
+            DeclareLaunchArgument("headless_mode", default_value="false"),
+            DeclareLaunchArgument("ft_ip_address", default_value="192.168.1.1"),
+            DeclareLaunchArgument("ft_sampling_rate", default_value="1000"),
+            DeclareLaunchArgument("ft_hardware_biasing", default_value="false"),
+            DeclareLaunchArgument("servo", default_value="false", description="Start MoveIt Servo"),
+            DeclareLaunchArgument("rviz", default_value="false"),
+            drivers,
+            inactive_modes,
+            move_group,
+            servo,
+            rviz,
+        ]
+    )

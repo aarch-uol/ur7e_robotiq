@@ -1,0 +1,34 @@
+# MoveIt Servo for the policy servo_admittance backend (Jazzy parameter names, moveit_servo/config/*).
+# Output path: Servo -> JointTrajectory -> admittance_trajectory_controller -> admittance_controller -> UR position.
+# Servo only reaches the arm while the admittance chain is active; the JTC ignores the topic otherwise.
+# Servo computes about the move group tip (tool0), not robotiq_tcp or a tool frame. [unverified on hardware]
+# joint_topic is the JTC reference (servo_reference_state.py), not measured /joint_states: the admittance controller offsets the arm 1-2 cm from the reference, which made Servo jump at each jog start.
+publish_period: 0.01
+max_expected_latency: 0.1
+command_in_type: speed_units
+scale:
+  linear: 0.4
+  rotational: 0.8
+  joint: 0.5
+command_out_type: trajectory_msgs/JointTrajectory
+publish_joint_positions: true
+publish_joint_velocities: true
+publish_joint_accelerations: false
+use_smoothing: true
+smoothing_filter_plugin_name: online_signal_smoothing::AccelerationLimitedPlugin
+is_primary_planning_scene_monitor: false
+check_octomap_collisions: false
+move_group_name: ur_manipulator
+lower_singularity_threshold: 17.0
+hard_stop_singularity_threshold: 30.0
+leaving_singularity_threshold_multiplier: 2.0
+joint_limit_margins: [0.1]
+cartesian_command_in_topic: ~/delta_twist_cmds
+joint_command_in_topic: ~/delta_joint_cmds
+joint_topic: /servo_reference_state/joint_states
+status_topic: ~/status
+command_out_topic: /admittance_trajectory_controller/joint_trajectory
+check_collisions: true
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02

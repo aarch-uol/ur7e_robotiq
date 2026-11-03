@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Republish /joint_states with the admittance JTC's commanded reference as arm positions.
+
+The admittance controller displaces the real arm from the JTC reference by (residual force / stiffness),
+easily 1-2 cm. MoveIt Servo takes its start state from ``joint_topic`` (measured /joint_states) whenever a
+new command burst starts, so its first output would jump the JTC reference by that offset and the arm
+jumps at every jog start. Feeding Servo this topic (reference instead of measured arm positions) makes the
+first trajectory point start exactly at the current reference.
+
+If no reference arrived within ``max_reference_age`` (JTC inactive, e.g. Position mode) or a message has
+no joint in the reference (gripper-only), the measured message is passed through unchanged.
+"""
+
+import copy
+
+import rclpy
+from control_msgs.msg import JointTrajectoryControllerState
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import JointState
+
+
+class ServoReferenceState(Node):
+    def __init__(self):
+        super().__init__("servo_reference_state")
+        self.declare_parameter("max_reference_age", 0.05)
+        self.declare_parameter("output_topic", "~/joint_states")
+        self.declare_parameter("controller_state_topic", "/admittance_trajectory_controller/controller_state")
+        self._ref = {}  # joint name -> (position, velocity or None)
+        self._ref_time = None
+        self._pub = self.create_publisher(JointState, self.get_parameter("output_topic").value, 10)
+        # Reliable subscription: matches JTC's default (reliable) publisher; a best-effort one would also match.
+        self.create_subscription(
+            JointTrajectoryControllerState,
+            self.get_parameter("controller_state_topic").value,
+            self._on_state,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE),
+        )
+        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
+
+    def _on_state(self, msg):
+        pos, vel = msg.reference.positions, msg.reference.velocities
+        self._ref = {
+            n: (pos[i], vel[i] if i < len(vel) else None)
+            for i, n in enumerate(msg.joint_names)
+            if i < len(pos)
+        }
+        self._ref_time = self.get_clock().now()
+
+    def _on_joint_states(self, msg):
+        out = copy.deepcopy(msg)
+        age_limit = self.get_parameter("max_reference_age").value
+        if self._ref_time is not None and (self.get_clock().now() - self._ref_time).nanoseconds * 1e-9 < age_limit:
+            for i, name in enumerate(out.name):
+                ref = self._ref.get(name)
+                if ref is None or i >= len(out.position):
+                    continue
+                out.position[i] = ref[0]
+                if ref[1] is not None and i < len(out.velocity):
+                    out.velocity[i] = ref[1]
+        self._pub.publish(out)
+
+
+def main():
+    rclpy.init()
+    node = ServoReferenceState()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

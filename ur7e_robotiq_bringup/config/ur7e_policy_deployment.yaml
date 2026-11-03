@@ -1,0 +1,39 @@
+version: 1
+description: "UR7e deployment config for mujoco_multiagent_rl.policy_runner. NOT COMMISSIONED: see ur7e_policy_deployment.commissioning.yaml."
+
+# Frames and topics come from ur7e_robotiq. No numbers from the other robot are copied: F/T compensation, mass, CoG,
+# position biases, sign conventions and scraping geometry are left out or neutral until measured on
+# this robot. The neutral values below disable behaviour; they are not measurements.
+topics:
+  controller_state: /cartesian_impedance_controller/controller_state
+  controller_state_fallback: /cartesian_impedance_controller/controller_state
+  ft_wrench: /ft/force_torque_sensor_broadcaster/wrench
+  clusters: /scraping_vision/world_midpoints
+  wrench_command: /cartesian_impedance_controller/set_cartesian_wrench
+  reference_pose: /cartesian_impedance_controller/reference_pose
+  status: /policy_runner/status
+  ft_compensated: /policy_runner/ft_compensated_wrench
+  wrench_frame_id: robotiq_tcp
+
+policy:
+  robot_controller: servo_admittance
+
+servo_admittance:
+  twist_topic: /servo_node/delta_twist_cmds
+  wrench_topic: /admittance_controller/wrench_reference
+  base_frame: base_link
+  # The policy's operational TCP. spatula_tip is a GUI virtual TCP today and is NOT in TF, so the runner cannot
+  # look it up yet: the GUI preflight fails until the frame is published or added to the robot description.
+  ee_frame: spatula_tip
+  wrench_frame_id: ft_fts_link
+  require_servo: true
+  auto_setup_servo: true
+
+sensors:
+  # Payload not measured for the Robotiq + tool. Run SETUP > F/T + Payload, review, then apply by hand.
+  ft_compensation_enabled: false
+  ft_compensation_sensor_frame: ft_fts_link
+  ft_compensation_gravity_frame: base_link
+
+recording:
+  output_root: null
