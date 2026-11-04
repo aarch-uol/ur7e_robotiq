@@ -1,0 +1,33 @@
+# Design only: not built yet. A thin action server around the existing runner in ~/franka_ros2
+# (my_robot_policy). Inference, the force startup baseline and recording stay in the runner.
+# moveit_gui.policy_action mirrors these fields; PolicyExecutor is the only GUI client.
+
+# Goal
+string policy               # manifest name
+string backend              # impedance | servo_admittance (the runner's --robot-controller)
+float64 duration            # seconds; 0 = runner default
+string robot_config         # the runner's --robot-config
+int8 record_obs             # -1 keep config, 0 off, 1 on (--record-obs / --no-record-obs)
+int8 record_video           # -1 keep config, 0 off, 1 on (--record-video / --no-record-video)
+float64 video_fps           # 0 = keep config (--video-fps)
+string output_root          # empty = keep config (--output-root)
+---
+# Result
+bool success
+string stop_reason
+string log_dir
+---
+# Feedback (no raw observations)
+string state                # preparing | baseline | ready | running | stopping
+float64 elapsed
+uint32 step
+float64[] action
+float64[6] wrench           # measured
+float64[6] compensated_wrench
+uint32 baseline_count       # force startup baseline, median over bias_collection_samples
+uint32 baseline_total
+bool pose_fresh
+bool observation_ok
+bool normalizer_ok
+string message
+string active_backend

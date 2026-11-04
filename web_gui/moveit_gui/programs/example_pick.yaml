@@ -1,0 +1,20 @@
+# Example program (schema v2). Every pose names its reference frame and TCP.
+# Positions in metres, quaternions xyzw. Check every pose in RViz / URSim first.
+version: 2
+name: example_pick
+robot: ur7e_lab
+waypoints:
+  above_pick:
+    pose: {frame: base_link, tcp: robotiq_tcp, position: [0.40, 0.00, 0.30], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+  pick:
+    pose: {frame: base_link, tcp: robotiq_tcp, position: [0.40, 0.00, 0.20], quat_xyzw: [1.0, 0.0, 0.0, 0.0]}
+steps:
+  - {type: controller, mode: position}
+  - {type: movej, target: ready, velocity: 0.2}
+  - {type: gripper, command: open}
+  - {type: move_pose, target: above_pick, velocity: 0.1}
+  - {type: move_pose, target: pick, cartesian: true, velocity: 0.05}
+  - {type: gripper, command: close, effort: 40}
+  - {type: wait, seconds: 0.5}
+  - {type: move_pose, target: above_pick, cartesian: true, velocity: 0.05}
+  - {type: movej, target: home, velocity: 0.2}

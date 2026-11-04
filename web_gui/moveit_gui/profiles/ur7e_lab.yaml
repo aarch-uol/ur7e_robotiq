@@ -1,0 +1,341 @@
+# Robot profile for the lab UR7e + Robotiq 2F-85 + ATI Gamma.
+#
+# A profile describes hardware/software TOPOLOGY only. User calibration
+# (virtual TCPs, fixtures, vision baselines) lives in the writable store
+# ~/.config/moveit_gui/calibrations/<profile name>.yaml, never here.
+#
+# Checked against the local sources on 2026-11-02 (~/ur7e_robotiq, ~/franka_ros2, Jazzy packages):
+#   [repo]   = read from ur7e_robotiq files
+#   [driver] = read from the installed ur_robot_driver / ur_controllers
+#   [hw]     = correct by source, still to be confirmed on the robot
+# Live checks: ros2 control list_controllers, ros2 action list -t, ros2 service list.
+
+name: ur7e_lab
+display_name: UR7e Lab
+ur_type: ur7e
+robot_ip: 10.6.203.101
+
+# Arm joints in the order the GUI shows and stores them.
+# /joint_states is always read BY NAME, never by index.
+joint_names:
+  - shoulder_pan_joint
+  - shoulder_lift_joint
+  - elbow_joint
+  - wrist_1_joint
+  - wrist_2_joint
+  - wrist_3_joint
+joint_prefix: ""
+
+moveit:
+  group: ur_manipulator          # [repo] SRDF
+  base_link: base_link           # [repo] reference frame of all base poses
+  planning_link: tool0           # [driver] link MoveIt plans for (group tip). NOT the TCP.
+  use_move_group_action: true
+  default_velocity_scaling: 0.1
+  default_acceleration_scaling: 0.1
+  planning_timeout_s: 60.0
+
+# Operational TCPs that exist as links in the robot description.
+# User-calibrated virtual TCPs (spatula, probe, ...) are added in the GUI and
+# stored in the calibration file. A virtual TCP changes pose semantics only:
+# it does NOT change MoveIt collision geometry.
+#   moveit_target: true  -> pose goals are sent for this link directly.
+#   moveit_target: false -> the GUI converts the goal to planning_link via TF
+#                           (always correct as long as TF is correct).
+tcps:
+  default: robotiq_tcp
+  model_links:
+    tool0:       {link: tool0, moveit_target: true}
+    robotiq_tcp: {link: robotiq_tcp, moveit_target: false}   # [repo] 157.1 mm past robotiq_85_base_link
+
+# Extra TF frames programs may reference besides base_link, fixtures and vision objects.
+tf_frames: [base, world, tool0, robotiq_tcp]
+
+state:
+  joint_state_timeout_s: 0.5      # older joint state = stale = mode switches refused
+  tf_timeout_s: 0.5               # non-static external frames older than this = stale
+
+topics:
+  joint_states: /joint_states
+  wrench: /ft/force_torque_sensor_broadcaster/wrench      # [repo] ATI Gamma on /ft/controller_manager, frame ft_fts_link
+  robot_mode: /io_and_status_controller/robot_mode         # [driver]
+  safety_mode: /io_and_status_controller/safety_mode       # [driver]
+  program_running: /io_and_status_controller/robot_program_running   # [driver]
+  speed_scaling: /speed_scaling_state_broadcaster/speed_scaling      # [driver]
+
+services:
+  dashboard_ns: /dashboard_client                          # [driver]
+  io_and_status_ns: /io_and_status_controller              # [driver]
+  controller_manager: /controller_manager                  # [driver] arm controller manager
+
+# Arm control stack. A mode is NOT just a controller preset: it fixes the hardware
+# command interface the controllers claim and the kind of command source it takes.
+#   command_interface  position | velocity | effort   (what the arm controllers claim on the UR)
+#   command_source     trajectory (FollowJointTrajectory, i.e. MoveIt) | cartesian_reference | manual
+#   moveit_controller  the FollowJointTrajectory controller MoveIt must target in this mode
+#   direct_torque      crossing into/out of this mode crosses the direct-torque boundary
+# Live switching (transactional, see control_modes.py) needs every mode's controllers LOADED in one
+# controller manager: start ur7e_robotiq_bringup gui.launch.py. The commissioning launches
+# (moveit, admittance, cartesian_impedance) load only their own mode, so with those a switch
+# reports "controller(s) not loaded".
+control_modes:
+  default: position
+  modes:
+    position:
+      label: Position
+      activate: [scaled_joint_trajectory_controller]                   # [repo]
+      command_interface: position
+      command_source: trajectory
+      moveit_controller: scaled_joint_trajectory_controller
+      supports_moveit: true
+    # Transient internal mode used only while Continuous Servo is held. It is
+    # hidden from the mode selector and is always restored to Position on release.
+    servo_position:
+      label: Servo Position
+      activate: [joint_trajectory_controller]       # [repo] Servo JointTrajectory output (ur7e_servo_position.yaml)
+      command_interface: position
+      command_source: servo
+      supports_moveit: false
+      hidden: true
+    admittance:
+      label: Admittance
+      # chained: admittance_trajectory_controller -> (exported position references) -> admittance_controller
+      activate: [admittance_controller, admittance_trajectory_controller]   # [repo] one request
+      chain: [admittance_trajectory_controller, admittance_controller]      # upstream -> downstream
+      command_interface: position
+      command_source: trajectory
+      moveit_controller: admittance_trajectory_controller
+      supports_moveit: true
+      # Every move starts at the trajectory controller's reference, not the measured joints: an applied force
+      # pushes the arm off its reference, and a move from the measured joints would double that push.
+      reference_start: {state_topic: /admittance_trajectory_controller/controller_state, max_shift_rad: 0.0873}
+      requires_ft: true          # refuse to enter without live ATI data
+      # The ATI reaches the admittance controller through this ros2_control sensor (topic_sensor_bridge). It
+      # stops itself when samples are > 0.1 s old; entering Admittance re-activates it once data is fresh.
+      hardware: [TopicSensorBridge]
+      note: "X-only compliance (selected_axes) with gravity compensation at zero until the payload is measured"   # [repo]
+      # OPERATE > Force. ~/wrench_reference is added to the measured F/T: only in the sensor frame (the
+      # controller drops other frames), about the sensor origin. params_node: selected_axes are read from it.
+      wrench:
+        topic: /admittance_controller/wrench_reference                   # [ros2_controllers 4.42]
+        frame: ft_fts_link                                                # [repo] ft_sensor.frame.id
+        point: ft_fts_link
+        params_node: /admittance_controller
+    impedance:
+      label: Impedance
+      activate: [cartesian_impedance_controller]                       # [repo]
+      command_interface: effort  # DIRECT TORQUE
+      command_source: cartesian_reference   # reference pose (+ optional wrench), NOT MoveIt trajectories
+      direct_torque: true
+      supports_moveit: false
+      experimental: true         # strict preflight: robot RUNNING, safety NORMAL, External Control running
+      requires_ft: false
+      # The patched controller sets its reference from the measured pose in on_activate, before the first
+      # torque (patches/cartesian_impedance_controller_ur6dof.patch). The GUI confirms that from
+      # controller_state and rolls back if it does not hold. It never publishes a reference itself.
+      reference_check:
+        state_topic: /cartesian_impedance_controller/controller_state
+        reference_topic: /cartesian_impedance_controller/reference_pose
+        max_position_error_m: 0.002
+        max_orientation_error_rad: 0.02
+        timeout_s: 1.0
+      # Enabled by the lab: torque control is allowed on this UR7e. Every switch still runs the strict
+      # preflight (RUNNING, NORMAL, External Control), the interface ownership check and the reference check,
+      # and rolls back to the previous mode on failure. Set false to lock the mode out again.
+      allow_activation: true
+      # OPERATE > Force: tau = J^T F at end_effector (robotiq_tcp), F in the controller's root frame (world).
+      # Sent in the root frame: for other frames the controller's transform also translates the force vector.
+      wrench:
+        topic: /cartesian_impedance_controller/set_cartesian_wrench      # [controller source]
+        frame: world                                                      # [log] "Root frame is 'world'"
+        point: robotiq_tcp                                                # [repo] end_effector
+      disabled_reason: "direct torque locked out in this profile (profile: allow_activation)"
+    freedrive:
+      label: Freedrive
+      activate: [freedrive_mode_controller]                            # [driver] spawned inactive by ur_control.launch.py
+      command_interface: none    # robot-side freedrive, no joint commands from ROS
+      command_source: manual
+      supports_moveit: false
+      hidden: true
+  managed:
+    - scaled_joint_trajectory_controller
+    - admittance_controller
+    - admittance_trajectory_controller
+    - cartesian_impedance_controller
+    - freedrive_mode_controller
+    - forward_velocity_controller
+    - forward_position_controller
+    - joint_trajectory_controller
+  stationary_joint_velocity: 0.01
+
+freedrive:
+  enable_topic: /freedrive_mode_controller/enable_freedrive_mode   # [driver]
+  keepalive_hz: 10.0
+
+# The gripper runs on its OWN controller manager, independent of the arm's control mode.
+gripper:
+  enabled: true
+  model: Robotiq 2F-85
+  controller_manager: /robotiq_controller_manager       # [repo] robotiq_controllers.yaml
+  controller: robotiq_gripper_controller                # [repo]
+  action_type: parallel_gripper                         # [repo] control_msgs/action/ParallelGripperCommand
+  action: /robotiq_gripper_controller/gripper_cmd       # [repo] gripper.sh
+  joint_name: robotiq_85_left_knuckle_joint             # [repo]
+  open_position: 0.0                                    # [repo] gripper.sh, SRDF "open"
+  closed_position: 0.79                                 # [repo] gripper.sh, SRDF "closed"
+  max_effort: 40.0                                      # [repo] gripper.sh default, MoveIt config (controller limit 50)
+  effort_limit: 50.0                                    # [repo] controller limit: the GUI refuses more
+  # std_srvs/Trigger from robotiq_activation_controller (robotiq_controllers source). [hw]
+  reactivate_service: /robotiq_activation_controller/reactivate_gripper
+  # Reconnect gripper (OPERATE): what the launch brings up on the gripper controller manager, redone when the
+  # stack started while the robot was powered off (no tool power -> the hardware failed to configure). [repo]
+  hardware: robotiq_2f85
+  controllers: [robotiq_joint_state_broadcaster, robotiq_gripper_controller, robotiq_activation_controller,
+                robotiq_gripper_status_broadcaster]
+  params_file: /opt/ur7e_ws/install/ur7e_robotiq_bringup/share/ur7e_robotiq_bringup/config/robotiq_controllers.yaml
+  # robotiq_msgs/GripperStatus: object detection, motor current, fault (robotiq_gripper_status_broadcaster). [repo]
+  status_topic: /robotiq_gripper_status_broadcaster/status
+
+# MoveIt Servo. gui.launch.py servo:=true starts two Servo nodes because the UR-native Position path and the
+# admittance policy path require different output message types/controllers.
+servo:
+  default_route: position
+  policy_route: admittance
+  routes:
+    position:
+      command_type_service: /position_servo_node/switch_command_type
+      twist_topic: /position_servo_node/delta_twist_cmds
+      joint_topic: /position_servo_node/delta_joint_cmds
+      status_topic: /position_servo_node/status
+      output_topic: /joint_trajectory_controller/joint_trajectory   # watched for the jog summary in the log
+      output_type: joint_trajectory
+      control_mode: servo_position
+      frame: base_link
+      tip_link: tool0
+    admittance:
+      # Kept as /servo_node/* because the policy runner currently uses these service names.
+      command_type_service: /servo_node/switch_command_type
+      twist_topic: /servo_node/delta_twist_cmds
+      joint_topic: /servo_node/delta_joint_cmds
+      status_topic: /servo_node/status
+      output_topic: /admittance_trajectory_controller/joint_trajectory
+      output_type: joint_trajectory
+      control_mode: admittance
+      frame: base_link
+      tip_link: tool0
+
+# OPERATE > Jog. Step jogs are short MoveIt moves (any MoveIt mode); hold-to-jog streams the route above while
+# the button/slider is held. Speeds are capped by the Velocity setting.
+jog:
+  step_mm: [0.5, 1, 5, 10]
+  step_deg: [0.5, 1, 5, 10]
+  max_linear_mps: 0.05
+  max_angular_dps: 15
+  max_joint_dps: 15
+
+# OPERATE > Force (Admittance and Impedance). Neither controller times out a wrench target, so the GUI streams
+# it while applied and zeroes it on release, STOP or a lost connection. Limits are on |F| and |T|.
+force:
+  max_force_n: 20
+  max_torque_nm: 2
+  ramp_force_nps: 10
+  ramp_torque_nmps: 1
+  max_duration_s: 120
+
+# SETUP > Controller gains. Read from the running controller node, checked against these limits, ramped in
+# while the mode is active, read back. Lasts until the controller restarts: "YAML" gives the snippet to keep it.
+# Limits are the GUI's (tighter than the controllers' own bounds). Parameter names are from the controllers'
+# parameter definitions: ros2_controllers admittance_controller (Jazzy) and the patched
+# cartesian_impedance_controller (mrceki fork, src/cartesian_impedance_controller_parameters.yaml).
+gains:
+  admittance:
+    node: /admittance_controller          # enable_parameter_update_without_reactivation: true [repo]
+    ramp_s: 1.0
+    rows:
+      - {key: stiffness, label: Stiffness, param: admittance.stiffness, size: 6, unit: "N/m · Nm/rad",
+         min: 0, max: [3000, 3000, 3000, 300, 300, 300], help: "spring to the reference; 0 = free along that axis"}
+      - {key: damping_ratio, label: Damping ratio, param: admittance.damping_ratio, size: 6, min: 0.1, max: 10,
+         help: "1 = critical; higher feels heavier and slower"}
+      - {key: mass, label: Virtual mass, param: admittance.mass, size: 6, unit: "kg · kg·m²", min: 0.1, max: 100,
+         help: "lower reacts faster to a push"}
+      - {key: selected_axes, label: Compliant axes, param: admittance.selected_axes, size: 6, type: bool,
+         live: false, help: "axes that respond to force at all (changed only outside Admittance)"}
+      - {key: joint_damping, label: Joint damping, param: admittance.joint_damping, min: 0, max: 100}
+      - {key: ft_filter, label: F/T filter, param: ft_sensor.filter_coefficient, min: 0.005, max: 1,
+         help: "low-pass coefficient; higher = less lag, more noise"}
+  impedance:
+    node: /cartesian_impedance_controller
+    ramp_s: 1.0
+    # Without these the controller ignores runtime stiffness / damping values. Setting them alone re-applies the
+    # values it already has, so they are sent first.
+    enable: {stiffness.update_stiffness: true, damping.update_damping_factors: true}
+    note: "Every parameter change also re-applies the parameter wrench (zero): not while a force is applied."
+    rows:
+      - {key: stiffness, label: Stiffness, unit: "N/m · Nm/rad", min: 0, max: [1500, 1500, 1500, 150, 150, 150],
+         params: [stiffness.translation.x, stiffness.translation.y, stiffness.translation.z,
+                  stiffness.rotation.x, stiffness.rotation.y, stiffness.rotation.z]}
+      - {key: damping, label: Damping factor, min: 0, max: 1, help: "1 = critically damped",
+         params: [damping.translation.x, damping.translation.y, damping.translation.z,
+                  damping.rotation.x, damping.rotation.y, damping.rotation.z]}
+      - {key: delta_tau_max, label: Torque rate limit, param: delta_tau_max, unit: Nm/update,
+         readonly: "read only at configure: edit the YAML and reload the controller"}
+
+# F/T software bias (SETUP > F/T + Payload > F/T bias). Set on the broadcaster's offset.* parameters
+# [ros2_controllers 4.42: re-read every cycle, added to the reading]; the ATI box itself is never biased
+# (keep ft_hardware_biasing:=false). Limits are a typo guard, well inside the Gamma's range.
+ft_bias:
+  node: /ft/force_torque_sensor_broadcaster       # [repo] ft_controllers.yaml
+  max_force_n: 100
+  max_torque_nm: 10
+  zero_s: 1.0                 # averaged with the arm still
+  max_spread_n: 1.0           # refuse to zero if the reading moves more than this while sampling
+  max_spread_nm: 0.1
+
+# F/T + payload calibration (SETUP). Six-joint UR poses that rotate the wrist, not the FR3 pose file.
+# Check they are clear of your workcell before running. Results are saved, never applied to controller YAML.
+ft_calibration:
+  sensor_frame: ft_fts_link         # [repo] the wrench frame
+  reference_frame: base_link
+  samples_per_pose: 50
+  sample_period_s: 0.02
+  settle_s: 2.0
+  velocity_scaling: 0.1
+  # A passed result can be applied to the running admittance controller (gravity_compensation.CoG), on
+  # request and only while admittance is not the active mode. Its frame.id in ur_controllers_*.yaml is
+  # ft_fts_link [repo], the frame the CoG is fitted in.
+  apply_to: {node: /admittance_controller, mode: admittance, frame: ft_fts_link}
+  # Base 0 like the `ready` waypoint: `down` IS ready, the others tilt or roll only the wrist from there.
+  poses:
+    - {name: down,        joints: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]}
+    - {name: tilt_fwd,    joints: [0.0, -1.5708, 1.5708, -0.7854, -1.5708, 0.0]}
+    - {name: tilt_back,   joints: [0.0, -1.5708, 1.5708, -2.3562, -1.5708, 0.0]}
+    - {name: tilt_left,   joints: [0.0, -1.5708, 1.5708, -1.5708, -0.7854, 0.0]}
+    - {name: tilt_right,  joints: [0.0, -1.5708, 1.5708, -1.5708, -2.3562, 0.0]}
+    - {name: roll_90,     joints: [0.0, -1.5708, 1.5708, -0.7854, -1.5708, 1.5708]}
+    - {name: roll_180,    joints: [0.0, -1.5708, 1.5708, -0.7854, -1.5708, 3.1416]}
+
+# Example fixtures, NOT taught: the PROGRAMS preview uses one while the real fixture is missing, and SETUP >
+# Vial Geometry > Vial profiles lists it as the built-in profile `label` (Use makes it the real fixture). vial = scraping.py's target_xyz
+# (~/franka_ros2/sample_scraping/scripts/scraping.py, `robot_demo`): vial centre at the bottom, base axes.
+example_fixtures:
+  vial: {parent: base_link, xyz_mm: [525.0, 16.0, 40.0], rpy_deg: [0.0, 0.0, 0.0],
+         source: "scraping.py target_xyz", radius_mm: 17.0, height_mm: 40.0, label: baseline}
+
+# Named joint waypoints usable from programs (radians).
+waypoints:
+  home:
+    joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+  ready:
+    joints: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
+
+# Image topics the lab expects. SETUP > Cameras shows whether each one has a publisher and previews any image
+# topic. Topics from ~/franka_ros2 (RealSense via realsense2_camera, and the scraping vision node's outputs).
+cameras:
+  - {name: RealSense colour, topic: /camera/camera/color/image_rect_raw, info: /camera/camera/color/camera_info}
+  - {name: RealSense depth,  topic: /camera/camera/depth/image_rect_raw}
+  # ZED: not installed yet. Default zed-ros2-wrapper names for camera_name "zed" [unverified here]; if the wrapper
+  # version or camera_name differs, correct these after its first launch (SETUP > Cameras lists what exists).
+  - {name: ZED left (rect), topic: /zed/zed_node/rgb/image_rect_color, info: /zed/zed_node/rgb/camera_info}
+  - {name: ZED depth,       topic: /zed/zed_node/depth/depth_registered}
+  - {name: Vision annotated, topic: /scraping_vision/annotated_image}
+  - {name: Vision midpoints, topic: /scraping_vision/midpoints_image}

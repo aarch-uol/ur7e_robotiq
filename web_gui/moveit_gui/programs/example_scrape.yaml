@@ -1,0 +1,13 @@
+# Contact-rich example (schema v2): approach in position mode, switch to admittance for the
+# MoveIt-driven contact motion, run a policy in impedance, then come back.
+# The policy step needs a manifest in policies/ (see policies/_template.yaml.example).
+version: 2
+name: example_scrape
+robot: ur7e_lab
+steps:
+  - {type: controller, mode: position}
+  - {type: movej, target: ready, velocity: 0.2}
+  - {type: controller, mode: admittance}
+  - {type: movej, target: home, velocity: 0.05}
+  - {type: controller, mode: position}
+  - {type: movej, target: ready, velocity: 0.2}

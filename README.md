@@ -1,4 +1,5 @@
 # UR7e + ATI Gamma + Robotiq 2F-85 ROS 2 Integration
+> **Branch `web-gui`:** this branch also carries the web GUI for this stack in [`web_gui/`](web_gui/README.md) (setup on a new PC there). `main` is the stack alone.
 
 ROS 2 **Jazzy** bringup and MoveIt configuration for a **UR7e** arm with an **ATI Gamma** F/T sensor and a **Robotiq 2F-85** gripper.
 

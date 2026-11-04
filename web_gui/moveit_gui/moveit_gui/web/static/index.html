@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MoveIt GUI</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="grp">
+    <div class="big" id="h-robot">…</div>
+    <div class="row" style="gap:6px"><span class="dot" id="h-state-dot"></span><span class="cap" id="h-state">—</span></div>
+  </div>
+  <div class="sep"></div>
+  <div class="grp"><div class="cap">TCP</div><select id="h-tcp" data-needs-lease></select></div>
+  <div class="grp"><div class="cap">CONTROL</div><div class="val" id="h-mode">—</div></div>
+  <div class="grp"><div class="cap">ACTIVITY</div><div style="display:flex;gap:4px"><a class="pill" id="h-activity" title="What the robot is doing. Click to open its page.">IDLE</a><a class="pill rec" id="h-rec" hidden>● REC</a></div></div>
+  <div class="spacer"></div>
+  <div class="grp hinfo" style="align-items:flex-end">
+    <div class="muted" id="h-conn">—</div>
+    <div class="muted" id="h-profile">—</div>
+  </div>
+  <div class="sep"></div>
+  <div class="grp" title="GUI speed: scales every motion started from this GUI (moves, jog, programs). Policies are not scaled.">
+    <div class="cap">GUI SPEED <span id="h-ovr-val">100%</span></div>
+    <input type="range" id="h-ovr" min="5" max="100" step="5" value="100" data-needs-lease>
+  </div>
+  <div class="sep"></div>
+  <div class="grp" title="Speed slider on the UR teach pendant (read-only here)"><div class="cap">PENDANT SPEED</div><div class="val" id="h-speed">—</div></div>
+  <div class="sep"></div>
+  <div id="lease">
+    <span class="who" id="lease-who">—</span>
+    <button class="btn" id="lease-btn">Take control</button>
+  </div>
+  <button id="stop" title="STOP GUI MOTION: program, MoveIt motion and policy. Not an emergency stop. (Esc)">■ STOP</button>
+</header>
+<div id="banner"></div>
+<div id="viewhint">View only: buttons that move or change the robot are greyed out. Press <b>Take control</b> (top right) to operate. STOP always works.</div>
+<div id="body">
+  <nav id="nav"></nav>
+  <main id="main"></main>
+</div>
+<div id="toasts" aria-live="polite"></div>
+<div id="logbar"><a class="btn quiet" id="logs-link">Logs ▸</a><span id="lastlog"></span></div>
+<script type="importmap">{"imports": {"three": "/static/vendor/three/build/three.module.js"}}</script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

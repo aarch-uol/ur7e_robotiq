@@ -1,0 +1,62 @@
+# Stock UR5e with the standard ur_robot_driver + ur_moveit_config.
+# Only position mode and freedrive (no admittance/impedance controllers loaded).
+# Copy this file to add another UR model: change ur_type, robot_ip, waypoints.
+name: ur5e
+display_name: UR5e
+ur_type: ur5e
+robot_ip: 192.168.56.101      # URSim default
+joint_names: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+joint_prefix: ""
+moveit:
+  group: ur_manipulator
+  base_link: base_link
+  planning_link: tool0
+  use_move_group_action: true
+  default_velocity_scaling: 0.1
+  default_acceleration_scaling: 0.1
+  planning_timeout_s: 60.0
+tcps:
+  default: tool0
+  model_links:
+    tool0: {link: tool0, moveit_target: true}
+tf_frames: [base, world, tool0]
+state:
+  joint_state_timeout_s: 0.5
+  tf_timeout_s: 0.5
+topics:
+  joint_states: /joint_states
+  robot_mode: /io_and_status_controller/robot_mode
+  safety_mode: /io_and_status_controller/safety_mode
+  program_running: /io_and_status_controller/robot_program_running
+  speed_scaling: /speed_scaling_state_broadcaster/speed_scaling
+services:
+  dashboard_ns: /dashboard_client
+  io_and_status_ns: /io_and_status_controller
+  controller_manager: /controller_manager
+control_modes:
+  default: position
+  modes:
+    position:
+      label: Position
+      activate: [scaled_joint_trajectory_controller]
+      command_interface: position
+      command_source: trajectory
+      moveit_controller: scaled_joint_trajectory_controller
+      supports_moveit: true
+    freedrive:
+      label: Freedrive
+      activate: [freedrive_mode_controller]
+      command_interface: none
+      command_source: manual
+      hidden: true
+  managed: [scaled_joint_trajectory_controller, freedrive_mode_controller,
+            joint_trajectory_controller, forward_velocity_controller, forward_position_controller]
+  stationary_joint_velocity: 0.01
+freedrive:
+  enable_topic: /freedrive_mode_controller/enable_freedrive_mode
+  keepalive_hz: 10.0
+gripper:
+  enabled: false
+waypoints:
+  home:  {joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]}
+  ready: {joints: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]}
