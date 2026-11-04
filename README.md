@@ -133,6 +133,15 @@ Anything else that sends a wrench target (a policy, a script) must therefore str
 
 Note the watchdog only helps while it is running. Controllers started by other launch files (`moveit.launch.py`, `drivers.launch.py`) do not use wrench targets.
 
+### Parts from the GUI (optional URDF / SRDF include)
+
+`ur7e_robotiq.urdf.xacro` and `ur7e_robotiq.srdf.xacro` include one extra file each when an environment variable
+names it: `UR7E_USER_PARTS_URDF` (fixed links on the robot's links) and `UR7E_USER_PARTS_SRDF` (their
+`disable_collisions` pairs). The MoveIt GUI writes both (SETUP › Parts, under
+`~/ur7e_data/config/moveit_gui/parts/generated/`) and `ur7e_gui.sh` sets the variables when the files exist. Without
+them the robot model is exactly as before. The variables reach every launch that runs the xacro (driver, MoveIt,
+Servo, RViz), because they are set on the container.
+
 ### Admittance mode
 
 The admittance launch uses this position-control chain:

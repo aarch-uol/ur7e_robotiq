@@ -137,4 +137,10 @@
   <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_left_finger_tip_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_tip_link" reason="Default"/>
+
+  <!-- Collision pairs of the GUI parts (SETUP > Parts), generated next to their URDF. -->
+  <xacro:arg name="user_parts_srdf" default="$(optenv UR7E_USER_PARTS_SRDF none)"/>
+  <xacro:if value="${'$(arg user_parts_srdf)' != 'none'}">
+    <xacro:include filename="$(arg user_parts_srdf)"/>
+  </xacro:if>
 </robot>

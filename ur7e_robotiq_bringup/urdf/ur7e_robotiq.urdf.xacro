@@ -204,4 +204,11 @@
       <state_interface name="torque.z"/>
     </sensor>
   </ros2_control>
+
+  <!-- Parts added in the MoveIt GUI (SETUP > Parts): a generated file of fixed links on this robot's links.
+       The launcher sets UR7E_USER_PARTS_URDF to it when it exists; without it nothing changes. -->
+  <xacro:arg name="user_parts_urdf" default="$(optenv UR7E_USER_PARTS_URDF none)"/>
+  <xacro:if value="${'$(arg user_parts_urdf)' != 'none'}">
+    <xacro:include filename="$(arg user_parts_urdf)"/>
+  </xacro:if>
 </robot>
