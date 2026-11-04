@@ -13,7 +13,7 @@ setup(
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="cenk",
-    maintainer_email="cenkcetix@gmail.com",
+    maintainer_email="cenk.cetin@liverpool.ac.uk",
     description="Safety helpers for the UR7e stack: wrench-target watchdog.",
     license="BSD-3-Clause",
     tests_require=["pytest"],

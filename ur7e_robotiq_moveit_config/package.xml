@@ -3,7 +3,7 @@
   <name>ur7e_robotiq_moveit_config</name>
   <version>0.2.0</version>
   <description>MoveIt 2 configuration for the UR7e + Robotiq 2F-85 (arm and gripper groups).</description>
-  <maintainer email="cenkcetix@gmail.com">cenk</maintainer>
+  <maintainer email="cenk.cetin@liverpool.ac.uk">cenk</maintainer>
   <license>BSD-3-Clause</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
