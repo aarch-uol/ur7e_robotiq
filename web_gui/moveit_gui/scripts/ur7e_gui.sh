@@ -87,7 +87,7 @@ if [ -n "$NEW_BASE" ]; then
 fi
 read_base() {                                       # the base for this start (file written by --base or the GUI)
   local b
-  b=$(tr -d ' \t\r\n' < "$BASE_FILE" 2>/dev/null || true)
+  [ -f "$BASE_FILE" ] && b=$(tr -d ' \t\r\n' < "$BASE_FILE" 2>/dev/null || true)
   if [ -z "$b" ]; then b=ft_gripper
   elif ! valid_base "$b"; then echo "$BASE_FILE says '$b' (not one of: $BASES): using ft_gripper" >&2; b=ft_gripper
   fi
