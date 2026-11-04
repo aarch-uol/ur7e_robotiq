@@ -113,55 +113,33 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
 
 ## Launch Files
 
-Each launch file that starts the drivers needs `robot_ip:=<ROBOT_IP>`. After starting one, press Play on the External
-Control program on the pendant. They are listed from the simplest to the most specialised: start at the top unless
-you need force control.
-
-| Command | What runs | Use it for |
-|---|---|---|
-| `ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py` | Arm, gripper, MoveIt, RViz. The ATI Gamma is in the robot model but its driver is not started | Planning and moving the arm, opening and closing the gripper. No F/T sensor needed |
-| `ros2 launch ur7e_robotiq_bringup moveit.launch.py` | Arm, gripper, ATI Gamma driver, MoveIt, RViz | The same, plus the force/torque reading on `/ft/force_torque_sensor_broadcaster/wrench` |
-| `ros2 launch ur7e_robotiq_bringup gui.launch.py` | Arm, MoveIt and the hardware of the selected base (see [End-effector bases](#end-effector-bases-ur7e_ee_config)), with the position, admittance and Cartesian impedance controllers loaded (position active). No RViz unless `rviz:=true` | The MoveIt GUI (`ur7e_gui.sh` starts it for you) |
-| `ros2 launch ur7e_robotiq_bringup admittance.launch.py` | Arm, gripper, ATI Gamma, MoveIt through the admittance controller chain, RViz | Moves that give way to contact forces (see [Admittance mode](#admittance-mode)) |
-| `ros2 launch ur7e_robotiq_bringup cartesian_impedance.launch.py` | Arm, gripper, ATI Gamma and the direct-torque Cartesian impedance controller, which stays inactive unless `activate_controller:=true`. No MoveIt, no RViz | Experimental |
-
-To start one piece on its own:
-
-| Command | What runs |
+| Command | Starts |
 |---|---|
-| `ros2 launch ur7e_robotiq_bringup drivers.launch.py` | Arm and gripper drivers (and the ATI Gamma unless `load_ft_sensor:=false`) |
+| `ros2 launch ur7e_robotiq_bringup moveit.launch.py` | Drivers + MoveIt + RViz |
+| `ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py` | Arm + gripper drivers + MoveIt + RViz, the ATI Gamma mounted but not used (no F/T driver) |
+| `ros2 launch ur7e_robotiq_bringup admittance.launch.py` | Drivers + ATI Gamma + MoveIt through the admittance controller chain + RViz |
+| `ros2 launch ur7e_robotiq_bringup gui.launch.py` | Drivers + MoveIt with every mode (position, admittance, Cartesian impedance) loaded; Position active |
+| `ros2 launch ur7e_robotiq_bringup cartesian_impedance.launch.py` | Experimental direct-torque Cartesian impedance (controller left inactive unless `activate_controller:=true`) |
+| `ros2 launch ur7e_robotiq_bringup drivers.launch.py` | Arm and gripper drivers only |
 | `ros2 launch ur7e_robotiq_moveit_config move_group.launch.py` | MoveIt only |
 | `ros2 launch ur7e_robotiq_moveit_config moveit_rviz.launch.py` | RViz only |
 
-Common arguments:
+Arguments: `robot_ip` (required), `kinematics_params_file`, `rviz:=false`, `headless_mode`, `tool_tcp_port` (default `54321`), `load_ft_sensor`, `ft_ip_address` (default `192.168.1.1`), `ft_sampling_rate` (default `1000`) and `ft_hardware_biasing`.
 
-| Argument | Default | Meaning |
-|---|---|---|
-| `robot_ip` | required | IP address of the UR7e controller |
-| `kinematics_params_file` | `config/ur7e_calibration.yaml` | The calibration extracted from your robot (see [Test the Setup](#test-the-setup)) |
-| `rviz` | `true` | `false` starts without RViz |
-| `headless_mode` | `false` | Run without the External Control program on the pendant |
-| `tool_tcp_port` | `54321` | Port of the wrist RS-485 forwarder (gripper) |
-| `load_ft_sensor` | `true` | `false` starts no ATI Gamma driver (as `ur7e_gripper_moveit.launch.py` does) |
-| `ft_ip_address` | `192.168.1.1` | ATI Gamma IP address |
-| `ft_sampling_rate` | `1000` | ATI Gamma sampling rate (Hz) |
-| `ft_hardware_biasing` | `false` | Use the ATI's hardware bias on activation |
+### Gripper and MoveIt only (Gamma mounted, not used)
 
-### Arm and gripper with the ATI Gamma not in use
-
-`ur7e_gripper_moveit.launch.py` is for the robot with the ATI Gamma and the 2F-85 on the flange, when only the arm,
-the gripper and MoveIt are needed:
+When the Gamma and the 2F-85 are both on the flange but you only need the gripper and MoveIt:
 
 ```bash
 ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py robot_ip:=$ROBOT_IP \
   kinematics_params_file:=$HOME/ur7e_calibration.yaml
 ```
 
-The Gamma stays in the robot model, so MoveIt plans around it and the gripper TCP is at the right height. Its
-Ethernet driver, the `/ft` controller manager and the arm-side wrench bridge are not started, so the sensor does
-not need to be connected. It is `moveit.launch.py load_ft_sensor:=false` with the base fixed to `ft_gripper`: with
-`load_ft_sensor:=false`, `drivers.launch.py` sets `UR7E_FT_BRIDGE=false`, which leaves the `TopicSensorBridge` out
-of the URDF.
+The Gamma stays in the robot model (MoveIt plans around it, the gripper TCP is at the right height), but its
+Ethernet driver, the `/ft` controller manager and the arm-side wrench bridge are not started, so nothing needs the
+sensor to be connected. `rviz:=false` and `headless_mode` work as in `moveit.launch.py`. It is the same as
+`moveit.launch.py load_ft_sensor:=false` with the base fixed to `ft_gripper`: with `load_ft_sensor:=false`,
+`drivers.launch.py` sets `UR7E_FT_BRIDGE=false`, which leaves the `TopicSensorBridge` out of the URDF.
 
 ### Wrench watchdog
 
