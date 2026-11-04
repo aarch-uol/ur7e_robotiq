@@ -71,6 +71,16 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("rviz")),
     )
 
+    # The wrench controllers have no input timeout: zero their target if the
+    # (GUI) publisher dies while a force is commanded. See ur7e_safety.
+    wrench_watchdog = Node(
+        package="ur7e_safety",
+        executable="wrench_watchdog",
+        name="wrench_watchdog",
+        output="screen",
+        parameters=[{"topics": ["/admittance_controller/wrench_reference", "/cartesian_impedance_controller/set_cartesian_wrench"], "timeout_s": 0.3}],
+    )
+
     return LaunchDescription(
         [
             DeclareLaunchArgument("robot_ip", description="IP address of the UR7e controller"),
@@ -91,5 +101,6 @@ def generate_launch_description():
             move_group,
             servo,
             rviz,
+            wrench_watchdog,
         ]
     )

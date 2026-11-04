@@ -20,6 +20,8 @@ The gripper is plugged into the robot's **wrist connector**. The ATI Gamma runs 
 |---|---|
 | `ur7e_robotiq_bringup` | Launch files, combined arm + Gamma + gripper model, F/T and gripper drivers |
 | `ur7e_robotiq_moveit_config` | MoveIt config with `ur_manipulator` (arm) and `gripper` planning groups |
+| `topic_sensor_bridge` | ros2_control hardware interface that exposes the ATI wrench topic as `ati_fts_sensor/*` state interfaces |
+| `ur7e_safety` | `wrench_watchdog`: zeroes the wrench target if its publisher dies mid-force (see [Wrench watchdog](#wrench-watchdog)) |
 
 Robotiq uses the UR driver's supported tool-communication forwarder: the robot's wrist RS-485 port is exposed locally as `/tmp/ttyUR`. A small PTY compatibility patch lets the Robotiq driver open that device with POSIX termios because its bundled libserialport rejects `/dev/pts/*`. The ATI driver carries the activation fix in `patches/net_ft_gamma_runtime.patch`.
 
@@ -115,11 +117,21 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
 |---|---|
 | `ros2 launch ur7e_robotiq_bringup moveit.launch.py` | Drivers + MoveIt + RViz |
 | `ros2 launch ur7e_robotiq_bringup admittance.launch.py` | Drivers + ATI Gamma + MoveIt through the admittance controller chain + RViz |
+| `ros2 launch ur7e_robotiq_bringup gui.launch.py` | Drivers + MoveIt with every mode (position, admittance, Cartesian impedance) loaded; Position active |
+| `ros2 launch ur7e_robotiq_bringup cartesian_impedance.launch.py` | Experimental direct-torque Cartesian impedance (controller left inactive unless `activate_controller:=true`) |
 | `ros2 launch ur7e_robotiq_bringup drivers.launch.py` | Arm and gripper drivers only |
 | `ros2 launch ur7e_robotiq_moveit_config move_group.launch.py` | MoveIt only |
 | `ros2 launch ur7e_robotiq_moveit_config moveit_rviz.launch.py` | RViz only |
 
 Arguments: `robot_ip` (required), `kinematics_params_file`, `rviz:=false`, `headless_mode`, `tool_tcp_port` (default `54321`), `load_ft_sensor`, `ft_ip_address` (default `192.168.1.1`), `ft_sampling_rate` (default `1000`) and `ft_hardware_biasing`.
+
+### Wrench watchdog
+
+`/admittance_controller/wrench_reference` and `/cartesian_impedance_controller/set_cartesian_wrench` (`geometry_msgs/WrenchStamped`) have no input timeout in the upstream controllers: if the program streaming the target (the GUI) crashes or is killed mid-force, the last force stays applied. `gui.launch.py`, `admittance.launch.py` and `cartesian_impedance.launch.py` therefore start `ur7e_safety/wrench_watchdog`. For each watched topic, if the last message was non-zero and nothing arrives for `timeout_s` (default 0.3 s), it publishes a zero wrench (same `frame_id`) 3 times and logs one warning. It publishes nothing during normal traffic or after a zero message. Parameters: `topics` (list), `timeout_s`, `zero_repeats` (3), `check_rate_hz` (50). Timing logic is unit tested: `cd ur7e_safety && python3 -m pytest test`.
+
+Anything else that sends a wrench target (a policy, a script) must therefore stream it faster than every `timeout_s`, like the GUI does (50 Hz): a single non-zero message is zeroed after 0.3 s. Raise `timeout_s` for slower publishers.
+
+Note the watchdog only helps while it is running. Controllers started by other launch files (`moveit.launch.py`, `drivers.launch.py`) do not use wrench targets.
 
 ### Admittance mode
 

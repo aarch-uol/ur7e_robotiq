@@ -40,8 +40,13 @@ only the RS485 forwarding URCap may own the wrist serial device.
 1. The UR driver starts. The arm controllers load but stay **inactive** until you press **Play** on the pendant.
 2. The gripper's controller manager starts with the gripper **not connected**.
 3. `wait_for_gripper` waits for `/tmp/ttyUR` and for the gripper controller manager to load the hardware.
-4. The gripper hardware is activated. It connects, resets and calibrates (the fingers move once).
+4. The gripper hardware is activated. It connects, resets and calibrates (the fingers move once). If activation fails it is retried every 2 s for up to 60 s (stops as soon as the component is `active`).
 5. The gripper controllers start.
+
+## Controller safety
+
+- **Joint states:** every `joint_state_broadcaster` config (`ur_controllers_*.yaml`) lists only the six arm joints and `position/velocity/effort`. Without the list the broadcaster would also claim the F/T bridge's `ati_fts_sensor/*` interfaces, and an F/T dropout would deactivate it and stop `/joint_states`.
+- **Wrench targets:** `ur7e_safety/wrench_watchdog` zeroes the wrench target when the publisher goes silent while non-zero (see README).
 
 ## MoveIt config
 
