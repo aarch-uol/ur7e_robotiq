@@ -18,4 +18,6 @@ RUN echo 'source /opt/ros/jazzy/setup.bash' >> /root/.bashrc \
     && echo 'source /opt/ur7e_ws/install/setup.bash' >> /root/.bashrc
 
 WORKDIR /opt/ur7e_ws
+# ros2 launch shuts down cleanly on SIGINT. Run with --init (docker/run.sh does).
+STOPSIGNAL SIGINT
 CMD ["bash"]
