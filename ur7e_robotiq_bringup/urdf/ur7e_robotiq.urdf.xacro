@@ -12,6 +12,20 @@
        take down the UR arm controller. -->
   <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
 
+  <!-- End-effector base (the locked hardware the GUI's parts go on top of). One environment variable selects it,
+       and the SRDF and the launch files read the same one, so they always agree:
+         ft_gripper  ATI Gamma + Robotiq 2F-85 (default, the setup described below)
+         gripper     Robotiq 2F-85, its coupling straight on the flange (tool0)
+         ft          ATI Gamma only: a tool of your own goes on ft_tool_mount_link (GUI parts)
+         none        the bare arm -->
+  <xacro:arg name="ee_config" default="$(optenv UR7E_EE_CONFIG ft_gripper)"/>
+  <xacro:property name="ee" value="$(arg ee_config)"/>
+  <xacro:if value="${ee not in ['none', 'gripper', 'ft', 'ft_gripper']}">
+    ${xacro.fatal('UR7E_EE_CONFIG (ee_config) must be none, gripper, ft or ft_gripper, not ' + ee)}
+  </xacro:if>
+  <xacro:property name="has_ft" value="${ee in ['ft', 'ft_gripper']}"/>
+  <xacro:property name="has_gripper" value="${ee in ['gripper', 'ft_gripper']}"/>
+
   <!--
     Physical end-effector stack, along tool0 +Z:
 
@@ -37,6 +51,7 @@
   <xacro:property name="robotiq_coupling_radius" value="0.0375"/>
   <xacro:property name="robotiq_tcp_from_base" value="0.1571"/>
 
+  <xacro:if value="${has_ft}">
   <!-- Robot-side plate. Link frames are placed on interface faces; geometry is
        offset by half its thickness so the fixed-joint dimensions stay obvious. -->
   <joint name="ati_robot_plate_joint" type="fixed">
@@ -117,14 +132,26 @@
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
   <link name="ati_sensor"/>
+  </xacro:if>
 
+  <xacro:if value="${has_gripper}">
   <!-- Measured physical spacing between the Gamma tool face and the front
        mounting face of the Robotiq coupling. There is no 10 mm adapter here. -->
+  <xacro:if value="${has_ft}">
   <joint name="sensor_to_coupling_gap_joint" type="fixed">
     <parent link="ft_tool_mount_link"/>
     <child link="robotiq_coupling_mount_link"/>
     <origin xyz="0 0 ${sensor_to_coupling_gap}" rpy="0 0 0"/>
   </joint>
+  </xacro:if>
+  <!-- Without the ATI the GRP-CPL-062 coupling goes straight on the flange. -->
+  <xacro:unless value="${has_ft}">
+  <joint name="flange_to_coupling_joint" type="fixed">
+    <parent link="$(arg tf_prefix)tool0"/>
+    <child link="robotiq_coupling_mount_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  </xacro:unless>
   <link name="robotiq_coupling_mount_link"/>
 
   <joint name="robotiq_coupling_joint" type="fixed">
@@ -176,12 +203,14 @@
     <origin xyz="0 0 ${robotiq_tcp_from_base}" rpy="0 0 0"/>
   </joint>
   <link name="robotiq_tcp"/>
+  </xacro:if>
 
   <!-- The physical Gamma is driven by the separate /ft controller manager.
        This read-only hardware component mirrors its WrenchStamped topic into
        the UR arm controller manager so admittance_controller can claim the
        ATI state interfaces without colliding with the UR driver's built-in
        tcp_fts_sensor. -->
+  <xacro:if value="${has_ft}">
   <ros2_control name="TopicSensorBridge" type="sensor">
     <hardware>
       <plugin>topic_sensor_bridge/TopicSensorHardware</plugin>
@@ -204,6 +233,7 @@
       <state_interface name="torque.z"/>
     </sensor>
   </ros2_control>
+  </xacro:if>
 
   <!-- Parts added in the MoveIt GUI (SETUP > Parts): a generated file of fixed links on this robot's links.
        The launcher sets UR7E_USER_PARTS_URDF to it when it exists; without it nothing changes. -->

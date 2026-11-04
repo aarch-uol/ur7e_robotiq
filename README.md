@@ -142,6 +142,26 @@ names it: `UR7E_USER_PARTS_URDF` (fixed links on the robot's links) and `UR7E_US
 them the robot model is exactly as before. The variables reach every launch that runs the xacro (driver, MoveIt,
 Servo, RViz), because they are set on the container.
 
+### End-effector bases (`UR7E_EE_CONFIG`)
+
+The URDF and SRDF xacro build one of four bases from `UR7E_EE_CONFIG` (xacro arg `ee_config`). Anything else is
+rejected with an error.
+
+| Base | On the flange | Controllers loaded besides Position |
+|---|---|---|
+| `ft_gripper` (default) | ATI Gamma, Robotiq 2F-85 on it | admittance, cartesian impedance; gripper + F/T managers |
+| `gripper` | Robotiq 2F-85 coupling straight on `tool0` | cartesian impedance; gripper manager |
+| `ft` | ATI Gamma only; your own tool on `ft_tool_mount_link` | admittance; F/T manager |
+| `none` | nothing; your own tool on `tool0` | none |
+
+The SRDF follows the same variable: the gripper group, its states and passive joints, and the collision pairs
+of the hardware that is there. `gui.launch.py` reads it too and passes `load_ft_sensor` / `load_gripper` to
+`drivers.launch.py`. `ft_gripper` gives exactly the URDF and SRDF from before this option.
+
+`ur7e_gui.sh --base <name>` sets it, and it stays set for later starts (`~/ur7e_data/config/moveit_gui/base`). The
+GUI switches it too, in SETUP › Setups. Tools you build in the GUI go on top of a base as parts. They are never
+edited into the base itself.
+
 ### Admittance mode
 
 The admittance launch uses this position-control chain:

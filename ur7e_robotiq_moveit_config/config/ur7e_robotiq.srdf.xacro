@@ -7,22 +7,33 @@
   <xacro:include filename="$(find ur_moveit_config)/srdf/ur_macro.srdf.xacro"/>
   <xacro:ur_srdf/>
 
+  <!-- End-effector base: the same selection as ur7e_robotiq.urdf.xacro (UR7E_EE_CONFIG). Everything about the
+       gripper is only here when it is mounted, the ATI pairs only with the ATI. -->
+  <xacro:arg name="ee_config" default="$(optenv UR7E_EE_CONFIG ft_gripper)"/>
+  <xacro:property name="ee" value="$(arg ee_config)"/>
+  <xacro:property name="has_ft" value="${ee in ['ft', 'ft_gripper']}"/>
+  <xacro:property name="has_gripper" value="${ee in ['gripper', 'ft_gripper']}"/>
+
   <!-- Single-joint group driving the gripper: the four mimic joints below
        follow robotiq_85_left_knuckle_joint automatically (see passive_joint
        tags), so the actuated DOF is exactly this one. Matches the
        MoveIt ParallelGripperCommand controller handle, which commands one
        named joint from the group's first (only) joint. -->
+  <xacro:if value="${has_gripper}">
   <group name="gripper">
     <joint name="robotiq_85_left_knuckle_joint"/>
   </group>
   <end_effector name="robotiq_2f85" parent_link="tool0" group="gripper" parent_group="ur_manipulator"/>
+  </xacro:if>
 
+  <xacro:if value="${has_gripper}">
   <group_state name="open" group="gripper">
     <joint name="robotiq_85_left_knuckle_joint" value="0.0"/>
   </group_state>
   <group_state name="closed" group="gripper">
     <joint name="robotiq_85_left_knuckle_joint" value="0.79"/>
   </group_state>
+  </xacro:if>
 
   <!-- Arm in front of the robot (shoulder_pan 90°), gripper pointing straight
        down. wrist_2 is 270° rather than the equivalent -90° to match how
@@ -38,23 +49,32 @@
   </group_state>
 
   <!-- Mimic joints: not independently commanded, so not planning DOF. -->
+  <xacro:if value="${has_gripper}">
   <passive_joint name="robotiq_85_right_knuckle_joint"/>
   <passive_joint name="robotiq_85_left_inner_knuckle_joint"/>
   <passive_joint name="robotiq_85_right_inner_knuckle_joint"/>
   <passive_joint name="robotiq_85_left_finger_tip_joint"/>
   <passive_joint name="robotiq_85_right_finger_tip_joint"/>
+  </xacro:if>
 
   <!-- End-effector stack collision pairs. -->
+  <xacro:if value="${has_ft}">
   <disable_collisions link1="tool0" link2="ati_robot_plate_link" reason="Adjacent"/>
   <disable_collisions link1="wrist_3_link" link2="ati_robot_plate_link" reason="Adjacent"/>
   <disable_collisions link1="ati_robot_plate_link" link2="ati_gamma_body_link" reason="Adjacent"/>
+  </xacro:if>
+  <xacro:if value="${has_ft and has_gripper}">
   <disable_collisions link1="ati_gamma_body_link" link2="robotiq_coupling_link" reason="Adjacent"/>
+  </xacro:if>
 
   <!-- The end-effector stack is rigid (wrist_3, ATI, coupling, gripper base) plus the gripper's own one-DOF
        linkage: these pairs cannot collide in a way MoveIt should prevent, but several sit closer than
        Servo's 10 mm self_collision_proximity_threshold (finger tips touch when closed, ATI body 9.9 mm
        from wrist_3), which made Servo decelerate every jog to zero. -->
+  <xacro:if value="${has_ft}">
   <disable_collisions link1="wrist_3_link" link2="ati_gamma_body_link" reason="Never"/>
+  </xacro:if>
+  <xacro:if value="${has_gripper}">
   <disable_collisions link1="wrist_3_link" link2="robotiq_coupling_link" reason="Never"/>
   <disable_collisions link1="wrist_3_link" link2="robotiq_85_base_link" reason="Never"/>
   <disable_collisions link1="wrist_3_link" link2="robotiq_85_left_knuckle_link" reason="Never"/>
@@ -65,6 +85,8 @@
   <disable_collisions link1="wrist_3_link" link2="robotiq_85_right_inner_knuckle_link" reason="Never"/>
   <disable_collisions link1="wrist_3_link" link2="robotiq_85_left_finger_tip_link" reason="Never"/>
   <disable_collisions link1="wrist_3_link" link2="robotiq_85_right_finger_tip_link" reason="Never"/>
+  </xacro:if>
+  <xacro:if value="${has_ft and has_gripper}">
   <disable_collisions link1="ati_robot_plate_link" link2="robotiq_coupling_link" reason="Never"/>
   <disable_collisions link1="ati_robot_plate_link" link2="robotiq_85_base_link" reason="Never"/>
   <disable_collisions link1="ati_robot_plate_link" link2="robotiq_85_left_knuckle_link" reason="Never"/>
@@ -84,6 +106,8 @@
   <disable_collisions link1="ati_gamma_body_link" link2="robotiq_85_right_inner_knuckle_link" reason="Never"/>
   <disable_collisions link1="ati_gamma_body_link" link2="robotiq_85_left_finger_tip_link" reason="Never"/>
   <disable_collisions link1="ati_gamma_body_link" link2="robotiq_85_right_finger_tip_link" reason="Never"/>
+  </xacro:if>
+  <xacro:if value="${has_gripper}">
   <disable_collisions link1="robotiq_coupling_link" link2="robotiq_85_left_knuckle_link" reason="Never"/>
   <disable_collisions link1="robotiq_coupling_link" link2="robotiq_85_right_knuckle_link" reason="Never"/>
   <disable_collisions link1="robotiq_coupling_link" link2="robotiq_85_left_finger_link" reason="Never"/>
@@ -114,7 +138,9 @@
   <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_right_finger_tip_link" reason="Never"/>
   <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_left_finger_tip_link" reason="Never"/>
   <disable_collisions link1="robotiq_85_left_finger_tip_link" link2="robotiq_85_right_finger_tip_link" reason="Never"/>
+  </xacro:if>
 
+  <xacro:if value="${has_gripper}">
   <disable_collisions link1="robotiq_coupling_link" link2="robotiq_85_base_link" reason="Adjacent"/>
   <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_left_knuckle_link" reason="Adjacent"/>
   <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_right_knuckle_link" reason="Adjacent"/>
@@ -124,6 +150,7 @@
   <disable_collisions link1="robotiq_85_right_knuckle_link" link2="robotiq_85_right_finger_link" reason="Adjacent"/>
   <disable_collisions link1="robotiq_85_left_finger_link" link2="robotiq_85_left_finger_tip_link" reason="Adjacent"/>
   <disable_collisions link1="robotiq_85_right_finger_link" link2="robotiq_85_right_finger_tip_link" reason="Adjacent"/>
+  </xacro:if>
 
   <!-- Non-adjacent pairs that are in contact (or very close) through the
        4-bar linkage's normal range of motion. First pass by inspection, not
@@ -131,12 +158,14 @@
        any self-touching pair missing from this list; re-run through
        moveit_setup_assistant's "auto compute default collisions" to
        tighten it if those warnings are a problem. -->
+  <xacro:if value="${has_gripper}">
   <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_left_finger_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_base_link" link2="robotiq_85_right_finger_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_left_finger_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_left_inner_knuckle_link" link2="robotiq_85_left_finger_tip_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_link" reason="Default"/>
   <disable_collisions link1="robotiq_85_right_inner_knuckle_link" link2="robotiq_85_right_finger_tip_link" reason="Default"/>
+  </xacro:if>
 
   <!-- Collision pairs of the GUI parts (SETUP > Parts), generated next to their URDF. -->
   <xacro:arg name="user_parts_srdf" default="$(optenv UR7E_USER_PARTS_SRDF none)"/>

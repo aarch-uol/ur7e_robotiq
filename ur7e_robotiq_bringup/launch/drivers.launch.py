@@ -39,6 +39,7 @@ def generate_launch_description():
     tool_device_name = LaunchConfiguration("tool_device_name")
     tool_tcp_port = LaunchConfiguration("tool_tcp_port")
     load_ft_sensor = LaunchConfiguration("load_ft_sensor")
+    load_gripper = LaunchConfiguration("load_gripper")
     ft_ip_address = LaunchConfiguration("ft_ip_address")
     ft_sampling_rate = LaunchConfiguration("ft_sampling_rate")
     ft_hardware_biasing = LaunchConfiguration("ft_hardware_biasing")
@@ -101,6 +102,7 @@ def generate_launch_description():
             ("/tf", "/robotiq/tf"),
             ("/tf_static", "/robotiq/tf_static"),
         ],
+        condition=IfCondition(load_gripper),
     )
 
     gripper_manager = Node(
@@ -110,6 +112,7 @@ def generate_launch_description():
         output="screen",
         parameters=[controllers_yaml],
         remappings=[("robot_description", "/robotiq/robot_description")],
+        condition=IfCondition(load_gripper),
     )
 
     # ATI Gamma runs in its own controller manager. This keeps F/T network or
@@ -193,6 +196,7 @@ def generate_launch_description():
         ],
         name="wait_for_gripper",
         output="screen",
+        condition=IfCondition(load_gripper),
     )
 
     # Activation connects to the gripper, resets and calibrates it, and can fail
@@ -221,6 +225,7 @@ def generate_launch_description():
         ],
         name="gripper_hardware_activation",
         output="screen",
+        condition=IfCondition(load_gripper),
     )
 
     gripper_controller_spawner = Node(
@@ -236,6 +241,7 @@ def generate_launch_description():
             "--controller-manager-timeout", "30",
             "--param-file", controllers_yaml,
         ],
+        condition=IfCondition(load_gripper),
     )
 
     return LaunchDescription(
@@ -275,6 +281,11 @@ def generate_launch_description():
                 "tool_tcp_port",
                 default_value="54321",
                 description="TCP port where the robot exposes the wrist RS-485 port",
+            ),
+            DeclareLaunchArgument(
+                "load_gripper",
+                default_value="true",
+                description="Start the Robotiq gripper controller manager and activate the gripper",
             ),
             DeclareLaunchArgument(
                 "load_ft_sensor",
