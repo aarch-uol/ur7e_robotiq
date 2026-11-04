@@ -100,6 +100,8 @@ class FtBias:
         self._last_poll = 0.0
         self._polling = False
         self._blocked = ""                               # last reason an automatic restore waited (logged once)
+        self._seen = False                               # the broadcaster's bias was reported once (startup log)
+        self._unread = ""                                # last read error logged (broadcaster missing at startup)
         s = self._load()
         self.presets: Dict[str, dict] = dict(s.get("presets") or {})
         self.last: Optional[dict] = s.get("last")        # {bias, at, how}: the last bias this GUI applied
@@ -118,15 +120,36 @@ class FtBias:
         got = self.bridge.get_node_parameters(self.node, PARAMS)
         if got is None:
             self.live, self.error = None, f"{self.node} is not running (its parameter service did not answer)"
-            return False, self.error
+            return False, self._unreadable(self.error)
         if any(got.get(p) is None for p in PARAMS):
             self.live = None
             self.error = (f"{self.node} has no offset parameters: force_torque_sensor_broadcaster older than "
                           "ros2_controllers 4.x cannot take a software bias")
-            return False, self.error
+            return False, self._unreadable(self.error)
         self.live = [-float(got[p]) + 0.0 for p in PARAMS]
         self.read_at, self.error = time.time(), ""
+        if not self._seen or self._unread:              # GUI start, or the broadcaster is back: say what it has
+            self._seen, self._unread = True, ""
+            self.log(self._status())
         return True, "read"
+
+    def _unreadable(self, why: str) -> str:
+        if why != self._unread:                         # logged once per cause, not every poll
+            self._unread = why
+            self.log(f"F/T bias: {why}")
+        return why
+
+    def _status(self) -> str:
+        """One line for the log: what the broadcaster has against the bias this GUI saved."""
+        on = "raw (no bias)" if all(abs(x) < EPS for x in self.live) else _fmt(self.live)
+        if not self.last:
+            return f"F/T bias on {self.node}: {on}; none saved by this GUI"
+        saved = f"{self.last.get('how')} {self.last.get('at')}: {_fmt(self.last['bias'])}"
+        if not self.lost():
+            return f"F/T bias on {self.node}: the saved one ({saved})"
+        return (f"F/T bias on {self.node}: {on}, NOT the saved one ({saved})"
+                + ("; re-applying it as soon as nothing uses the reading" if self.cfg.get("auto_restore", True)
+                   else "; auto_restore is off: SETUP > F/T + Payload > Re-apply"))
 
     def poll(self, may_read: bool):
         """Re-read every poll_s in the background (shows a broadcaster restart, which drops the bias)."""
@@ -336,4 +359,5 @@ class FtBias:
         return {"available": self.available, "node": self.node, "bias": _r(self.live) if self.live else None,
                 "raw": raw, "error": self.error, "busy": self.busy, "last": self.last,
                 "lost": self.lost(), "presets": self.presets, "why_not": self.why_not(),
+                "auto_restore": bool(self.cfg.get("auto_restore", True)), "restore_waits": self._blocked,
                 "limits": [self.cfg["max_force_n"], self.cfg["max_torque_nm"]]}

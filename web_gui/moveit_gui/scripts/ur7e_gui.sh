@@ -191,8 +191,11 @@ else
 fi
 # In the background + wait, so Ctrl-C reaches the cleanup at once. The GUI records its pid and is exec'd, so
 # cleanup (stop_gui) can signal it by itself before the container is stopped.
+# Its output also goes to ~/ur7e_data/logs/gui_<time>.log (what the GUI did after a restart: F/T bias, gains, ...).
 run_gui() {
-  docker exec "$NAME" bash -c "$ENV && $GUI_PRE echo \$\$ > $GUI_PIDFILE && exec $GUI_CMD" &
+  local gstamp; gstamp=$(date +%Y%m%d_%H%M%S)
+  say "GUI log: ~/ur7e_data/logs/gui_$gstamp.log"
+  docker exec "$NAME" bash -c "$ENV && $GUI_PRE echo \$\$ > $GUI_PIDFILE && exec > >(tee -a /data/logs/gui_$gstamp.log) 2>&1 && exec $GUI_CMD" &
   local rc=0
   wait $! || rc=$?
   return $rc

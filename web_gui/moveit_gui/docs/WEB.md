@@ -256,7 +256,15 @@ TopicSensorBridge) all see the same values at once. Reading = raw sensor − bia
 * The broadcaster starts with no bias every time the robot stack starts. The GUI then shows that the last bias
   is gone. With `ft_bias.auto_restore: true` (the default, `moveit_gui/ft_bias.py`) the GUI then puts the last
   bias back **by itself** as soon as nothing uses the reading (checked every `poll_s`) and logs it; with
-  `auto_restore: false` it only shows that the bias is gone and offers **Re-apply**.
+  `auto_restore: false` it only shows that the bias is gone and offers **Re-apply**. While it waits, SETUP >
+  F/T + Payload says why (e.g. a program runs). At every GUI start the log says, once, what the broadcaster has
+  against the saved bias ("F/T bias on ...: the saved one" or "... NOT the saved one ...; re-applying it"), and
+  once if the broadcaster does not answer yet. `scripts/ur7e_gui.sh` keeps the GUI's output in
+  `~/ur7e_data/logs/gui_<time>.log` (next to the stack's `launch_<time>.log`). Parameter calls use one client
+  per node, kept (a new client per call had to find the service again within 0.5 s every time).
+  With **Zero now** (payload kept) the reading at rest still shows the tool weight (Fz ~10 N on the UR7e tool):
+  that is the payload the admittance controller removes, not a lost bias. Opt-in check on the real broadcaster
+  (docker, no network): `MOVEIT_GUI_DOCKER_TESTS=1 pytest test/test_ft_bias_restart_docker.py`.
 * The payload calibration holds only for the bias it was collected with: **Apply to admittance** is refused after
   the bias changed (collect again, or set the bias back). Zeroing with the gripper on and gravity compensation
   set makes Admittance subtract the gripper weight twice.

@@ -2490,10 +2490,14 @@ pages.SETUP = {
       st.textContent = f.raw ? `The bias is gone (the robot stack restarted): the reading is raw. Last bias, ${f.last.how} ${f.last.at}: ` +
         `F [${f.last.bias.slice(0, 3).map((v) => v.toFixed(2)).join(", ")}] N.  `
         : `The broadcaster has a bias this GUI did not set (last set here: ${f.last.how} ${f.last.at}).  `;
+      if (f.auto_restore) st.textContent += f.restore_waits ? `Auto re-apply waits: ${f.restore_waits}.  `
+        : "Re-applying it automatically…  ";
       st.classList.add("bad");
       st.append(B.reapply);
     } else if (f.raw) { st.textContent = "RAW: no bias, the reading is the sensor's own value."; st.classList.add("good"); }
-    else st.textContent = `BIASED${f.last ? ` (${f.last.how} ${f.last.at})` : ""}: the reading is raw − bias.`;
+    else st.textContent = `BIASED${f.last ? ` (${f.last.how} ${f.last.at}${f.last.restored ? `, re-applied ${f.last.restored} after a restart` : ""})` : ""}: ` +
+      "the reading is raw − bias." + (f.last && f.last.how === "zeroed, payload kept"
+        ? " Payload kept: the tool weight stays in the reading (Fz ≈ the tool weight at rest); Admittance removes it." : "");
     if (f.busy) st.textContent = "ZEROING: hold still…";
     const w = s.wrench;
     for (let i = 0; i < 6; i++) {

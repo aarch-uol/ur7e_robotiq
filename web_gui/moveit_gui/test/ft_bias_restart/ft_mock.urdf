@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<robot name="ft_mock">
+  <link name="ft_fts_link"/>
+  <ros2_control name="FtMock" type="system">
+    <hardware><plugin>mock_components/GenericSystem</plugin></hardware>
+    <sensor name="tcp_fts_sensor">
+      <state_interface name="force.x"><param name="initial_value">1.0</param></state_interface>
+      <state_interface name="force.y"><param name="initial_value">-1.3</param></state_interface>
+      <state_interface name="force.z"><param name="initial_value">10.8</param></state_interface>
+      <state_interface name="torque.x"><param name="initial_value">0.02</param></state_interface>
+      <state_interface name="torque.y"><param name="initial_value">0.07</param></state_interface>
+      <state_interface name="torque.z"><param name="initial_value">0.01</param></state_interface>
+    </sensor>
+  </ros2_control>
+</robot>

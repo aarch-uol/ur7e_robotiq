@@ -235,6 +235,8 @@ class RosBridge:
         self.moveit = None
         self._follow_clients: Dict = {}
         self._execute_handle = None
+        self._param_lock = threading.Lock()
+        self._param_clients: Dict = {}            # parameter service -> client (see _param_call)
         # Chained admittance: the trajectory controller's REFERENCE joints (controller_state), so a move starts there
         # and not at the pushed, measured joints (see control_modes.shift_to_reference). {controller: (t, {joint: q})}
         self._ctrl_ref: Dict[str, tuple] = {}
@@ -1434,15 +1436,23 @@ class RosBridge:
     def watched_image(self) -> Optional[ImageWatch]:
         return self._image_watch
 
+    def _param_call(self, srv_type, service: str, request):
+        """A parameter service call on a client kept per service. A new client per call had to discover the service
+        again each time (0.5 s): on a busy ROS graph that missed, and the F/T bias / gains read as "not running"."""
+        with self._param_lock:
+            cli = self._param_clients.get(service)
+            first = cli is None
+            if first:
+                cli = self._param_clients[service] = self.node.create_client(srv_type, service, callback_group=self.cb)
+        if first and not cli.wait_for_service(timeout_sec=2.0):
+            return None
+        return self._call(cli, request)
+
     def set_node_parameters(self, node_name: str, params: Dict[str, object]) -> Tuple[bool, str]:
         from rcl_interfaces.srv import SetParameters
         from rclpy.parameter import Parameter
-        cli = self.node.create_client(SetParameters, f"{node_name}/set_parameters", callback_group=self.cb)
-        try:
-            req = SetParameters.Request(parameters=[Parameter(k, value=v).to_parameter_msg() for k, v in params.items()])
-            res = self._call(cli, req)
-        finally:
-            self.node.destroy_client(cli)
+        req = SetParameters.Request(parameters=[Parameter(k, value=v).to_parameter_msg() for k, v in params.items()])
+        res = self._param_call(SetParameters, f"{node_name}/set_parameters", req)
         if res is None:
             return False, f"{node_name}/set_parameters not available"
         bad = [f"{k}: {r.reason}" for k, r in zip(params, res.results) if not r.successful]
@@ -1451,11 +1461,7 @@ class RosBridge:
     def get_node_parameters(self, node_name: str, names: List[str]) -> Optional[Dict[str, object]]:
         from rcl_interfaces.srv import GetParameters
         from rclpy.parameter import parameter_value_to_python
-        cli = self.node.create_client(GetParameters, f"{node_name}/get_parameters", callback_group=self.cb)
-        try:
-            res = self._call(cli, GetParameters.Request(names=list(names)))
-        finally:
-            self.node.destroy_client(cli)
+        res = self._param_call(GetParameters, f"{node_name}/get_parameters", GetParameters.Request(names=list(names)))
         if res is None:
             return None
         return {n: parameter_value_to_python(v) for n, v in zip(names, res.values)}

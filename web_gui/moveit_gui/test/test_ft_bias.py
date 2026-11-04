@@ -376,6 +376,8 @@ def test_the_bias_comes_back_by_itself_after_a_stack_restart(s):
     c.ft_bias.poll(True)
     assert wait(lambda: not c.ft_bias._polling)
     assert c.ft_bias.lost() and offsets(s) == [0.0] * 6
+    v = c.ft_bias.view()                                     # the page says it is gone and why it waits
+    assert v["lost"] and v["auto_restore"] and "Admittance uses the F/T reading" in v["restore_waits"]
     # free again: restored on the next poll, as it was made
     c.ft_bias.refusal = lambda: None
     c.ft_bias._last_poll = 0.0
@@ -412,3 +414,27 @@ def test_the_saved_payload_file_and_bias_are_shown_without_a_new_calibration(s):
     s.core.bridge.node_params[NODE].update({p: 0.0 for p in PARAMS})          # the stack restarted
     s.core.ft_bias.read()
     assert not s.payload_view()["saved"]["bias"]["in_use"]
+
+
+def test_the_log_says_what_the_broadcaster_has_at_gui_start_and_when_it_is_missing(s):
+    """A GUI restart logs, once, whether the sensor carries the saved bias (the GUI log is the only record)."""
+    c, b = s.core, s.core.bridge
+    n = len(s.results)
+    cmd(s, "ft_bias_zero")
+    assert result(s, n)["ok"]
+    fb = c.ft_bias
+    seen = []
+    fb.log = seen.append
+    fb._seen = False                                             # as in a new GUI process
+    b.node_params[NODE].update({p: 0.0 for p in PARAMS})         # ... after the stack restarted
+    fb.read()
+    assert len(seen) == 1 and "NOT the saved one" in seen[0] and "re-applying it" in seen[0]
+    fb.read()
+    assert len(seen) == 1                                        # once, not every poll
+    orig = b.get_node_parameters
+    b.get_node_parameters = lambda *a: None                      # the broadcaster is not up (yet)
+    fb.read(); fb.read()
+    assert len(seen) == 2 and "is not running" in seen[1]
+    b.get_node_parameters = orig
+    fb.read()                                                    # back: says what it has again
+    assert len(seen) == 3 and seen[2].startswith("F/T bias on")
