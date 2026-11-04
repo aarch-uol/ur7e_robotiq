@@ -25,6 +25,11 @@
   </xacro:if>
   <xacro:property name="has_ft" value="${ee in ['ft', 'ft_gripper']}"/>
   <xacro:property name="has_gripper" value="${ee in ['gripper', 'ft_gripper']}"/>
+  <!-- UR7E_FT_BRIDGE=false (xacro arg ft_bridge): the Gamma is mounted (its links stay in the model) but its driver
+       is not started, so leave out the TopicSensorBridge below: with no wrench topic it only reports stale samples.
+       drivers.launch.py sets it from load_ft_sensor. -->
+  <xacro:arg name="ft_bridge" default="$(optenv UR7E_FT_BRIDGE true)"/>
+  <xacro:property name="ft_bridge" value="${str('$(arg ft_bridge)').lower() in ['true', '1']}"/>
 
   <!--
     Physical end-effector stack, along tool0 +Z:
@@ -210,7 +215,7 @@
        the UR arm controller manager so admittance_controller can claim the
        ATI state interfaces without colliding with the UR driver's built-in
        tcp_fts_sensor. -->
-  <xacro:if value="${has_ft}">
+  <xacro:if value="${has_ft and ft_bridge}">
   <ros2_control name="TopicSensorBridge" type="sensor">
     <hardware>
       <plugin>topic_sensor_bridge/TopicSensorHardware</plugin>

@@ -16,6 +16,7 @@ from launch.actions import (
     ExecuteProcess,
     IncludeLaunchDescription,
     RegisterEventHandler,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -307,6 +308,8 @@ def generate_launch_description():
                 default_value="false",
                 description="Use ATI hardware biasing on activation",
             ),
+            # No F/T driver: no TopicSensorBridge in the arm's model either (the Gamma's links stay).
+            SetEnvironmentVariable("UR7E_FT_BRIDGE", load_ft_sensor),
             ur_driver,
             robotiq_robot_state_publisher,
             gripper_manager,

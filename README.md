@@ -116,6 +116,7 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
 | Command | Starts |
 |---|---|
 | `ros2 launch ur7e_robotiq_bringup moveit.launch.py` | Drivers + MoveIt + RViz |
+| `ros2 launch ur7e_robotiq_bringup gripper_moveit.launch.py` | Arm + gripper drivers + MoveIt + RViz, the ATI Gamma mounted but not used (no F/T driver) |
 | `ros2 launch ur7e_robotiq_bringup admittance.launch.py` | Drivers + ATI Gamma + MoveIt through the admittance controller chain + RViz |
 | `ros2 launch ur7e_robotiq_bringup gui.launch.py` | Drivers + MoveIt with every mode (position, admittance, Cartesian impedance) loaded; Position active |
 | `ros2 launch ur7e_robotiq_bringup cartesian_impedance.launch.py` | Experimental direct-torque Cartesian impedance (controller left inactive unless `activate_controller:=true`) |
@@ -124,6 +125,21 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
 | `ros2 launch ur7e_robotiq_moveit_config moveit_rviz.launch.py` | RViz only |
 
 Arguments: `robot_ip` (required), `kinematics_params_file`, `rviz:=false`, `headless_mode`, `tool_tcp_port` (default `54321`), `load_ft_sensor`, `ft_ip_address` (default `192.168.1.1`), `ft_sampling_rate` (default `1000`) and `ft_hardware_biasing`.
+
+### Gripper and MoveIt only (Gamma mounted, not used)
+
+When the Gamma and the 2F-85 are both on the flange but you only need the gripper and MoveIt:
+
+```bash
+ros2 launch ur7e_robotiq_bringup gripper_moveit.launch.py robot_ip:=$ROBOT_IP \
+  kinematics_params_file:=$HOME/ur7e_calibration.yaml
+```
+
+The Gamma stays in the robot model (MoveIt plans around it, the gripper TCP is at the right height), but its
+Ethernet driver, the `/ft` controller manager and the arm-side wrench bridge are not started, so nothing needs the
+sensor to be connected. `rviz:=false` and `headless_mode` work as in `moveit.launch.py`. It is the same as
+`moveit.launch.py load_ft_sensor:=false` with the base fixed to `ft_gripper`: with `load_ft_sensor:=false`,
+`drivers.launch.py` sets `UR7E_FT_BRIDGE=false`, which leaves the `TopicSensorBridge` out of the URDF.
 
 ### Wrench watchdog
 
