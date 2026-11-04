@@ -31,6 +31,10 @@ The controller started, but the real arm didn't follow the trajectory. This is u
 
 ## Gripper
 
+### Gripper never became `active` after launch
+
+`drivers.launch.py` retries activation every 2 s for 60 s and prints `gripper activation attempt N/30`. If it still gives up, check the tool-port items below, then relaunch (a driver `ERROR` finalizes the component; only a relaunch recovers it).
+
 ### Log keeps printing `TCP serial bridge closed the connection` / `link faulted`
 
 The robot keeps dropping the gripper's connection. A few of these right after startup are normal while the gripper activates. If they **don't stop**, something on the robot is also using the gripper port. Check [ROBOT_SETUP.md](ROBOT_SETUP.md):
@@ -108,7 +112,7 @@ Run `export DISPLAY=:1` (or `:0`) before launching. With Docker, `./docker/run.s
 This means an old bringup / move_group is still running next to the new one. It happens when a terminal is closed without **Ctrl+C**, or `ros2 launch` is run twice.
 
 **Fix:**
-- **Docker:** exit all container terminals and start again with `./docker/run.sh`. Each start is a fresh container.
+- **Docker:** exit all container terminals and start again with `./docker/run.sh`. Each start is a fresh container. `run.sh` uses `--init`, SIGINT as stop signal and a 15 s stop timeout, so `docker stop ur7e_robotiq` shuts the launch down cleanly.
 - **Native:**
   ```bash
   pkill -f "ros2 launch"; pkill -f ros2_control_node; pkill -f move_group; pkill -f rviz2

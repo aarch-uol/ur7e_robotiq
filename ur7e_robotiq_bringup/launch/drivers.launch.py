@@ -195,16 +195,32 @@ def generate_launch_description():
         output="screen",
     )
 
-    gripper_hardware_spawner = Node(
-        package="controller_manager",
-        executable="hardware_spawner",
-        output="screen",
-        arguments=[
-            "robotiq_2f85",
-            "--controller-manager", "/robotiq_controller_manager",
-            "--controller-manager-timeout", "30",
-            "--activate",
+    # Activation connects to the gripper, resets and calibrates it, and can fail
+    # (RS-485 forwarder not ready, gripper still powering up, link glitch). The
+    # plain hardware_spawner tries once and the launch moves on, leaving the
+    # gripper dead until someone restarts the stack. Retry every 2 s for up to
+    # 60 s, stop as soon as the component reports "active". After the last try
+    # the launch continues as before (the controller spawner then fails visibly).
+    # Note: if the driver returns ERROR (not FAILURE) the component is finalized
+    # and only a relaunch recovers it; the retries then just time out.
+    gripper_hardware_spawner = ExecuteProcess(
+        cmd=[
+            "bash",
+            "-c",
+            "is_active() { ros2 control list_hardware_components -c /robotiq_controller_manager 2>/dev/null"
+            " | sed 's/\\x1b\\[[0-9;]*m//g' | grep -q 'label=active'; }"
+            "; for i in $(seq 1 30); do"
+            " if is_active; then echo 'gripper hardware active'; exit 0; fi"
+            "; echo \"gripper activation attempt $i/30\""
+            "; ros2 run controller_manager hardware_spawner robotiq_2f85"
+            " --controller-manager /robotiq_controller_manager"
+            " --controller-manager-timeout 30 --activate"
+            "; is_active && { echo 'gripper hardware active'; exit 0; }"
+            "; sleep 2; done"
+            "; echo 'WARNING: gripper hardware not active after 60 s of retries' >&2; exit 1",
         ],
+        name="gripper_hardware_activation",
+        output="screen",
     )
 
     gripper_controller_spawner = Node(
