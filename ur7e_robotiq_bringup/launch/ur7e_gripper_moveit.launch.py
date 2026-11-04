@@ -1,6 +1,6 @@
 """Arm + Robotiq gripper + MoveIt + RViz, with the ATI Gamma mounted but NOT used.
 
-    ros2 launch ur7e_robotiq_bringup gripper_moveit.launch.py robot_ip:=<ROBOT_IP>
+    ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py robot_ip:=<ROBOT_IP>
 
 Then press Play on the External Control program on the pendant.
 

@@ -116,7 +116,7 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
 | Command | Starts |
 |---|---|
 | `ros2 launch ur7e_robotiq_bringup moveit.launch.py` | Drivers + MoveIt + RViz |
-| `ros2 launch ur7e_robotiq_bringup gripper_moveit.launch.py` | Arm + gripper drivers + MoveIt + RViz, the ATI Gamma mounted but not used (no F/T driver) |
+| `ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py` | Arm + gripper drivers + MoveIt + RViz, the ATI Gamma mounted but not used (no F/T driver) |
 | `ros2 launch ur7e_robotiq_bringup admittance.launch.py` | Drivers + ATI Gamma + MoveIt through the admittance controller chain + RViz |
 | `ros2 launch ur7e_robotiq_bringup gui.launch.py` | Drivers + MoveIt with every mode (position, admittance, Cartesian impedance) loaded; Position active |
 | `ros2 launch ur7e_robotiq_bringup cartesian_impedance.launch.py` | Experimental direct-torque Cartesian impedance (controller left inactive unless `activate_controller:=true`) |
@@ -131,7 +131,7 @@ Arguments: `robot_ip` (required), `kinematics_params_file`, `rviz:=false`, `head
 When the Gamma and the 2F-85 are both on the flange but you only need the gripper and MoveIt:
 
 ```bash
-ros2 launch ur7e_robotiq_bringup gripper_moveit.launch.py robot_ip:=$ROBOT_IP \
+ros2 launch ur7e_robotiq_bringup ur7e_gripper_moveit.launch.py robot_ip:=$ROBOT_IP \
   kinematics_params_file:=$HOME/ur7e_calibration.yaml
 ```
 
