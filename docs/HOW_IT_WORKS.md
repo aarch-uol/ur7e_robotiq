@@ -72,3 +72,62 @@ The gripper model is mounted directly on `tool0` with no offset. If you have a c
 ```xml
 <origin xyz="0 0 0.011" rpy="0 0 0"/>   <!-- e.g. 11 mm Robotiq coupling -->
 ```
+
+## Tool communication and patches
+
+Robotiq uses the UR driver's supported tool-communication forwarder: the robot's wrist RS-485 port is exposed locally as `/tmp/ttyUR`. A small PTY compatibility patch lets the Robotiq driver open that device with POSIX termios because its bundled libserialport rejects `/dev/pts/*`. The ATI driver carries the activation fix in `patches/net_ft_gamma_runtime.patch`.
+
+## Wrench watchdog
+
+`/admittance_controller/wrench_reference` and `/cartesian_impedance_controller/set_cartesian_wrench` (`geometry_msgs/WrenchStamped`) have no input timeout in the upstream controllers: if the program streaming the target (the GUI) crashes or is killed mid-force, the last force stays applied. `gui.launch.py`, `admittance.launch.py` and `cartesian_impedance.launch.py` therefore start `ur7e_safety/wrench_watchdog`. For each watched topic, if the last message was non-zero and nothing arrives for `timeout_s` (default 0.3 s), it publishes a zero wrench (same `frame_id`) 3 times and logs one warning. It publishes nothing during normal traffic or after a zero message. Parameters: `topics` (list), `timeout_s`, `zero_repeats` (3), `check_rate_hz` (50). Timing logic is unit tested: `cd ur7e_safety && python3 -m pytest test`.
+
+Anything else that sends a wrench target (a policy, a script) must therefore stream it faster than every `timeout_s`, like the GUI does (50 Hz): a single non-zero message is zeroed after 0.3 s. Raise `timeout_s` for slower publishers.
+
+Note the watchdog only helps while it is running. Controllers started by other launch files (`moveit.launch.py`, `drivers.launch.py`) do not use wrench targets.
+
+## Parts from the GUI (optional URDF / SRDF include)
+
+`ur7e_robotiq.urdf.xacro` and `ur7e_robotiq.srdf.xacro` include one extra file each when an environment variable
+names it: `UR7E_USER_PARTS_URDF` (fixed links on the robot's links) and `UR7E_USER_PARTS_SRDF` (their
+`disable_collisions` pairs). The MoveIt GUI writes both (SETUP › Parts, under
+`~/ur7e_data/config/moveit_gui/parts/generated/`) and `ur7e_gui.sh` sets the variables when the files exist. Without
+them the robot model is exactly as before. The variables reach every launch that runs the xacro (driver, MoveIt,
+Servo, RViz), because they are set on the container.
+
+## End-effector bases (`UR7E_EE_CONFIG`)
+
+The URDF and SRDF xacro build one of four bases from `UR7E_EE_CONFIG` (xacro arg `ee_config`). Anything else is
+rejected with an error.
+
+| Base | On the flange | Controllers loaded besides Position |
+|---|---|---|
+| `ft_gripper` (default) | ATI Gamma, Robotiq 2F-85 on it | admittance, cartesian impedance; gripper + F/T managers |
+| `gripper` | Robotiq 2F-85 coupling straight on `tool0` | cartesian impedance; gripper manager |
+| `ft` | ATI Gamma only; your own tool on `ft_tool_mount_link` | admittance; F/T manager |
+| `none` | nothing; your own tool on `tool0` | none |
+
+The SRDF follows the same variable: the gripper group, its states and passive joints, and the collision pairs
+of the hardware that is there. `gui.launch.py` reads it too and passes `load_ft_sensor` / `load_gripper` to
+`drivers.launch.py`. `ft_gripper` gives exactly the URDF and SRDF from before this option.
+
+`ur7e_gui.sh --base <name>` sets it, and it stays set for later starts (`~/ur7e_data/config/moveit_gui/base`). The
+GUI switches it too, in SETUP › Setups. Tools you build in the GUI go on top of a base as parts. They are never
+edited into the base itself.
+
+## Admittance mode
+
+The admittance launch uses this position-control chain:
+
+`MoveIt -> admittance_trajectory_controller -> admittance_controller -> UR joint position interfaces`
+
+The ATI Gamma still runs in the separate `/ft/controller_manager`. Its wrench topic is bridged into the UR controller manager as `ati_fts_sensor/*` state interfaces; this name intentionally differs from the UR driver's built-in `tcp_fts_sensor`.
+
+Start it with:
+
+```bash
+ros2 launch ur7e_robotiq_bringup admittance.launch.py \
+  robot_ip:=$ROBOT_IP \
+  kinematics_params_file:=$HOME/ur7e_calibration.yaml
+```
+
+The migration default enables compliance only on tool0 X. The gravity-compensation payload and CoG are deliberately set to zero until the real Robotiq + adapter + tool payload is measured. Calibrate those values before enabling vertical or rotational compliance.
