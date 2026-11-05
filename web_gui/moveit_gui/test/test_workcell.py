@@ -5,6 +5,7 @@ import os
 import struct
 import time
 import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -172,6 +173,45 @@ def test_mesh_upload_and_mesh_part(env):
     assert s.part_mesh_file("../calibrations/x.stl") is None
 
 
+def test_auto_mesh_preview_and_async_save(env):
+    s, b, tmp = env
+    v = [(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0),
+         (0, 0, 20), (20, 0, 20), (20, 20, 20), (0, 20, 20)]
+    f = [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7), (0, 1, 5), (0, 5, 4),
+         (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)]
+    data = stl([[v[a], v[b], v[c]] for a, b, c in f])
+    run(s, "parts_mesh_upload", filename="cube.stl", data_b64=base64.b64encode(data).decode())
+    preview = run(s, "parts_collision_preview", file="cube.stl", scale=0.001,
+                  collision_settings={"max_pieces": 8, "max_triangles": 64, "tolerance_mm": 0.5})
+    assert preview["generating"] and "generating collision" in preview["msg"]
+    assert wait(lambda: s._collision_jobs.get(preview["collision_job"], {}).get("state") != "generating", 5)
+    preview = run(s, "parts_collision_preview_status", job=preview["collision_job"])
+    assert preview["info"]["pieces"] == 1 and preview["info"]["triangles"] <= 12
+    assert len(preview["preview"]) == 1
+    rel = "collision/" + Path(preview["preview"][0]["uri"]).name
+    assert s.part_mesh_file(rel).is_file()
+
+    r = run(s, "parts_save", name="cube", parent="tool0",
+            shape={"type": "mesh", "file": "cube.stl", "scale": 0.001}, collision="auto",
+            collision_settings={"max_pieces": 8, "max_triangles": 64, "tolerance_mm": 0.5})
+    assert not r.get("generating")                         # preview cache: save does not pretend to regenerate
+    assert s.parts.parts["cube"].collision == "auto"
+    assert s.parts_view()["parts"][0]["collision_info"]["pieces"] == 1
+    assert synced(s)
+    assert len(b.part_objects["gui_part/cube"]["geoms"]) == 1
+    urdf = (tmp / "cfg" / "moveit_gui" / "parts" / "generated" / P.GENERATED_URDF).read_text()
+    assert urdf.count("<collision>") == 1 and "/generated/collision/" in urdf
+
+    # A cache miss is generated away from the request thread and the part appears only after it is ready.
+    r = run(s, "parts_save", name="cube_async", parent="tool0",
+            shape={"type": "mesh", "file": "cube.stl", "scale": 0.001}, collision="auto",
+            collision_settings={"max_pieces": 8, "max_triangles": 64, "tolerance_mm": 0.6})
+    assert r["generating"] and "generating collision" in r["msg"]
+    assert "cube_async" not in s.parts.parts
+    assert wait(lambda: s._collision_jobs.get("cube_async", {}).get("state") != "generating", 5)
+    assert s._collision_jobs["cube_async"]["state"] == "done" and "cube_async" in s.parts.parts
+
+
 def test_tcp_from_a_part_follows_the_part(env):
     s, _, _ = env
     run(s, "parts_save", name="spatula", parent="robotiq_tcp", shape={"type": "box", "size_mm": [20, 3, 150]},
@@ -274,6 +314,31 @@ def test_setups_save_load_restore_and_restart(env):
     autos = [x for x in s.setups.list() if x["auto"]]
     assert len(autos) == 1 and "spatula" not in (s.setups.dir / autos[0]["name"] / "files" / "parts" /
                                                  "ur7e_lab.yaml").read_text()
+
+
+def test_setup_current_changes_and_preview(env):
+    s, _, _ = env
+    assert run(s, "setup_list")["current"]["name"] == ""
+    run(s, "parts_save", name="spatula", parent="robotiq_tcp", shape={"type": "box", "size_mm": [20, 3, 150]})
+    run(s, "tcp_save", name="tip_a", parent="tool0", xyz_mm=[0, 0, 200], rpy_deg=[0, 0, 0])
+    cur = run(s, "setup_save", name="scraping")["current"]
+    assert cur["name"] == "scraping" and cur["changed"] == [] and "parts" in cur["present"]
+    assert s.workcell_state()["setup"]["name"] == "scraping"
+    run(s, "tcp_delete", name="tip_a")
+    assert run(s, "setup_list")["current"]["changed"] == ["TCPs, fixtures, vision"]
+    pv = run(s, "setup_preview", name="scraping")
+    assert pv["changes"] == ["TCPs, fixtures, vision"] and pv["base"] is None
+    assert pv["restart"] == "stack"                       # the spatula is not in the running robot model yet
+    import json
+    fb = s.setups.cfg / "ft_bias" / "ur7e_lab.json"           # the GUI's own "restored at" stamp is not a change
+    fb.parent.mkdir(parents=True, exist_ok=True)
+    fb.write_text(json.dumps({"presets": {}, "last": {"bias": [0.1] * 6, "at": "x"}}))
+    run(s, "setup_save", name="scraping", replace=True)
+    fb.write_text(json.dumps({"presets": {}, "last": {"bias": [0.1] * 6, "at": "x", "restored": "now"}}))
+    assert run(s, "setup_list")["current"]["changed"] == []
+    run(s, "setup_save", name="other")
+    run(s, "setup_delete", name="other")
+    assert run(s, "setup_list")["current"]["name"] == ""   # the one in use was deleted
 
 
 def test_restart_rules(env):

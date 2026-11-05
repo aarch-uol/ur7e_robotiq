@@ -4,6 +4,7 @@
 
 import { jointMonitor, ftChart } from "/static/monitors.js";
 import { workcell } from "/static/workcell.js";
+import { drivers, driversBadge } from "/static/drivers.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 function h(tag, props = {}, ...kids) {
@@ -1781,51 +1782,64 @@ pages.AUTOMATION = {
 
 // ==================================================================== SETUP
 pages.SETUP = {
-  sub: "TCPs",
+  sub: "Setups",
+  // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
+  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry"]],
+    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]]],
   build(el) {
-    const subs = ["TCPs", "Parts", "Vial Geometry", "Keep-out zones", "F/T + Payload", "Controller gains", "Cameras",
-      "Camera calibration", "Setups"];
-    this.nav = h("div", { class: "list subnav" }, subs.map((n) => h("div", { class: "item", onclick: () => this.show(n) }, n)));
+    this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
+      ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
+        h("span", { class: "grow" }, n), h("span", { class: "nb" })))]));
     this.body = h("div", { class: "grow col" });
-    el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), this.body));
+    // one bar for every SETUP page: saved changes that the robot model (URDF) only gets at a robot stack restart
+    this.mbar = h("div", { class: "banner-warn row hidden", id: "su-modelbar" }, h("span", { class: "grow", id: "su-modelbar-msg" }),
+      (() => { const b = btn("Restart robot stack…", "", () => this.wc.restart("stack"),
+        "Driver, controllers, MoveIt and the GUI restart (about a minute) and the robot model is rebuilt"); b.dataset.lease = "1"; return b; })());
+    el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), h("div", { class: "grow col" }, this.mbar, this.body)));
     this.views = {};
-    // TCPs
-    this.views["TCPs"] = h("div", { class: "card su-main" }, h("div", { class: "section" }, "TCPs"),
-      note("A virtual TCP is a fixed offset from a parent TCP or link (e.g. the spatula tip).",
-        "Recorded poses store their TCP. A virtual TCP changes poses only, not MoveIt's collision model. " +
-        "Pivot calibration estimates tip position, not orientation."),
-      h("div", { class: "list", id: "su-tcps" }),
-      h("div", { class: "section" }, "New / edit virtual TCP"),
-      h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
-        h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "su-tn", placeholder: "spatula_tip" }),
-        h("span", { class: "k" }, "Parent"), h("select", { id: "su-tp" }),
-        h("span", { class: "k" }, "X Y Z mm"), h("div", { class: "row" }, [0, 1, 2].map((i) => h("input", { type: "number", id: `su-to${i}`, value: "0", step: "0.5", style: "width:80px" }))),
-        h("span", { class: "k" }, "R P Y °"), h("div", { class: "row" }, [3, 4, 5].map((i) => h("input", { type: "number", id: `su-to${i}`, value: "0", step: "1", style: "width:80px" })))),
-      h("div", { class: "row" },
-        (() => { const b = btn("Save TCP", "primary", () => this.saveTcp()); b.dataset.lease = "1"; return b; })(),
-        h("span", { class: "muted small" }, "Saving a name that exists edits it.")),
-      h("div", { class: "section" }, "Pivot calibration"),
-      note("Hold the tool tip against one fixed point. In freedrive, tilt about two different axes and capture 6–12 poses. " +
-        "No robot motion is commanded by Capture. Use a parent attached rigidly to the tool."),
-      h("div", { class: "row" }, h("span", { class: "k" }, "Parent"),
-        h("select", { id: "su-pivot-parent", onchange: () => this.pivotReset() }), freedriveButton()),
-      h("select", { id: "su-pivot-samples", size: "5", style: "width:100%;min-height:100px" }),
-      h("div", { class: "row" },
-        ...[["Capture sample", () => this.pivotCmd("pivot_capture", { parent: $("#su-pivot-parent").value })],
-          ["Remove selected", () => this.pivotCmd("pivot_remove", { index: $("#su-pivot-samples").selectedIndex })],
-          ["Reset", () => this.pivotReset()], ["Solve", () => this.pivotCmd("pivot_solve")]].map(([label, fn]) => {
-            const b = btn(label, "", fn); b.dataset.lease = "1"; return b;
-          })),
-      h("div", { class: "muted small", id: "su-pivot-quality" }, "No samples"),
-      h("div", { class: "mono small", id: "su-pivot-result" }, "Solve after capturing diverse orientations."),
-      h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
-        h("span", { class: "k" }, "Save as"), h("input", { id: "su-pivot-name", value: "spatula_tip" }),
-        h("span", { class: "k" }, "Manual R P Y °"),
-        h("div", { class: "row" }, [0, 1, 2].map(i => h("input", {
-          id: `su-pivot-r${i}`, type: "number", value: "0", min: "-180", max: "180", step: "1", style: "width:80px"
-        })))),
-      (() => { const b = btn("Save calibrated TCP", "primary", () => this.pivotSave()); b.id = "su-pivot-save";
-        b.dataset.lease = "1"; return b; })());
+    // TCPs: one list, one editor. Name and parent once, then type the offset or measure the tip (pivot)
+    const lb = (b) => (b.dataset.lease = "1", b);
+    const n3 = (i, step) => h("input", { type: "number", id: `su-to${i}`, value: "0", step, style: "width:80px" });
+    this.tcpHow = "type";
+    const howBtn = (k, label) => h("button", { class: "btn" + (k === "type" ? " on" : ""), "data-how": k, onclick: () => this.tcpSetHow(k) }, label);
+    this.views["TCPs"] = h("div", { class: "col su-main" },
+      h("div", { class: "card" },
+        h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "TCPs"),
+          btn("+ New TCP", "", () => this.tcpNew(), "Clear the editor below for a new TCP")),
+        note("A TCP is the tool point the robot moves: tool0 (the flange), robotiq_tcp, or your own, e.g. a spatula tip.",
+          "Your own TCP is a fixed offset from a parent TCP or link. Recorded poses store their TCP. A TCP changes poses only, " +
+          "not MoveIt's collision model (for that, add the tool as a part)."),
+        h("div", { class: "list", id: "su-tcps" })),
+      h("div", { class: "card" },
+        h("div", { class: "section", id: "su-t-title" }, "New TCP"),
+        h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
+          h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "su-tn", placeholder: "spatula_tip" }),
+          h("span", { class: "k" }, "From"), h("select", { id: "su-tp", title: "The parent: the offset is measured from this frame",
+            onchange: () => this.tcpHow === "pivot" && this.pivot?.samples.length && this.pivotReset() }),
+          h("span", { class: "k" }, "How"), h("div", {}, h("span", { class: "seg", id: "su-t-how" },
+            howBtn("type", "Type the offset"), howBtn("pivot", "Measure the tip (pivot)")))),
+        h("div", { id: "su-t-type" },
+          h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
+            h("span", { class: "k" }, "X Y Z mm"), h("div", { class: "row" }, [0, 1, 2].map((i) => n3(i, "0.5"))))),
+        h("div", { id: "su-t-pivot", class: "hidden" },
+          h("ol", { class: "small steps" },
+            h("li", {}, "Freedrive on. Hold the tool tip on one fixed point (a cone, a screw head)."),
+            h("li", {}, "Keep the tip there, tilt the tool to a new angle, press Capture. 6–12 times, about two different axes."),
+            h("li", {}, "Solve and check the error (under 1 mm is good), then Save TCP.")),
+          h("div", { class: "row" }, freedriveButton(),
+            lb(btn("Capture", "", () => this.pivotCmd("pivot_capture", { parent: $("#su-tp").value }), "Reads where the tool is now. Nothing moves")),
+            lb(btn("Solve", "", () => this.pivotCmd("pivot_solve"))),
+            h("div", { class: "grow" }),
+            lb(btn("Start over", "quiet", () => this.pivotReset(), "Forget every sample"))),
+          h("div", { class: "row wrap", id: "su-pivot-samples" }),
+          h("div", { class: "muted small", id: "su-pivot-quality" }, "No samples"),
+          h("div", { class: "mono small", id: "su-pivot-result" }, "")),
+        h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
+          h("span", { class: "k" }, "R P Y °"), h("div", { class: "row" }, [3, 4, 5].map((i) => n3(i, "1")))),
+        h("div", { class: "muted small", id: "su-t-rpyhint" }, "Rotation of the TCP from its parent (0 0 0 = the same axes)."),
+        h("div", { class: "row" },
+          (() => { const b = lb(btn("Save TCP", "primary", () => this.tcpHow === "pivot" ? this.pivotSave() : this.saveTcp())); b.id = "su-t-save"; return b; })(),
+          h("span", { class: "muted small" }, "Saving a name that exists changes that TCP."))));
     // Vial
     const vrows = INFO.vial_points.map((n, k) => h("div", { class: "row" }, h("span", { class: "dot", id: `su-vd-${k}` }),
       h("span", { style: "width:130px" }, n + (n === "Bottom" ? " (optional)" : "")),
@@ -1953,18 +1967,9 @@ pages.SETUP = {
     this.pcols = this.views["F/T + Payload"];
     this.views["F/T + Payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
     this.views["Controller gains"] = this.buildGains();
-    // Cameras
-    this.views["Cameras"] = h("div", { class: "cols" },
-      h("div", { class: "card", style: "width:300px" }, h("div", { class: "section" }, "Cameras"),
-        h("div", { class: "list", id: "su-cams" }),
-        h("div", { class: "section" }, "Any image topic"),
-        h("input", { type: "text", id: "su-topic", list: "su-topics", placeholder: "/camera/…/image_raw",
-                     onchange: (e) => this.watch(e.target.value.trim()) }),
-        h("datalist", { id: "su-topics" }),
-        h("div", {}, btn("Rescan topics", "quiet", () => this.camStatus(true)))),
-      h("div", { class: "card grow" }, h("div", { class: "row" }, h("span", { class: "title grow", id: "su-camtitle" }, "No topic selected")),
-        h("div", { class: "secondary", id: "su-caminfo" }),
-        h("div", { class: "cam", id: "su-cam" }, "Select a camera")));
+    // Drivers & cameras: drivers.js
+    this.dr = drivers({ h, btn, note, cmd, toast, lease: (b) => { b.dataset.lease = "1"; return b; } });
+    this.views["Drivers & cameras"] = this.dr.view;
     // one 3D view for the pages that place things in space: the live robot and what the page edits
     this.sv = h("div", { class: "card su-v3card" },
       h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3D view"),
@@ -2008,6 +2013,10 @@ pages.SETUP = {
     this.zKey = null;
     if (!full) return;
     v.setMarkers([]); v.setPathMm(null); v.setFrames([]);
+    if (n === "Parts") {
+      const p = this.wc.W.parts.draft();
+      v.setPartDraft(p, (pose) => this.wc.W.parts.poseFromGizmo(pose));
+    } else v.clearPartDraft();
     if (n !== "F/T + Payload") { this.pStop(); v.showGhost(null); } else this.pGhost();
     if (n === "TCPs" || n === "Vial Geometry") {
       const r = await cmd("tf_frames").catch(() => null);
@@ -2049,8 +2058,9 @@ pages.SETUP = {
       cmd("payload_collect", { index: this.pPick });
   },
   show(n) {
+    if (this.sub === "Parts" && n !== "Parts" && this.view) this.view.clearPartDraft();
     this.sub = n;
-    [...this.nav.children].forEach((it) => it.classList.toggle("on", it.textContent === n));
+    this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
     if (this.SV_PAGES[n]) {
       if (n === "F/T + Payload") {            // the poses, their ghost, the result side by side under the bias
         this.pcols.insertBefore(this.sv, this.pcols.lastChild);
@@ -2059,7 +2069,7 @@ pages.SETUP = {
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
     } else this.body.replaceChildren(this.views[n]);
-    if (n === "Cameras") this.camStatus(true); else this.watch(null, true);
+    if (n === "Drivers & cameras") this.dr.load(); else this.dr.leave();
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
     if (n === "Controller gains") this.gLoad(true);
     if (n === "Parts") this.wc.W.parts.load();
@@ -2232,7 +2242,10 @@ pages.SETUP = {
     const r = await cmd("gains_preset_delete", { name: n });
     if (r.ok) { this.gData.presets = r.presets; this.gRender(); }
   },
-  hide() { this.watch(null, true); },
+  hide() {
+    this.dr.leave();
+    if (this.view) this.view.clearPartDraft();
+  },
   vial(v) {
     this.vialData = v;
     if (this.sub === "Vial Geometry") this.svPaint(true);
@@ -2347,8 +2360,25 @@ pages.SETUP = {
     }) : [h("div", { class: "muted" }, "No keep-out zones. Add the table first (see the form).")]));
   },
   editTcp(t) {
+    this.tcpSetHow("type");
+    $("#su-t-title").textContent = `Edit TCP ${t.name}`;
     $("#su-tn").value = t.name; $("#su-tp").value = t.parent;
     [...t.xyz_mm, ...t.rpy_deg].forEach((v, i) => ($(`#su-to${i}`).value = v));
+  },
+  tcpNew() {
+    $("#su-t-title").textContent = "New TCP";
+    $("#su-tn").value = "";
+    [0, 1, 2, 3, 4, 5].forEach((i) => ($(`#su-to${i}`).value = "0"));
+    $("#su-tn").focus();
+  },
+  tcpSetHow(k) {
+    this.tcpHow = k;
+    $("#su-t-how").querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.how === k));
+    $("#su-t-type").classList.toggle("hidden", k !== "type");
+    $("#su-t-pivot").classList.toggle("hidden", k !== "pivot");
+    $("#su-t-rpyhint").textContent = k === "pivot" ? "The tip measurement gives the position only. Rotation from the parent: usually 0 0 0."
+      : "Rotation of the TCP from its parent (0 0 0 = the same axes).";
+    if (k === "pivot") this.pivotCmd("pivot_get"); else gate($("#su-t-save"), true);
   },
   saveTcp() {
     const name = $("#su-tn").value.trim(), v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#su-to${i}`).value);
@@ -2360,27 +2390,24 @@ pages.SETUP = {
     const r = await cmd(command, args);
     if (r.ok && r.pivot) this.pivotUpdate(r.pivot);
   },
-  pivotReset() { this.pivotCmd("pivot_reset", { parent: $("#su-pivot-parent").value }); },
+  pivotReset() { this.pivotCmd("pivot_reset", { parent: $("#su-tp").value }); },
   pivotUpdate(p) {
     this.pivot = p;
-    const sel = $("#su-pivot-samples"), selected = sel.selectedIndex;
-    sel.replaceChildren(...p.samples.map((x, i) => h("option", { value: i },
-      `#${i + 1}  ${x.xyz_mm.join(", ")} mm · ${x.rpy_deg.join(", ")}°`)));
-    sel.selectedIndex = selected < p.samples.length ? selected : p.samples.length - 1;
-    $("#su-pivot-quality").textContent = `${p.samples.length} samples · ${p.quality}: ${p.quality_reason}`;
+    $("#su-pivot-samples").replaceChildren(...p.samples.map((x, i) => h("span", { class: "chip", title: `${x.xyz_mm.join(", ")} mm · ${x.rpy_deg.join(", ")}°` },
+      `#${i + 1}`, h("a", { class: "x", title: "Remove this sample", onclick: () => this.pivotCmd("pivot_remove", { index: i }) }, " ×"))));
+    $("#su-pivot-quality").textContent = p.samples.length ? `${p.samples.length} samples · ${p.quality}: ${p.quality_reason}` : "No samples yet.";
     const r = p.result;
     $("#su-pivot-result").textContent = r
-      ? `Tip in ${p.parent}: [${r.xyz_mm.join(", ")}] mm; pivot in base: [${r.pivot_base_mm.join(", ")}] mm; ` +
-        `RMS ${r.rms_mm} mm, max ${r.max_mm} mm (sample #${r.worst_sample})`
-      : "Solve after capturing diverse orientations.";
-    gate($("#su-pivot-save"), !!r);
+      ? `Tip from ${p.parent}: ${r.xyz_mm.join(", ")} mm · error ${r.rms_mm} mm (worst ${r.max_mm} mm, sample #${r.worst_sample})`
+      : "";
+    if (this.tcpHow === "pivot") gate($("#su-t-save"), !!r);
   },
   pivotSave() {
     if (!this.pivot?.result) return;
-    const name = $("#su-pivot-name").value.trim();
+    const name = $("#su-tn").value.trim();
     const existing = S.calibration.tcps.some(t => t.name === name);
     if (existing && !window.confirm(`Replace TCP ${name}? Previously taught poses will use the new offset.`)) return;
-    cmd("pivot_save", { name, replace: existing, rpy_deg: [0, 1, 2].map(i => +$(`#su-pivot-r${i}`).value) });
+    cmd("pivot_save", { name, replace: existing, rpy_deg: [3, 4, 5].map(i => +$(`#su-to${i}`).value) });
   },
   // F/T bias: software offsets on the F/T broadcaster (the ATI box itself is never biased)
   buildBias() {
@@ -2552,32 +2579,37 @@ pages.SETUP = {
     if (window.confirm(`Set the admittance gravity compensation to ${r.mass.toFixed(3)} kg at ${r.cog.map((c) => (c * 1000).toFixed(1)).join(", ")} mm?` + off))
       cmd("payload_apply");
   },
-  async camStatus(force) {
-    if (!force && Date.now() - (this.camT || 0) < 2000) return;
-    this.camT = Date.now();
-    const r = await cmd("camera_status");
-    if (!r.ok) return;
-    $("#su-cams").replaceChildren(...r.cameras.map((c) => h("div", { class: "item" + (c.topic === this.topic ? " on" : ""),
-      onclick: () => this.watch(c.topic) },
-      h("span", { class: "dot" + (c.publishers > 0 ? " ok" : ""), style: "margin-top:5px" }),
-      h("div", { class: "grow" }, h("div", {}, c.name), h("div", { class: "muted" }, c.topic)),
-      h("span", { class: "muted", style: "white-space:nowrap" }, c.publishers > 0 ? "publishing" : "no publisher"))));
-    $("#su-topics").replaceChildren(...r.topics.map((t) => h("option", { value: t })));
-    if (!this.topic && r.cameras.length) this.watch(r.cameras[0].topic);
-  },
-  watch(topic, quiet) {
-    const box = $("#su-cam");
-    if (!topic) { if (box) box.replaceChildren(quiet ? "" : "Select a camera"); if (!quiet) this.topic = null; return; }
-    this.topic = topic;
-    const cam = INFO.cameras.find((c) => c.topic === topic);
-    $("#su-camtitle").textContent = cam ? cam.name : topic;
-    $("#su-topic").value = topic;
-    const img = h("img", { src: "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&t=" + Date.now(), alt: "",
-      onerror: () => box.replaceChildren(`${topic}: no image publisher. Is the camera driver running?`) });
-    box.replaceChildren(img);
-    [...$("#su-cams").children].forEach((it) => it.classList.toggle("on", it.querySelector(".muted")?.textContent === topic));
+  // the small status after each menu item, and the robot-model bar
+  navStatus(s) {
+    const w = s.workcell || {}, st = w.setup || {}, c = s.calibration || {};
+    const own = (c.tcps || []).filter((t) => !t.builtin).length, ko = (s.keepout?.boxes || []).filter((b) => b.enabled).length;
+    const vial = (c.fixtures || []).some((f) => (f.name || f) === "vial");
+    const nb = {
+      "Setups": st.name ? (st.changed?.length || st.base_changed ? ["changed", "warn", `"${st.name}" is loaded; changed since: ` +
+        [...(st.changed || []), ...(st.base_changed ? ["base"] : [])].join(", ")] : ["✓ " + st.name, "ok", `"${st.name}" is loaded, unchanged`])
+        : ["none", "", "No setup loaded or saved yet"],
+      "Parts": w.restart_for?.length ? [String(w.parts_n), "warn", "Some parts are not in the robot model yet (restart the robot stack)"]
+        : w.parts_n ? [String(w.parts_n), "", "parts"] : null,
+      "TCPs": own ? [String(own), "", "your own TCPs"] : null,
+      "Camera calibration": w.cams_n ? ["✓ " + w.cams_n, "ok", "saved camera calibrations"] : ["—", "", "No camera calibrated"],
+      "F/T + Payload": s.payload?.saved?.file ? ["✓", "ok", "a payload calibration is saved"] : ["—", "", "No payload calibration saved"],
+      "Vial Geometry": vial ? ["✓", "ok", "the vial is taught"] : null,
+      "Keep-out zones": ko ? [String(ko), "", "enabled keep-out boxes"] : null,
+      "Drivers & cameras": driversBadge(w.drivers),
+    };
+    this.nav.querySelectorAll(".item").forEach((it) => {
+      const v = nb[it.dataset.name], b = it.querySelector(".nb");
+      b.textContent = v ? v[0] : ""; b.className = "nb" + (v && v[1] ? " " + v[1] : ""); b.title = v ? v[2] : "";
+    });
+    const rf = w.restart_for || [], bn = w.base_next;
+    const msg = w.restarting ? "Restarting…" : [rf.length ? `Not in the robot model yet: ${rf.join(", ")}. They already work (TF, MoveIt, 3D view).` : "",
+      bn ? `The next robot stack start uses another base (${bn}).` : ""].filter(Boolean).join(" ");
+    this.mbar.classList.toggle("hidden", !msg);
+    if (msg) $("#su-modelbar-msg").textContent = msg + (w.restarting ? "" : " Restart the robot stack to write them into the robot model (URDF).");
+    this.mbar.querySelector("button").classList.toggle("hidden", !!w.restarting);
   },
   update(s) {
+    this.navStatus(s);
     if (this.sub === "F/T + Payload" && this.fbChart) this.fbChart.push(s);
     if (this.view && this.SV_PAGES[this.sub]) {          // the shared 3D view follows the arm; zones when they change
       const q = {};
@@ -2604,11 +2636,7 @@ pages.SETUP = {
         const sel = $("#su-tp"), cur = sel.value;
         sel.replaceChildren(...c.tcp_parents.map((n) => h("option", { value: n }, n)));
         sel.value = c.tcp_parents.includes(cur) ? cur : c.active_tcp;
-        const pivotParent = $("#su-pivot-parent"), prev = pivotParent.value;
-        pivotParent.replaceChildren(...c.tcp_parents.map(n => h("option", { value: n }, n)));
-        pivotParent.value = c.tcp_parents.includes(prev) ? prev : c.active_tcp;
-        if (this.pivot && this.pivot.parent && c.tcp_parents.includes(this.pivot.parent))
-          pivotParent.value = this.pivot.parent;
+        if (this.tcpHow === "pivot" && this.pivot?.samples.length && c.tcp_parents.includes(this.pivot.parent)) sel.value = this.pivot.parent;
       }
     }
     if (this.sub === "Vial Geometry") gate(this.vsave, this.vialOk);
@@ -2622,6 +2650,7 @@ pages.SETUP = {
     if (this.sub === "Keep-out zones") this.koUpdate(s);
     if (this.sub === "Parts") this.wc.W.parts.update(s);
     if (this.sub === "Camera calibration") this.wc.W.he.update(s);
+    if (this.sub === "Setups") this.wc.W.setups.update(s);
     if (this.sub === "F/T + Payload") {
       this.biasUpdate(s);
       const p = s.payload;
@@ -2663,14 +2692,7 @@ pages.SETUP = {
       gate(this.papply, !!(r && r.can_apply) && s.mode !== "admittance");
       this.papply.textContent = s.mode === "admittance" ? "Apply (leave Admittance first)" : "Apply to admittance";
     }
-    if (this.sub === "Cameras") {
-      this.camStatus(false);
-      const c = s.camera;
-      $("#su-caminfo").textContent = c && c.topic === this.topic
-        ? (c.width ? `${c.width}×${c.height} · ` : "") + `${c.encoding || "—"} · ${fmt(c.rate)} Hz · ${c.frame_id || "no frame_id"}` +
-          (c.age != null && c.age > 2 ? ` · last image ${c.age.toFixed(0)} s ago` : "") + (c.error ? " · " + c.error : "")
-        : "";
-    }
+    if (this.sub === "Drivers & cameras") this.dr.update(s);
   },
 };
 

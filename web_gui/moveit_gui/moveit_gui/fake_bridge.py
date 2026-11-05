@@ -117,6 +117,7 @@ class FakeBridge:
             "/camera/camera/infra1/image_rect_raw": ("mono8", 848, 480, 30.0),
             "/scraping_vision/annotated_image": ("bgr8", 640, 480, 10.0),
         }
+        self.fake_published = set()        # other topics a fake driver 'publishes' (SETUP > Drivers & cameras)
         self._image_watch = None
         self._image_stop = threading.Event()
         self.ft_live = True
@@ -688,7 +689,7 @@ class FakeBridge:
         return sorted((t, "sensor_msgs/msg/Image") for t in self.fake_cameras)
 
     def topic_publishers(self, topic):
-        return 1 if topic in self.fake_cameras else 0
+        return 1 if topic in self.fake_cameras or topic in self.fake_published else 0
 
     def watch_image(self, topic):
         from .camera import ImageWatch

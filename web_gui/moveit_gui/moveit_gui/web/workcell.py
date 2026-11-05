@@ -6,6 +6,7 @@ payload calibration: claimed with core.begin_motion, refused unless idle in a Mo
 from __future__ import annotations
 
 import base64
+import os
 import re
 import threading
 import time
@@ -17,12 +18,14 @@ import numpy as np
 from .. import bases as B
 from .. import handeye as he
 from .. import parts as P
+from .. import services as SV
 from .. import transforms as tf
 from ..calibration import TcpDef, config_dir
-from ..setups import Setups
+from ..setups import Setups, members as S_members
 
 RESTART_STACK, RESTART_GUI = 75, 76
 PARTS_VERIFY_S = 10.0
+SETUP_CHECK_S = 5.0          # how often the state compares the files in use with the loaded setup
 
 
 class WorkcellCommands:
@@ -40,6 +43,9 @@ class WorkcellCommands:
         self._parts_sig = None
         self._parts_busy = False
         self._tcp_checked = None
+        self._collision_jobs: Dict[str, dict] = {}
+        self._restore_auto_collisions()
+        self._drivers_init()
         self.he: dict = {"topic": "", "info_topic": "", "mount": "eye_in_hand", "K": None, "D": None,
                          "frame": "", "samples": [], "result": None, "poses": [], "last": None,
                          "progress": {"running": False, "done": 0, "total": 0, "error": ""}}
@@ -52,14 +58,43 @@ class WorkcellCommands:
             self.model_rev += 1
         return self._model
 
+    def _restore_auto_collisions(self):
+        """Rebuild missing/stale generated auto pieces after config restore without blocking service startup."""
+        todo = [p for p in self.parts.parts.values()
+                if p.collision == "auto" and self.parts.auto_collision_cached(p) is None]
+        if not todo:
+            return
+        key = "startup"
+        self._collision_jobs[key] = {"state": "generating", "msg": "regenerating saved collisions…"}
+
+        def run():
+            try:
+                for p in todo:
+                    self.parts.auto_collision_files(p)
+                m = self._base_model()
+                if m.get("ok"):
+                    P.write_generated(self.parts, m)
+                self._parts_sig = None
+                self.model_rev += 1
+                self._collision_jobs[key] = {"state": "done", "msg": "saved collisions regenerated"}
+            except Exception as e:
+                self._collision_jobs[key] = {"state": "error", "msg": str(e)}
+                self._log_error("parts collision", e)
+        threading.Thread(target=run, daemon=True, name="parts-collision-restore").start()
+
     def part_mesh_file(self, rel: str) -> Optional[Path]:
-        """/mesh/_parts/<file>: an uploaded mesh; /mesh/_parts/hulls/<file>.hull.stl: its collision hull."""
+        """/mesh/_parts/<file>: uploaded mesh; hulls/ and collision/ are generated collision meshes."""
         rel = rel or ""
         if rel.startswith("hulls/"):
             f = rel[len("hulls/"):]
             if not f.endswith(".hull.stl") or not P.MESH_FILE.match(f[:-len(".hull.stl")]):
                 return None
             p = self.parts.generated_dir / "hulls" / f
+        elif rel.startswith("collision/"):
+            f = rel[len("collision/"):]
+            if "/" in f or "\\" in f or not re.match(r"^[A-Za-z0-9_.-]+\.stl$", f, re.I):
+                return None
+            p = self.parts.generated_dir / "collision" / f
         else:
             if not P.MESH_FILE.match(rel):
                 return None
@@ -80,7 +115,9 @@ class WorkcellCommands:
             self._tcp_check(m)
         frames, objects = P.live_plan(self.parts, m)
         sig = repr([(a, b, np.round(T, 6).tolist()) for a, b, T in frames] +
-                   [(o["id"], o["link"], np.round(o["T_link_obj"], 6).tolist(), o["geom"], o["attach"]) for o in objects])
+                   [(o["id"], o["link"],
+                     [(np.round(x["T_link_obj"], 6).tolist(), x["geom"]) for x in o.get("geoms", [])],
+                     o["attach"]) for o in objects])
         due = time.monotonic() - self.parts_sync["at"] > PARTS_VERIFY_S
         if sig == self._parts_sig and not due:
             return
@@ -136,7 +173,78 @@ class WorkcellCommands:
                 "restart_for": sorted(n for n, s in st.items() if s in ("live", "changed", "removed")),
                 "he": {**self.he["progress"], "samples": len(self.he["samples"]),
                        "solved": self.he["result"] is not None},
-                "restarting": self.restart_code, "model_rev": self.model_rev}
+                "restarting": self.restart_code, "model_rev": self.model_rev,
+                "cams_n": len(self.cams.cameras),
+                "drivers": self.drivers_state(),
+                "setup": self._setup_summary(), "base_next": self._base_next()}
+
+    def _base_next(self) -> str:
+        """The base the next robot stack start uses when it differs from the running one, else ""."""
+        try:
+            v = self.base_view()
+            return v["next"] if v.get("next") and v["next"] != v.get("running") else ""
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------ drivers & pipelines (services.py)
+    def _drivers_init(self):
+        c, prof = self.core, self.core.profile.name
+        here = config_dir() / "services"
+        run = here / "run" if c.fake else Path("/tmp/moveit_gui_services") / prof   # /tmp: gone with the container
+        logs = Path(os.environ["MOVEIT_GUI_LOG_DIR"]) / "services" if os.environ.get("MOVEIT_GUI_LOG_DIR") \
+            else here / "logs"
+        b = c.bridge
+        self.drivers = SV.Services(here / f"{prof}.yaml", run, logs,
+                                   spawn=SV.spawn_fake if c.fake else SV.spawn_process,
+                                   have=(lambda pkg: True) if c.fake else SV.have_package,
+                                   publishers=b.topic_publishers, on_change=self._driver_changed if c.fake else None,
+                                   log=b.log)
+
+    def _driver_changed(self, s, up: bool):
+        """Fake mode: a started fake driver 'publishes' its outputs, so the page and the preview work."""
+        b = self.core.bridge
+        for o in s.outputs():
+            if o["image"]:
+                (b.fake_cameras.__setitem__(o["topic"], ("rgb8", 640, 480, 15.0)) if up
+                 else b.fake_cameras.pop(o["topic"], None))
+            else:
+                (b.fake_published.add if up else b.fake_published.discard)(o["topic"])
+
+    def drivers_state(self) -> list:
+        """Small, in every state: [{name, kind, state, msg}] (the full view is drivers_get)."""
+        return [{k: r[k] for k in ("name", "kind", "state", "msg")} for r in self.drivers.view()["services"]]
+
+    def drivers_stop_all(self, wait: float = 6.0):
+        """The GUI closes: stop the drivers, except on a GUI-only restart (the next GUI adopts them)."""
+        if self.restart_code == RESTART_GUI:
+            return
+        self.drivers.stop_all(wait=wait)
+
+    def cmd_drivers_get(self):
+        return self._ok(**self.drivers.view(), types=SV.Services.types_view(self.drivers.have), kinds=SV.KINDS)
+    cmd_drivers_get.read_only = True
+
+    def cmd_drivers_save(self, service, replace=None):
+        s = self.drivers.save(dict(service or {}), replace or None)
+        return self._ok(f"{s.name} saved", **self.drivers.view())
+
+    def cmd_drivers_delete(self, name):
+        self.drivers.delete(str(name))
+        return self._ok(f"{name} deleted", **self.drivers.view())
+
+    def cmd_drivers_start(self, name):
+        return self._ok(self.drivers.start(str(name)), **self.drivers.view())
+
+    def cmd_drivers_stop(self, name):
+        return self._ok(self.drivers.stop(str(name)), **self.drivers.view())
+
+    def cmd_drivers_autostart(self, name, on=True):
+        self.drivers.set_autostart(str(name), bool(on))
+        return self._ok(f"{name}: {'starts' if on else 'does not start'} with the GUI", **self.drivers.view())
+
+    def cmd_drivers_log(self, name, lines=60):
+        return self._ok(**self.drivers.log_tail(str(name), max(5, min(400, int(lines)))))
+    cmd_drivers_log.read_only = True
 
     # ------------------------------------------------------------------ parts
     def _robot_links(self) -> set:
@@ -149,7 +257,9 @@ class WorkcellCommands:
         out = []
         for n, p in self.parts.ordered().items():
             lo, hi = self.parts.extent_m(p)
-            out.append({"name": n, **p.to_yaml(), "status": st.get(n, "live"), "far_face_mm": round(hi * 1000, 2)})
+            ci = self.parts.auto_collision_info(p)
+            out.append({"name": n, **p.to_yaml(), "status": st.get(n, "live"), "far_face_mm": round(hi * 1000, 2),
+                        "collision_info": ci})
         removed = [n for n, s in st.items() if s == "removed"]
         restart = [n for n, s in st.items() if s in ("live", "changed", "removed")]
         links = sorted(self._robot_links())
@@ -159,6 +269,7 @@ class WorkcellCommands:
                 "presets": {k: v for k, v in P.PRESETS.items()},
                 "problems": P.problems(self.parts, m) if m.get("ok") else [], "error": self.parts.error,
                 "sync": {k: v for k, v in self.parts_sync.items() if k != "sent"},
+                "collision_jobs": dict(self._collision_jobs),
                 "model_ok": bool(m.get("ok")), "model_msg": m.get("msg", "")}
 
     def cmd_parts_get(self):
@@ -176,16 +287,81 @@ class WorkcellCommands:
         return self._ok(what, parts=self.parts_view())
 
     def cmd_parts_save(self, name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base", color="#9aa0a6",
-                       collision=None, kind="part", note="", replace=None):
+                       collision=None, collision_settings=None, kind="part", note="", replace=None):
         old = self.parts.parts.get(replace or name)
         meta = dict(old.meta) if old else {}
         if old and meta.get("source") == "handeye" and (list(map(float, xyz_mm or [])) != old.xyz_mm or
                                                         list(map(float, rpy_deg or [])) != old.rpy_deg):
             meta = {k: v for k, v in meta.items() if k not in ("source", "camera")}
             meta["note"] = "offset edited after the hand-eye calibration"
-        p = P.make_part(name, parent, xyz_mm, rpy_deg, shape, anchor, color, collision, kind, note, meta)
-        self.parts.put(p, self._robot_links(), replace=replace or (name if old else None))
-        return self._parts_saved(f"part {p.name} saved")
+        p = P.make_part(name, parent, xyz_mm, rpy_deg, shape, anchor, color, collision,
+                        collision_settings=collision_settings, kind=kind, note=note, meta=meta)
+        rep = replace or (name if old else None)
+        links = self._robot_links()
+        self.parts.check(p, links, replace=rep)
+        if p.collision != "auto":
+            self.parts.put(p, links, replace=rep)
+            return self._parts_saved(f"part {p.name} saved")
+        if self.parts.auto_collision_cached(p) is not None:
+            self.parts.put(p, links, replace=rep)
+            return self._parts_saved(f"part {p.name} saved")
+        if any(j.get("state") == "generating" for j in self._collision_jobs.values()):
+            raise P.PartError("another automatic collision is being generated")
+        self._collision_jobs[p.name] = {"state": "generating", "msg": "generating collision…"}
+
+        def generate():
+            try:
+                _, info = self.parts.auto_collision_files(p)
+                self.parts.put(p, links, replace=rep)
+                self._parts_saved(f"part {p.name} saved")
+                self._collision_jobs[p.name] = {"state": "done", "msg": "collision generated", "info": info}
+            except Exception as e:
+                self._collision_jobs[p.name] = {"state": "error", "msg": str(e)}
+                self._log_error("parts collision", e)
+        threading.Thread(target=generate, daemon=True, name="parts-collision").start()
+        return self._ok("generating collision…", generating=True, collision_job=p.name, parts=self.parts_view())
+
+    def cmd_parts_collision_preview(self, file, scale=None, collision_settings=None, force=False):
+        """Generate/reuse auto collision for an uploaded mesh without blocking the HTTP request."""
+        f = str(file)
+        info = self.parts.mesh_info(f)
+        if info.get("error"):
+            raise P.PartError(f"mesh {f} is missing")
+        shape = {"type": "mesh", "file": f, "scale": info["scale"] if scale is None else scale}
+        p = P.make_part("collision_preview", "tool0", shape=shape, collision="auto",
+                        collision_settings=collision_settings)
+        cached = None if force else self.parts.auto_collision_cached(p)
+        if cached is not None:
+            paths, result = cached
+            return self._ok("collision generated", info=result,
+                            preview=[{"uri": q.resolve().as_uri(), "scale": [p.shape["scale"]] * 3} for q in paths])
+        _, manifest = self.parts._auto_cache(p)
+        key = "preview:" + manifest.name
+        job = self._collision_jobs.get(key)
+        if job and job.get("state") == "generating":
+            return self._ok("generating collision…", generating=True, collision_job=key)
+        self._collision_jobs[key] = {"state": "generating", "msg": "generating collision…"}
+
+        def generate():
+            try:
+                paths, result = self.parts.auto_collision_files(p, force=bool(force))
+                self._collision_jobs[key] = {
+                    "state": "done", "msg": "collision generated", "info": result,
+                    "preview": [{"uri": q.resolve().as_uri(), "scale": [p.shape["scale"]] * 3} for q in paths],
+                }
+            except Exception as e:
+                self._collision_jobs[key] = {"state": "error", "msg": str(e)}
+                self._log_error("parts collision preview", e)
+        threading.Thread(target=generate, daemon=True, name="parts-collision-preview").start()
+        return self._ok("generating collision…", generating=True, collision_job=key)
+    cmd_parts_collision_preview.read_only = True
+
+    def cmd_parts_collision_preview_status(self, job):
+        j = self._collision_jobs.get(str(job))
+        if not j:
+            raise P.PartError("no such collision preview")
+        return self._ok(j.get("msg", ""), **{k: v for k, v in j.items() if k != "msg"})
+    cmd_parts_collision_preview_status.read_only = True
 
     def cmd_parts_delete(self, name):
         self.parts.delete(str(name))
@@ -199,7 +375,26 @@ class WorkcellCommands:
         f = self.parts.add_mesh(filename, data)
         info = self.parts.mesh_info(f)
         users = [n for n, p in self.parts.parts.items() if p.shape.get("file") == f]
-        if users:                                            # replaced a mesh parts use: regenerate the model
+        auto_users = [n for n in users if self.parts.parts[n].collision == "auto"]
+        if auto_users:
+            key = f"mesh:{f}"
+            self._collision_jobs[key] = {"state": "generating", "msg": "regenerating collision…"}
+
+            def regenerate():
+                try:
+                    for n in auto_users:
+                        self.parts.auto_collision_files(self.parts.parts[n], force=True)
+                    m = self._base_model()
+                    if m.get("ok"):
+                        P.write_generated(self.parts, m)
+                    self._parts_sig = None
+                    self.model_rev += 1
+                    self._collision_jobs[key] = {"state": "done", "msg": "collision regenerated"}
+                except Exception as e:
+                    self._collision_jobs[key] = {"state": "error", "msg": str(e)}
+                    self._log_error("parts collision", e)
+            threading.Thread(target=regenerate, daemon=True, name="parts-collision").start()
+        elif users:                                         # hull/box/visual stay cheap
             m = self._base_model()
             if m.get("ok"):
                 P.write_generated(self.parts, m)
@@ -363,18 +558,59 @@ class WorkcellCommands:
                         restart="stack")
 
     # ------------------------------------------------------------------ setups
+    def setup_current(self) -> dict:
+        """The setup in use and what changed since it was saved or loaded (read from disk: call it rarely)."""
+        n = self.setups.current()
+        out = {"name": n, "changed": [], "base_changed": False, "present": self.setups.present()}
+        if n:
+            try:
+                out["changed"] = self.setups.changes(n)
+                b = str(self.setups.info(n).get("base") or "")
+                out["base_changed"] = bool(b) and b != self.running_base()
+            except Exception as e:
+                out["error"] = str(e)
+        self._setup_cache = (time.monotonic(), out)
+        return out
+
+    def _setup_summary(self) -> dict:
+        t, v = getattr(self, "_setup_cache", (0.0, None))
+        if v is None or time.monotonic() - t > SETUP_CHECK_S:
+            try:
+                v = self.setup_current()
+            except Exception as e:
+                v = {"name": "", "changed": [], "base_changed": False, "present": [], "error": str(e)}
+                self._setup_cache = (time.monotonic(), v)
+        return {k: v[k] for k in ("name", "changed", "base_changed")}
+
     def cmd_setup_list(self):
-        return self._ok(setups=self.setups.list(), base=self.base_view())
+        return self._ok(setups=self.setups.list(), base=self.base_view(), current=self.setup_current())
     cmd_setup_list.read_only = True
+
+    def cmd_setup_preview(self, name):
+        """What loading setup `name` changes: the files, the base, and what restarts."""
+        info = self.setups.info(str(name))
+        changes = self.setups.changes(str(name))
+        d = self.setups._path(str(name)) / "files"
+        rel = S_members(self.core.profile.name)["parts"]
+        m = self._base_model()
+        stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(d / rel), m).values())
+        b, run = str(info.get("base") or ""), self.running_base()
+        base = {"from": run, "to": b, "from_label": B.BASES.get(run, (run,))[0],
+                "to_label": B.BASES.get(b, (b,))[0]} if b and b != run else None
+        return self._ok(changes=changes, base=base, restart="stack" if (stack or base) else "gui",
+                        holds=info.get("holds", []), note=info.get("note", ""), saved=info.get("saved", ""))
+    cmd_setup_preview.read_only = True
 
     def cmd_setup_save(self, name, note="", replace=False):
         holds = self.setups.save(str(name), str(note or ""), bool(replace), base=self.running_base())
         self.core.bridge.log(f"setup '{name}' saved: {', '.join(holds) or 'nothing to save yet'}")
-        return self._ok(f"setup '{name}' saved ({len(holds)} item(s))", setups=self.setups.list(), base=self.base_view())
+        return self._ok(f"setup '{name}' saved ({len(holds)} item(s))", setups=self.setups.list(), base=self.base_view(),
+                        current=self.setup_current())
 
     def cmd_setup_delete(self, name):
         self.setups.delete(str(name))
-        return self._ok(f"setup '{name}' deleted", setups=self.setups.list(), base=self.base_view())
+        return self._ok(f"setup '{name}' deleted", setups=self.setups.list(), base=self.base_view(),
+                        current=self.setup_current())
 
     def cmd_setup_load(self, name):
         why = self._restart_refusal()
@@ -407,6 +643,12 @@ class WorkcellCommands:
         r = h["result"]
         cams = [{"name": c.get("name", c["topic"]), "topic": c["topic"], "info": c.get("info", "")}
                 for c in self.core.profile.cameras if not str(c.get("topic", "")).endswith(("depth", "depth_registered"))]
+        mine = []                                          # colour pictures of SETUP > Drivers & cameras first
+        for d in self.drivers.view()["services"]:
+            info = next((o["topic"] for o in d["outputs"] if o["topic"].endswith("camera_info")), "")
+            mine += [{"name": f"{d['name']} ({o['label']})", "topic": o["topic"], "info": info} for o in d["outputs"]
+                     if o["image"] and info and "depth" not in o["topic"]]
+        cams = mine + [c for c in cams if all(m["topic"] != c["topic"] for m in mine)]
         res = None
         if r:
             xyz, rpy = tf.T_to_mm_deg(r["X"])

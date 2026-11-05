@@ -1066,27 +1066,30 @@ class RosBridge:
             c.header.frame_id = o["link"]
             c.header.stamp = n.get_clock().now().to_msg()
             c.pose = pose(np.eye(4))
-            g = o["geom"]
-            if g["type"] == "mesh":
-                from .parts import read_mesh
-                from urllib.parse import unquote, urlparse
-                try:
-                    tri = read_mesh(unquote(urlparse(g["uri"]).path)) * np.asarray(g["scale"], float)
-                except Exception as e:
-                    return False, f"{o['id']}: {e}"
-                mesh = Mesh()
-                mesh.vertices = [Point(x=float(v[0]), y=float(v[1]), z=float(v[2])) for v in tri.reshape(-1, 3)]
-                mesh.triangles = [MeshTriangle(vertex_indices=[3 * k, 3 * k + 1, 3 * k + 2]) for k in range(len(tri))]
-                c.meshes, c.mesh_poses = [mesh], [pose(o["T_link_obj"])]
-            else:
-                prim = SolidPrimitive()
-                if g["type"] == "box":
-                    prim.type, prim.dimensions = SolidPrimitive.BOX, [float(v) for v in g["size"]]
-                elif g["type"] == "cylinder":
-                    prim.type, prim.dimensions = SolidPrimitive.CYLINDER, [float(g["length"]), float(g["radius"])]
+            for x in o.get("geoms") or [{"geom": o["geom"], "T_link_obj": o["T_link_obj"]}]:
+                g, T = x["geom"], x["T_link_obj"]
+                if g["type"] == "mesh":
+                    from .parts import read_mesh
+                    from urllib.parse import unquote, urlparse
+                    try:
+                        tri = read_mesh(unquote(urlparse(g["uri"]).path)) * np.asarray(g["scale"], float)
+                    except Exception as e:
+                        return False, f"{o['id']}: {e}"
+                    mesh = Mesh()
+                    mesh.vertices = [Point(x=float(v[0]), y=float(v[1]), z=float(v[2])) for v in tri.reshape(-1, 3)]
+                    mesh.triangles = [MeshTriangle(vertex_indices=[3 * k, 3 * k + 1, 3 * k + 2]) for k in range(len(tri))]
+                    c.meshes.append(mesh)
+                    c.mesh_poses.append(pose(T))
                 else:
-                    prim.type, prim.dimensions = SolidPrimitive.SPHERE, [float(g["radius"])]
-                c.primitives, c.primitive_poses = [prim], [pose(o["T_link_obj"])]
+                    prim = SolidPrimitive()
+                    if g["type"] == "box":
+                        prim.type, prim.dimensions = SolidPrimitive.BOX, [float(v) for v in g["size"]]
+                    elif g["type"] == "cylinder":
+                        prim.type, prim.dimensions = SolidPrimitive.CYLINDER, [float(g["length"]), float(g["radius"])]
+                    else:
+                        prim.type, prim.dimensions = SolidPrimitive.SPHERE, [float(g["radius"])]
+                    c.primitives.append(prim)
+                    c.primitive_poses.append(pose(T))
             if o["attach"]:
                 a = AttachedCollisionObject()
                 a.link_name, a.object, a.touch_links = o["link"], c, list(o["touch_links"])

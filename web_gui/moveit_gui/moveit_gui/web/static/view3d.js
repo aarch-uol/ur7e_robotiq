@@ -34,6 +34,24 @@ export function matrixToPose(m) {
   return { xyz_mm: [p.x * 1000, p.y * 1000, p.z * 1000], rpy_deg: [e.x / D2R, e.y / D2R, e.z / D2R] };
 }
 
+// A Part pose is always the pose of its FRAME in its parent frame. Shape anchoring / mesh offsets are visual
+// children of that frame and deliberately never enter these two conversions.
+export function partFrameWorld(parentWorld, pose) {
+  return parentWorld.clone().multiply(poseToMatrix(pose.xyz_mm, pose.rpy_deg));
+}
+export function partPoseFromWorld(parentWorld, world) {
+  return matrixToPose(parentWorld.clone().invert().multiply(world));
+}
+export function partGeometryOffsetMm(d) {
+  const s = d.shape || {}, t = s.type;
+  if (t === "mesh") return (s.offset_mm || [0, 0, 0]).slice();
+  if (d.anchor !== "base") return [0, 0, 0];
+  if (t === "box") return [0, 0, (s.size_mm?.[2] || 0) / 2];
+  if (t === "cylinder") return [0, 0, (s.length_mm || 0) / 2];
+  if (t === "sphere") return [0, 0, s.radius_mm || 0];
+  return [0, 0, 0];
+}
+
 // Wavefront OBJ: positions and faces only (polygons as fans), the way the GUI's Python side reads it.
 function parseObj(text) {
   const v = [], out = [];
@@ -60,7 +78,9 @@ class MeshCache {
     const f = /^file:\/\/.*\/parts\/meshes\/([^/]+)$/.exec(uri);     // a mesh uploaded in SETUP > Parts
     if (f) return `/mesh/_parts/${f[1]}`;
     const c = /^file:\/\/.*\/parts\/generated\/hulls\/([^/]+)$/.exec(uri); // its collision hull
-    return c ? `/mesh/_parts/hulls/${c[1]}` : null;
+    if (c) return `/mesh/_parts/hulls/${c[1]}`;
+    const a = /^file:\/\/.*\/parts\/generated\/collision\/([^/]+)$/.exec(uri);
+    return a ? `/mesh/_parts/collision/${a[1]}` : null;
   }
   // uploaded meshes can be replaced under the same name: forget them when the model changes
   forgetParts() { for (const k of [...this.cache.keys()]) if (k.startsWith("/mesh/_parts/")) this.cache.delete(k); }
@@ -127,6 +147,7 @@ class RobotInstance {
 
   addVisual(parent, v, meshes) {
     const holder = new THREE.Group();
+    holder.userData.linkVisual = true;
     holder.matrixAutoUpdate = false;
     holder.matrix.copy(originMatrix(v.xyz, v.rpy));
     parent.add(holder);
@@ -152,6 +173,12 @@ class RobotInstance {
         holder.add(obj);
       });
     }
+  }
+
+  setLinkGeometryVisible(name, visible) {
+    const g = this.links[name];
+    if (!g) return;
+    for (const c of g.children) if (c.userData.linkVisual) c.visible = visible;
   }
 
   // A mesh could not be loaded (package not installed on the robot PC): draw the link as rods from its origin to
@@ -235,10 +262,41 @@ export class View3D {
     this.gizmo = new TransformControls(this.camera, this.renderer.domElement);
     this.gizmo.setSpace("local");
     this.gizmo.setSize(0.8);
-    this.gizmo.addEventListener("dragging-changed", (e) => { this.orbit.enabled = !e.value; });
-    this.gizmo.addEventListener("objectChange", () => this.onTargetChange(this.targetPose()));
+    this.gizmoOwner = null;
+    this.gizmoDragging = false;
+    this.gizmo.addEventListener("dragging-changed", (e) => {
+      this.orbit.enabled = !e.value;
+      this.gizmoDragging = e.value;
+      if (this.gizmoOwner === "part") this.partDragChanged(e.value);
+    });
+    this.gizmo.addEventListener("objectChange", () => {
+      if (this.gizmoOwner === "target") this.onTargetChange(this.targetPose());
+      else if (this.gizmoOwner === "part") this.partGizmoChanged();
+    });
     this.gizmo.addEventListener("change", () => this.draw());
     this.scene.add(this.gizmo);
+
+    // SETUP > Parts draft: the geometry is a child of the part frame; a separate proxy lets TransformControls
+    // present either the part's local axes or its parent's axes without changing the saved frame convention.
+    this.partDraftFrame = new THREE.Group();
+    this.partDraftFrame.visible = false;
+    this.partDraftVisual = new THREE.Group();
+    this.partDraftFrame.add(this.partDraftVisual);
+    this.partDraftCollision = new THREE.Group();
+    this.partDraftCollision.visible = this.show.collision;
+    this.partDraftFrame.add(this.partDraftCollision);
+    this.scene.add(this.partDraftFrame);
+    this.partGizmoProxy = new THREE.Group();
+    this.partGizmoProxy.visible = false;
+    this.scene.add(this.partGizmoProxy);
+    this.partDraft = null;
+    this.partShapeKey = "";
+    this.partShapeRev = 0;
+    this.partMeshRev = -1;
+    this.partHiddenLink = null;
+    this.partSpace = "local";
+    this.partSnap = 0;
+    this.partDrag = null;
 
     this.ftArrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 0.1, 0xdc2626, 0.03, 0.018);
     this.ftArrow.visible = false;
@@ -298,9 +356,11 @@ export class View3D {
         this.colBot.material.opacity = 0.45;
         this.scene.add(this.colBot.root);
         if (this.robot.values) this.colBot.setJoints(this.robot.values);
+        if (this.partHiddenLink) this.colBot.setLinkGeometryVisible(this.partHiddenLink, false);
       }
       this.robot.root.visible = this.show.visual;
       if (this.colBot) this.colBot.root.visible = this.show.collision;
+      if (this.partDraftCollision) this.partDraftCollision.visible = this.show.collision;
     }
     this.draw();
   }
@@ -335,6 +395,8 @@ export class View3D {
     await this.load(model);
     [this.ghost.root.visible, this.goalBot.root.visible] = vis;
     if (q) this.robot.setJoints(q);
+    this.placePartDraft();
+    if (this.partHiddenLink) this.hidePartLink(this.partHiddenLink, true);
     this.draw();
   }
 
@@ -369,13 +431,31 @@ export class View3D {
       const ok = tcpOff && this.robot.links[tcpOff.link];
       this.tcpOff = ok ? { link: tcpOff.link, M: poseToMatrix(tcpOff.xyz_mm, tcpOff.rpy_deg) } : null;
     }
+    this.placePartDraft();
     this.draw();
   }
 
   // ---------------------------------------------------------------- goal
+  attachGizmo(owner, object) {
+    if (this.gizmoOwner === owner && this.gizmo.object === object) return;
+    this.gizmo.detach();
+    this.gizmoOwner = owner;
+    if (object) this.gizmo.attach(object);
+  }
+  detachGizmo(owner) {
+    if (owner && this.gizmoOwner !== owner) return;
+    this.gizmo.detach();
+    this.gizmoOwner = null;
+  }
   showTarget(on) {
     this.target.visible = on;
-    if (on) this.gizmo.attach(this.target); else this.gizmo.detach();
+    if (on) {
+      this.clearPartDraft();
+      this.gizmo.setSpace("local");
+      this.gizmo.setTranslationSnap(null);
+      this.gizmo.setRotationSnap(null);
+      this.attachGizmo("target", this.target);
+    } else this.detachGizmo("target");
     this.draw();
   }
   setGizmoMode(mode) { this.gizmo.setMode(mode); this.draw(); }
@@ -388,6 +468,182 @@ export class View3D {
   targetPose() {
     this.target.updateMatrixWorld(true);
     return matrixToPose(this.base().invert().multiply(this.target.matrixWorld));
+  }
+
+  // ---------------------------------------------------------- SETUP Parts draft
+  hidePartLink(name, hide) {
+    for (const r of [this.robot, this.colBot]) if (r) r.setLinkGeometryVisible(name, !hide);
+  }
+  clearPartDraft() {
+    if (this.partHiddenLink) this.hidePartLink(this.partHiddenLink, false);
+    this.partHiddenLink = null;
+    this.partDraft = null;
+    this.partDraftFrame.visible = false;
+    this.partGizmoProxy.visible = false;
+    this.partDrag = null;
+    this.partShapeRev++;
+    if (this.gizmoOwner === "part") this.detachGizmo("part");
+    this.draw();
+  }
+  setPartDraft(draft, onChange) {
+    if (!draft) return this.clearPartDraft();
+    if (this.gizmoOwner === "target") this.showTarget(false);
+    if (this.partHiddenLink && this.partHiddenLink !== draft.editing) this.hidePartLink(this.partHiddenLink, false);
+    this.partHiddenLink = draft.editing || null;
+    if (this.partHiddenLink) this.hidePartLink(this.partHiddenLink, true);
+    this.partDraft = { ...draft, onChange };
+    this.partSpace = draft.space === "parent" ? "parent" : "local";
+    this.partSnap = +draft.snap || 0;
+    this.partDraftFrame.visible = true;
+    if (draft.mesh_rev !== this.partMeshRev) {
+      this.partMeshRev = draft.mesh_rev;
+      this.meshes.forgetParts();
+    }
+    const shapeKey = JSON.stringify([draft.shape, draft.anchor, draft.color, draft.mesh_rev]);
+    if (shapeKey !== this.partShapeKey) {
+      this.partShapeKey = shapeKey;
+      this.buildPartDraftShape(draft);
+    }
+    this.gizmo.setMode(draft.mode === "rotate" ? "rotate" : "translate");
+    const step = this.partSnap / 1000;
+    this.gizmo.setTranslationSnap(step || null);
+    this.gizmo.setRotationSnap(this.partSnap ? this.partSnap * D2R : null);
+    this.placePartDraft();
+    if (!this.gizmoDragging) {
+      this.syncPartGizmo();
+      this.attachGizmo("part", this.partGizmoProxy);
+    }
+    this.draw();
+  }
+  buildPartDraftShape(d) {
+    this.partShapeRev++;
+    const rev = this.partShapeRev;
+    for (const o of [...this.partDraftVisual.children]) {
+      this.partDraftVisual.remove(o);
+      o.traverse((x) => { if (x.geometry) x.geometry.dispose(); });
+    }
+    for (const o of [...this.partDraftCollision.children]) {
+      this.partDraftCollision.remove(o);
+      o.traverse((x) => { if (x.geometry) x.geometry.dispose(); });
+    }
+    const mat = new THREE.MeshStandardMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.48,
+                                                 depthWrite: false, metalness: 0.05, roughness: 0.65 });
+    const s = d.shape || {}, off = partGeometryOffsetMm(d).map((x) => x / 1000);
+    let obj = null;
+    if (s.type === "box") obj = new THREE.Mesh(new THREE.BoxGeometry(...s.size_mm.map((x) => x / 1000)), mat);
+    else if (s.type === "sphere") obj = new THREE.Mesh(new THREE.SphereGeometry(s.radius_mm / 1000, 24, 16), mat);
+    else if (s.type === "cylinder") {
+      obj = new THREE.Mesh(new THREE.CylinderGeometry(s.radius_mm / 1000, s.radius_mm / 1000, s.length_mm / 1000, 32), mat);
+      obj.rotation.x = Math.PI / 2;
+    } else if (s.type === "mesh" && s.file) {
+      this.meshes.load(`file:///parts/meshes/${s.file}`).then((r) => {
+        if (!r || rev !== this.partShapeRev || !this.partDraft) return;
+        let mesh;
+        if (r.kind === "stl") mesh = new THREE.Mesh(r.geometry, mat);
+        else {
+          mesh = r.scene.clone(true);
+          mesh.traverse((o) => {
+            if (!o.isMesh || !o.material) return;
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            const copy = mats.map((m) => { const q = m.clone(); q.transparent = true; q.opacity = 0.58; q.depthWrite = false; return q; });
+            o.material = Array.isArray(o.material) ? copy : copy[0];
+          });
+        }
+        mesh.position.set(...off);
+        mesh.scale.multiplyScalar(+s.scale || 1);
+        this.partDraftVisual.add(mesh);
+        this.draw();
+      });
+    }
+    if (obj) {
+      obj.position.set(...off);
+      this.partDraftVisual.add(obj);
+    }
+    const cm = new THREE.MeshStandardMaterial({ color: 0x2fbf71, transparent: true, opacity: 0.42,
+                                                depthWrite: false, metalness: 0, roughness: 0.8 });
+    for (const g of d.collision_preview || []) {
+      this.meshes.load(g.uri).then((r) => {
+        if (!r || rev !== this.partShapeRev || !this.partDraft) return;
+        let mesh;
+        if (r.kind === "stl") mesh = new THREE.Mesh(r.geometry, cm);
+        else {
+          mesh = r.scene.clone(true);
+          mesh.traverse((o) => { if (o.isMesh) o.material = cm; });
+        }
+        mesh.position.set(...off);
+        mesh.scale.multiply(new THREE.Vector3(...g.scale));
+        this.partDraftCollision.add(mesh);
+        this.draw();
+      });
+    }
+    const ax = new THREE.AxesHelper(0.06);
+    ax.material.depthTest = false;
+    ax.renderOrder = 6;
+    this.partDraftVisual.add(ax);
+  }
+  partParentWorld() {
+    return this.partDraft && this.robot && this.robot.worldMatrix(this.partDraft.parent);
+  }
+  placePartDraft() {
+    if (!this.partDraft || !this.partDraftFrame.visible) return;
+    const parent = this.partParentWorld();
+    if (!parent) { this.partDraftFrame.visible = false; return; }
+    this.partDraftFrame.visible = true;
+    const M = partFrameWorld(parent, this.partDraft);
+    M.decompose(this.partDraftFrame.position, this.partDraftFrame.quaternion, this.partDraftFrame.scale);
+    if (!this.gizmoDragging) this.syncPartGizmo();
+  }
+  syncPartGizmo() {
+    if (!this.partDraft || !this.partDraftFrame.visible) return;
+    const parent = this.partParentWorld();
+    if (!parent) return;
+    this.partDraftFrame.updateMatrixWorld(true);
+    const M = this.partDraftFrame.matrixWorld, p = new THREE.Vector3().setFromMatrixPosition(M);
+    let q = new THREE.Quaternion().setFromRotationMatrix(M);
+    if (this.partSpace === "parent") q = new THREE.Quaternion().setFromRotationMatrix(parent);
+    this.partGizmoProxy.position.copy(p);
+    this.partGizmoProxy.quaternion.copy(q);
+    this.partGizmoProxy.scale.set(1, 1, 1);
+    this.partGizmoProxy.visible = true;
+    this.gizmo.setSpace("local");
+  }
+  partDragChanged(on) {
+    if (!this.partDraft) return;
+    if (on) {
+      const parent = this.partParentWorld();
+      this.partGizmoProxy.updateMatrixWorld(true);
+      this.partDrag = parent ? { parent: parent.clone(), pose: poseToMatrix(this.partDraft.xyz_mm, this.partDraft.rpy_deg) } : null;
+    } else {
+      this.partDrag = null;
+      this.syncPartGizmo();
+    }
+  }
+  partGizmoChanged() {
+    const d = this.partDraft, parent = this.partParentWorld();
+    if (!d || !parent) return;
+    this.partGizmoProxy.updateMatrixWorld(true);
+    let pose;
+    if (this.partSpace === "local") {
+      pose = partPoseFromWorld(parent, this.partGizmoProxy.matrixWorld);
+    } else if (this.gizmo.getMode() === "translate") {
+      const p = new THREE.Vector3().setFromMatrixPosition(this.partGizmoProxy.matrixWorld).applyMatrix4(parent.clone().invert());
+      pose = { xyz_mm: [p.x * 1000, p.y * 1000, p.z * 1000], rpy_deg: d.rpy_deg.slice() };
+    } else {
+      const start = this.partDrag?.pose || poseToMatrix(d.xyz_mm, d.rpy_deg);
+      const qp = new THREE.Quaternion().setFromRotationMatrix(parent);
+      const qg = new THREE.Quaternion().setFromRotationMatrix(this.partGizmoProxy.matrixWorld);
+      const delta = qp.clone().invert().multiply(qg);
+      const qs = new THREE.Quaternion().setFromRotationMatrix(start);
+      const T = new THREE.Matrix4().compose(new THREE.Vector3(...d.xyz_mm.map((x) => x / 1000)),
+        delta.multiply(qs), new THREE.Vector3(1, 1, 1));
+      pose = matrixToPose(T);
+    }
+    d.xyz_mm = pose.xyz_mm.slice();
+    d.rpy_deg = pose.rpy_deg.slice();
+    const M = partFrameWorld(parent, pose);
+    M.decompose(this.partDraftFrame.position, this.partDraftFrame.quaternion, this.partDraftFrame.scale);
+    if (d.onChange) d.onChange(pose);
+    this.draw();
   }
 
   // ------------------------------------------------------------- preview

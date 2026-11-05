@@ -49,6 +49,7 @@ from ..vials import VialLibrary, VialProfileError
 from ..handeye import HandEyeError
 from ..parts import PartError, merged_model as parts_merged
 from ..setups import SetupError
+from ..services import ServiceError
 from .workcell import WorkcellCommands
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
@@ -176,6 +177,10 @@ class WebService(WorkcellCommands):
             self._parts_tick()
         except Exception as e:
             self._log_error("parts", e)
+        try:
+            self.drivers.tick()
+        except Exception as e:
+            self._log_error("drivers", e)
         for line in self.core.bridge.drain_logs():
             self.logs.append((next(self._log_seq), line))
 
@@ -281,7 +286,7 @@ class WebService(WorkcellCommands):
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, B.BaseError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError) as e:
                 raise CommandError(str(e)) from None
             if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
                 self.program_rev += 1
@@ -2007,8 +2012,13 @@ class WebService(WorkcellCommands):
             topics, err = [], str(e)
         else:
             err = ""
+        cams = list(self.core.profile.cameras)
+        for r in self.drivers.view()["services"]:              # the image outputs of SETUP > Drivers & cameras
+            info = next((o["topic"] for o in r["outputs"] if o["topic"].endswith("camera_info")), "")
+            cams += [{"name": f"{r['name']} {o['label']}", "topic": o["topic"], "info": info, "driver": r["name"]}
+                     for o in r["outputs"] if o["image"] and all(c["topic"] != o["topic"] for c in cams)]
         return self._ok(error=err, topics=[t for t, _ in topics],
-                        cameras=[{**c, "publishers": b.topic_publishers(c["topic"])} for c in self.core.profile.cameras])
+                        cameras=[{**c, "publishers": b.topic_publishers(c["topic"])} for c in cams])
     cmd_camera_status.read_only = True
 
     # =================================================================== views
@@ -2153,6 +2163,7 @@ class WebService(WorkcellCommands):
 
     def shutdown(self):
         self._jobs.shutdown(wait=False, cancel_futures=True)
+        self.drivers_stop_all()
         self.core.recorder.stop_and_wait("GUI closed")      # never leave a `ros2 bag record` running
 
 

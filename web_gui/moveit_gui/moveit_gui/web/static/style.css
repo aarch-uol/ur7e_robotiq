@@ -178,7 +178,7 @@ tbody tr { cursor: pointer; }
               align-items: flex-start; }
 .list .item:hover { background: var(--sunken); }
 .list .item.on { background: var(--selected); }
-.subnav { width: 150px; flex-shrink: 0; }
+.subnav { width: 190px; flex-shrink: 0; }
 .cam { background: var(--chrome); border-radius: var(--r); min-height: 300px; display: flex; align-items: center;
        justify-content: center; color: var(--on-chrome2); }
 .cam img { max-width: 100%; max-height: 70vh; display: block; }
@@ -427,3 +427,25 @@ table.gains .hint { color: var(--muted); font-size: 11px; cursor: help; }
 .chip.err { background: var(--danger-bg); color: var(--danger); }
 .chip .x { cursor: pointer; margin-left: 2px; }
 #pt-list tr.on td { background: rgba(91, 141, 239, 0.12); }
+/* SETUP menu: groups and the small status after each item */
+.subnav .navgrp { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase;
+  padding: 10px var(--s) 2px; }
+.subnav .navgrp:first-child { padding-top: 2px; }
+.subnav .item { align-items: center; }
+.subnav .nb { font-size: 10px; color: var(--muted); white-space: nowrap; max-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+.subnav .nb.ok { color: var(--ok); } .subnav .nb.warn { color: var(--warn); font-weight: 700; }
+#su-modelbar { margin-bottom: var(--s); align-items: center; }
+.st-cur { padding: 8px var(--s); border-radius: var(--r); background: var(--sunken); margin-bottom: var(--s); }
+.list.subnav { width: auto; }
+ol.steps { margin: 4px 0 6px; padding-left: 18px; color: var(--muted); } ol.steps li { margin: 2px 0; }
+
+/* SETUP > Drivers & cameras */
+.dr-grp { margin: 6px 0 2px; text-transform: uppercase; letter-spacing: .04em; }
+.dr-types { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+.dr-type { text-align: left; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card, #fff); cursor: pointer; font: inherit; }
+.dr-type.on { border-color: var(--accent, #2563eb); box-shadow: 0 0 0 1px var(--accent, #2563eb) inset; }
+.dr-form { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; max-width: 560px; }
+.dr-form > label { color: var(--muted); font-size: 12px; }
+.dr-form .span2 { grid-column: 2; margin-top: -4px; }
+.dr-log { max-height: 260px; overflow: auto; font-size: 11px; background: var(--bg2, #f6f7f9); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; }
+.dr-form input[type=checkbox] { justify-self: start; }

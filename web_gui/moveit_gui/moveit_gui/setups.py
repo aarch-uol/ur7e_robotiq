@@ -13,6 +13,8 @@ Programs, policies and recordings are not part of a setup: they are shared by ev
 """
 from __future__ import annotations
 
+import filecmp
+import json
 import re
 import shutil
 import time
@@ -24,6 +26,8 @@ import yaml
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
 AUTO_PREFIX = "_before_"
 AUTO_KEEP = 5
+CURRENT = "current.yaml"           # setups/current.yaml: the setup last saved or loaded
+DERIVED = ("parts URDF/SRDF",)     # rebuilt from the parts: copied, but not a change of its own
 
 
 class SetupError(ValueError):
@@ -47,6 +51,35 @@ def members(profile: str) -> Dict[str, str]:
 
 def _payload_files(cfg: Path, profile: str) -> List[Path]:
     return sorted((cfg / "ft_payload").glob(f"{profile}_*.json"))
+
+
+def _same_tree(a: Path, b: Path) -> bool:
+    """Two directories hold the same files (missing or empty = the same as each other)."""
+    fa = {p.relative_to(a) for p in a.rglob("*") if p.is_file()} if a.is_dir() else set()
+    fb = {p.relative_to(b) for p in b.rglob("*") if p.is_file()} if b.is_dir() else set()
+    return fa == fb and all(filecmp.cmp(a / r, b / r, shallow=True) for r in fa)
+
+
+VOLATILE = {"restored"}               # written by the GUI itself (ft_bias: when it put the bias back after a restart)
+
+
+def _drop_volatile(v):
+    if isinstance(v, dict):
+        return {k: _drop_volatile(x) for k, x in v.items() if k not in VOLATILE}
+    return [_drop_volatile(x) for x in v] if isinstance(v, list) else v
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    if a.is_file() != b.is_file():
+        return False
+    if not a.is_file() or filecmp.cmp(a, b, shallow=False):
+        return True
+    if a.suffix == ".json":
+        try:
+            return _drop_volatile(json.loads(a.read_text())) == _drop_volatile(json.loads(b.read_text()))
+        except (OSError, ValueError):
+            return False
+    return False
 
 
 class Setups:
@@ -77,6 +110,49 @@ class Setups:
                         "profile": info.get("profile", ""), "base": info.get("base", ""),
                         "error": info.get("error", "")})
         return out
+
+    # ---- which setup is in use, and what differs from it
+    def current(self) -> str:
+        """The setup last saved or loaded ("" if none, or it was deleted since)."""
+        try:
+            n = str((yaml.safe_load((self.dir / CURRENT).read_text()) or {}).get("name") or "")
+        except Exception:
+            return ""
+        return n if n and (self.dir / n / "setup.yaml").is_file() else ""
+
+    def _mark(self, name: str):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        (self.dir / CURRENT).write_text(yaml.safe_dump({"name": name, "at": time.strftime("%Y-%m-%d %H:%M")}))
+
+    def present(self) -> List[str]:
+        """What a save would hold now (the keys of members(), plus the last payload calibration)."""
+        out = []
+        for key, rel in members(self.profile).items():
+            src = self.cfg / rel.rstrip("/")
+            if (rel.endswith("/") and src.is_dir() and any(src.iterdir())) or (not rel.endswith("/") and src.is_file()):
+                out.append(key)
+        return out + (["last payload calibration"] if _payload_files(self.cfg, self.profile) else [])
+
+    def changes(self, name: str) -> List[str]:
+        """What differs between the files in use and setup `name` (keys of members(); derived files left out)."""
+        files = self._path(name) / "files"
+        out = []
+        for key, rel in members(self.profile).items():
+            if key in DERIVED:
+                continue
+            a, b = self.cfg / rel.rstrip("/"), files / rel.rstrip("/")
+            if not (_same_tree(a, b) if rel.endswith("/") else _same_file(a, b)):
+                out.append(key)
+        live, kept = _payload_files(self.cfg, self.profile), sorted((files / "ft_payload").glob("*.json"))
+        if bool(live) != bool(kept) or (live and not filecmp.cmp(live[-1], kept[-1], shallow=False)):
+            out.append("last payload calibration")
+        return out
+
+    def info(self, name: str) -> dict:
+        d = self._path(name)
+        if not (d / "setup.yaml").is_file():
+            raise SetupError(f"no setup '{name}'")
+        return yaml.safe_load((d / "setup.yaml").read_text()) or {}
 
     def _copy_in(self, dest: Path, note: str, base: Optional[str] = None) -> List[str]:
         tmp = dest.with_name(dest.name + ".partial")
@@ -122,7 +198,9 @@ class Setups:
         if d.exists() and not replace:
             raise SetupError(f"a setup '{d.name}' exists (save again to replace it)")
         self.dir.mkdir(parents=True, exist_ok=True)
-        return self._copy_in(d, note, base)
+        holds = self._copy_in(d, note, base)
+        self._mark(d.name)
+        return holds
 
     def delete(self, name: str):
         d = self._path(name)
@@ -159,6 +237,7 @@ class Setups:
             # a new name, so it is the newest file (the one SETUP shows as the last calibration)
             shutil.copy2(p, self.cfg / "ft_payload" / f"{self.profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         self._prune()
+        self._mark(d.name)
         b = str(info.get("base") or "")
         from .bases import BASES
         return {"backup": backup, "holds": info.get("holds", []), "base": b if b in BASES else ""}

@@ -495,6 +495,7 @@ def main(argv=None):
     stop.wait()
     core.stop_all()
     core.recorder.stop_and_wait("GUI closed")      # finish the bag file; never leave `ros2 bag record` behind
+    service.drivers_stop_all()                     # camera drivers / pipelines (kept on a GUI-only restart)
     server.stop()
     bridge.shutdown()
     return service.restart_code or 0

@@ -20,7 +20,10 @@ Saved in config_dir()/parts/<profile>.yaml (+ meshes/). Loaded with yaml.safe_lo
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,8 +43,9 @@ JOINT_PREFIX, JOINT_SUFFIX = "gui_part_", "_joint"
 OBJECT_PREFIX = "gui_part/"
 MESH_MAX_BYTES = M.MESH_MAX_BYTES
 MESH_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(stl|obj|dae)$", re.I)
-COLLISIONS = ("visual", "box", "hull", "none")     # visual: the shape itself; box: its bounding box;
-                                                   # hull: a mesh's convex hull (light for MoveIt); none: show only
+COLLISIONS = ("auto", "visual", "box", "hull", "none")
+AUTO_DEFAULTS = {"max_pieces": M.AUTO_MAX_PIECES, "max_triangles": M.AUTO_MAX_TRIANGLES,
+                 "tolerance_mm": M.AUTO_TOLERANCE_MM, "concavity": M.AUTO_CONCAVITY}
 GENERATED_URDF, GENERATED_SRDF = "robot_parts.urdf.xacro", "robot_parts.srdf.xacro"
 POS_TOL_M, ANG_TOL_RAD = 1e-5, 1e-4
 
@@ -85,6 +89,7 @@ class Part:
     anchor: str = "base"                            # base: the shape starts at the frame and grows along +Z
     color: str = "#9aa0a6"
     collision: str = "visual"                      # one of COLLISIONS
+    collision_settings: dict = field(default_factory=dict)
     kind: str = "part"                              # camera: a camera's frame (hand-eye calibration result)
     note: str = ""
     meta: dict = field(default_factory=dict)        # saved, source (typed / handeye / preset)
@@ -124,6 +129,8 @@ class Part:
         d = {"parent": self.parent, "xyz_mm": [round(float(v), 3) for v in self.xyz_mm],
              "rpy_deg": [round(float(v), 4) for v in self.rpy_deg], "shape": self.shape, "anchor": self.anchor,
              "color": self.color, "collision": self.collision, "kind": self.kind}
+        if self.collision_settings:
+            d["collision_settings"] = self.collision_settings
         if self.note:
             d["note"] = self.note
         if self.meta:
@@ -142,8 +149,7 @@ def _num(v, what, lo=-1e9, hi=1e9) -> float:
 
 
 def collision_mode(collision, shape_type: str) -> str:
-    """visual / box / hull / none; True / False (older files) are visual / none. A frame has none; only a mesh has
-    a hull (for a primitive, hull is the shape itself)."""
+    """Legacy missing mesh collision stays hull. auto/hull are mesh-only; primitives use their visual shape."""
     if collision is None:
         c = "hull" if shape_type == "mesh" else "visual"
     elif isinstance(collision, bool):
@@ -154,13 +160,22 @@ def collision_mode(collision, shape_type: str) -> str:
         raise PartError(f"collision is one of {', '.join(COLLISIONS)}")
     if shape_type == "none":
         return "none"
-    if c == "hull" and shape_type != "mesh":
+    if c in ("auto", "hull") and shape_type != "mesh":
         return "visual"
     return c
 
 
+def auto_settings(settings=None) -> dict:
+    s = {**AUTO_DEFAULTS, **dict(settings or {})}
+    s["max_pieces"] = int(_num(s["max_pieces"], "max collision pieces", 1, 16))
+    s["max_triangles"] = int(_num(s["max_triangles"], "collision triangles per piece", 16, 256))
+    s["tolerance_mm"] = _num(s["tolerance_mm"], "collision tolerance", 0, 10)
+    s["concavity"] = _num(s["concavity"], "collision concavity ratio", 1.01, 10)
+    return s
+
+
 def make_part(name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base", color="#9aa0a6",
-              collision=None, kind="part", note="", meta=None) -> Part:
+              collision=None, collision_settings=None, kind="part", note="", meta=None) -> Part:
     name = str(name).strip()
     if not NAME.match(name):
         raise PartError("a part name is lower_snake_case: a-z, 0-9, _ (up to 40, starting with a letter)")
@@ -201,7 +216,9 @@ def make_part(name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base"
         raise PartError("colour is #rrggbb")
     if kind not in KINDS:
         raise PartError(f"kind is one of {', '.join(KINDS)}")
-    return Part(name, str(parent).strip(), xyz, rpy, s, anchor, str(color), collision_mode(collision, s["type"]),
+    mode = collision_mode(collision, s["type"])
+    cs = auto_settings(collision_settings) if mode == "auto" else {}
+    return Part(name, str(parent).strip(), xyz, rpy, s, anchor, str(color), mode, cs,
                 kind, str(note or "")[:200], dict(meta or {}))
 
 
@@ -214,6 +231,7 @@ class PartStore:
         self.parts: Dict[str, Part] = {}
         self.error = ""
         self._bounds: Dict[str, tuple] = {}            # file -> ((file, mtime), (lo, hi))
+        self._auto_lock = threading.Lock()
         self.load()
 
     def load(self):
@@ -229,10 +247,9 @@ class PartStore:
             try:
                 self.parts[n] = make_part(n, **{k: v for k, v in (p or {}).items()
                                                 if k in ("parent", "xyz_mm", "rpy_deg", "shape", "anchor", "color",
-                                                         "collision", "kind", "note", "meta")})
+                                                         "collision", "collision_settings", "kind", "note", "meta")})
             except (PartError, TypeError) as e:
                 self.error = f"part {n}: {e}"
-
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
@@ -362,6 +379,75 @@ class PartStore:
         tmp.replace(out)
         return out
 
+    def _auto_cache(self, part: Part):
+        if part.shape.get("type") != "mesh":
+            return None, None
+        f = part.shape["file"]
+        settings = auto_settings(part.collision_settings)
+        scale = float(part.shape["scale"])
+        key_data = {"algorithm": M.AUTO_COLLISION_VERSION, "scale": scale, **settings}
+        key = hashlib.sha256(json.dumps(key_data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
+        root = self.generated_dir / "collision"
+        return root, root / f"{f}.{key}.json"
+
+    def auto_collision_cached(self, part: Part) -> Optional[Tuple[List[Path], dict]]:
+        """Cached pieces only; never starts generation (safe from tick/status paths)."""
+        root, manifest = self._auto_cache(part)
+        if root is None:
+            return None
+        src = self.mesh_dir / part.shape["file"]
+        try:
+            if not manifest.is_file() or manifest.stat().st_mtime_ns < src.stat().st_mtime_ns:
+                return None
+            d = json.loads(manifest.read_text())
+            paths = [root / x for x in d["files"]]
+            return (paths, d["info"]) if paths and all(p.is_file() for p in paths) else None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def auto_collision_files(self, part: Part, force: bool = False) -> Tuple[List[Path], dict]:
+        """Generated conservative convex pieces for an auto mesh collision, cached by mesh version + settings."""
+        with self._auto_lock:
+            if not force:
+                cached = self.auto_collision_cached(part)
+                if cached is not None:
+                    return cached
+            f = part.shape["file"]
+            src = self.mesh_dir / f
+            root, manifest = self._auto_cache(part)
+            settings = auto_settings(part.collision_settings)
+            scale = float(part.shape["scale"])
+            key = manifest.name[len(f) + 1:-len(".json")]
+            try:
+                tri = read_mesh(src)
+                tol_units = (settings["tolerance_mm"] / 1000.0) / scale
+                pieces, info = M.auto_collision(tri, max_pieces=settings["max_pieces"],
+                                                max_triangles=settings["max_triangles"],
+                                                tolerance=tol_units, concavity=settings["concavity"])
+            except M.MeshError as e:
+                raise PartError(f"{f}: automatic collision failed ({e})") from None
+            info = {**info, "visual_triangles": int(len(tri)), "settings": settings}
+            root.mkdir(parents=True, exist_ok=True)
+            paths = []
+            for i, piece in enumerate(pieces):
+                out = root / f"{f}.{key}.{i}.stl"
+                tmp = out.with_suffix(".tmp")
+                M.write_stl(tmp, piece)
+                tmp.replace(out)
+                paths.append(out)
+            tmp = manifest.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "files": [p.name for p in paths], "info": info},
+                                      sort_keys=True, separators=(",", ":")))
+            tmp.replace(manifest)
+            return paths, info
+
+    def auto_collision_info(self, part: Part) -> Optional[dict]:
+        """Cached summary for an auto part; does not generate."""
+        if part.collision != "auto" or part.shape.get("type") != "mesh":
+            return None
+        cached = self.auto_collision_cached(part)
+        return cached[1] if cached else None
+
     def extent_m(self, part: Part) -> Tuple[float, float]:
         mb = self.mesh_bounds(part.shape["file"]) if part.shape.get("type") == "mesh" else None
         return part.extent_m(mb)
@@ -482,42 +568,55 @@ def _visual(store: PartStore, p: Part) -> Optional[dict]:
             "rgba": None if _keeps_colours(p) else _rgba(p.color)}
 
 
-def _collision(store: PartStore, p: Part) -> Optional[Tuple[dict, np.ndarray]]:
-    """(geometry in metres, T_part_geom) MoveIt and the URDF collide with, None for collision none."""
+def _collisions(store: PartStore, p: Part) -> List[Tuple[dict, np.ndarray]]:
+    """[(geometry in metres, T_part_geom)] for MoveIt/URDF. auto mesh collision returns several pieces."""
     g = _geom_m(store, p)
     if g is None or p.collision == "none":
-        return None
+        return []
     T = p.T_part_geom()
     if p.collision == "box":
         if g["type"] == "mesh":
             b = store.mesh_bounds(p.shape["file"])
             if b is None:
-                return None
+                return []
             lo, hi = b[0] * p.shape["scale"], b[1] * p.shape["scale"]
             C = np.eye(4)
             C[:3, 3] = (lo + hi) / 2
-            return {"type": "box", "size": [max(float(v), 1e-4) for v in hi - lo]}, T @ C
+            return [({"type": "box", "size": [max(float(v), 1e-4) for v in hi - lo]}, T @ C)]
         if g["type"] == "cylinder":
-            return {"type": "box", "size": [2 * g["radius"], 2 * g["radius"], g["length"]]}, T
+            return [({"type": "box", "size": [2 * g["radius"], 2 * g["radius"], g["length"]]}, T)]
         if g["type"] == "sphere":
-            return {"type": "box", "size": [2 * g["radius"]] * 3}, T
-        return g, T
+            return [({"type": "box", "size": [2 * g["radius"]] * 3}, T)]
+        return [(g, T)]
+    if p.collision == "auto" and g["type"] == "mesh":
+        cached = store.auto_collision_cached(p)
+        return [({**g, "uri": q.resolve().as_uri()}, T) for q in cached[0]] if cached else []
     if p.collision == "hull" and g["type"] == "mesh":
         try:
-            return {**g, "uri": store.hull_file(p.shape["file"]).resolve().as_uri()}, T
+            return [({**g, "uri": store.hull_file(p.shape["file"]).resolve().as_uri()}, T)]
         except (OSError, PartError):
-            return g, T                                        # no hull (flat mesh): the mesh itself
-    return g, T
+            return [(g, T)]                                    # no hull (flat mesh): the mesh itself
+    return [(g, T)]
+
+
+def _collision(store: PartStore, p: Part) -> Optional[Tuple[dict, np.ndarray]]:
+    """Backward-compatible first collision geometry; auto callers should use _collisions()."""
+    c = _collisions(store, p)
+    return c[0] if c else None
+
+
+def collision_geoms(store: PartStore, p: Part) -> List[dict]:
+    """Collision shapes as visual-like dicts for the 3D views."""
+    out = []
+    for g, T in _collisions(store, p):
+        out.append({"geometry": g, "xyz": [float(v) for v in T[:3, 3]],
+                    "rpy": list(tf.quat_to_rpy(tf.matrix_to_quat(T[:3, :3]))), "rgba": None})
+    return out
 
 
 def collision_geom(store: PartStore, p: Part) -> Optional[dict]:
-    """The collision shape as a visual-like dict {geometry, xyz, rpy} (for the 3D views), None for none."""
-    c = _collision(store, p)
-    if c is None:
-        return None
-    g, T = c
-    return {"geometry": g, "xyz": [float(v) for v in T[:3, 3]],
-            "rpy": list(tf.quat_to_rpy(tf.matrix_to_quat(T[:3, :3]))), "rgba": None}
+    c = collision_geoms(store, p)
+    return c[0] if c else None
 
 
 def _same_geom(a: Optional[dict], b: Optional[dict]) -> bool:
@@ -546,8 +645,8 @@ def status(store: PartStore, model: dict) -> Dict[str, str]:
         vis, mine = links.get(n) or [], _visual(store, p)
         same = same and len(vis) == (1 if mine else 0) and (not mine or _same_geom(vis[0], mine))
         if same and "collisions" in model:                   # the model knows its collision shapes: compare those
-            col, cmine = model["collisions"].get(n) or [], collision_geom(store, p)
-            same = len(col) == (1 if cmine else 0) and (not cmine or _same_geom(col[0], cmine))
+            col, cmine = model["collisions"].get(n) or [], collision_geoms(store, p)
+            same = len(col) == len(cmine) and all(_same_geom(a, b) for a, b in zip(col, cmine))
         out[n] = "in_model" if same else "changed"
     for n in have:
         if n not in store.parts:
@@ -566,8 +665,7 @@ def merged_model(store: PartStore, model: dict) -> dict:
             continue
         v = _visual(store, p)
         links[n] = [v] if v else []
-        c = collision_geom(store, p)
-        cols[n] = [c] if c else []
+        cols[n] = collision_geoms(store, p)
         T = p.T_parent_part()
         joints.append({"name": joint_name(n), "type": "fixed", "parent": p.parent, "child": n,
                        "xyz": [float(x) for x in T[:3, 3]], "rpy": list(tf.quat_to_rpy(tf.matrix_to_quat(T[:3, :3]))),
@@ -608,12 +706,16 @@ def live_plan(store: PartStore, model: dict) -> Tuple[List[Tuple[str, str, np.nd
             continue                                         # parent missing from this model: shown as a problem
         if p.parent in links or p.parent in store.parts:
             frames.append((p.parent, n, p.T_parent_part()))
-        c = _collision(store, p)
-        if c is None:
+        cs = _collisions(store, p)
+        if not cs:
             continue
-        objects.append({"id": OBJECT_PREFIX + n, "link": link, "T_link_obj": T_link_part @ c[1], "geom": c[0], "attach": rides_on_arm(model, link),
-                        "touch_links": sorted(neighbourhood(model, link) | {
-                            q for q in store.parts if q != n and _anchor_link(store, model, q) == link})})
+        geoms = [{"geom": g, "T_link_obj": T_link_part @ T} for g, T in cs]
+        obj = {"id": OBJECT_PREFIX + n, "link": link, "geoms": geoms, "attach": rides_on_arm(model, link),
+               "touch_links": sorted(neighbourhood(model, link) | {
+                   q for q in store.parts if q != n and _anchor_link(store, model, q) == link})}
+        if len(geoms) == 1:                                  # old bridge/tests can still inspect the single geometry
+            obj.update(geoms[0])
+        objects.append(obj)
     return frames, objects
 
 
@@ -685,9 +787,8 @@ def generate_urdf(store: PartStore, model: Optional[dict] = None) -> str:
             mat = "" if _keeps_colours(p) else \
                 f'<material name="gui_part_{n}_colour"><color rgba="{rgba}"/></material>'
             lines.append(f'    <visual>{o}<geometry>{_geometry_xml(g)}</geometry>{mat}</visual>')
-            c = _collision(store, p)
-            if c is not None:
-                lines.append(f'    <collision>{_origin_xml(c[1])}<geometry>{_geometry_xml(c[0])}</geometry>'
+            for cg, Tc in _collisions(store, p):
+                lines.append(f'    <collision>{_origin_xml(Tc)}<geometry>{_geometry_xml(cg)}</geometry>'
                              '</collision>')
         lines.append('  </link>')
         lines.append(f'  <joint name="{joint_name(n)}" type="fixed"><parent link="{p.parent}"/><child link="{n}"/>'

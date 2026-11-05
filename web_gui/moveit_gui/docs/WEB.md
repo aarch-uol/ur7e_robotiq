@@ -92,7 +92,7 @@ program runner and lease, and they do not know about each other.
 | OPERATE | MoveJ (joints, waypoints), MovePose (any frame, linear), Plan → preview → Execute, Jog (step, or hold-to-jog through Servo), Force (Admittance / Impedance), 3D view (robot, goal gizmo, plan preview, F/T and force arrows, TF Frames overlay (checklist in localStorage, polled at 2 Hz via `tf_frames`), planned TCP path line, 10 s TCP Trail, Top/Front/Side/Iso and Follow TCP camera controls), control mode switch, freedrive, gripper, ATI F/T, Joint monitor (bar per joint across its URDF limits, amber within 10°, red within 3°), live F/T chart (last 20 s, Pause/Clear, torque toggle, commanded-force line) | With **Goal** on, an **orange goal-state arm** follows the goal marker live (as in RViz MotionPlanning): IK in the page from the robot model, seeded from the current joints, within joint limits, retried from other seeds near singular poses; nothing is sent to the robot and nothing is collision-checked (Plan does that). A goal it cannot reach says so and keeps the last pose that worked. Screenshot: `docs/ux/web_operate_goal_state.png`.
 | PROGRAMS | Insert tab with the **jog panel and gripper** (jog, then MoveJ/MoveL (here)); waypoint rename and coordinates; **3D preview** beside the tree: the program's TCP path (loops and relative moves included) and its waypoints (selected one orange, joint targets as a ghost arm); typed waypoints and a Go to list; loop progress in the run bar; UR-style tree (Loop, Folder, Comment, …); Insert / Command / Teach tabs; edits apply when you leave a field; **Undo / Redo** (also Ctrl+Z / Ctrl+Y); unsaved changes are marked `*` and New/Open ask first; Set waypoint here, Move here; run from a selected step, step, pause, stop; The 3D preview's **▶ Play** runs a ghost arm through the whole program from where the robot is (loops included; MoveJ / non-linear MovePose in joint space, linear moves in <= 10 mm steps with IK); nothing moves, no planning, no contact. A **Move until contact** is drawn to where it meets the wall or floor of a vial of known size (a fixture with a radius: taught by touch, a vial profile, Use example vial, or the example vial while assumed), else to its full distance; the step line says which. A fixture the program uses but that is not taught yet is previewed at the profile's `example_fixtures` position (`vial` = scraping.py's target_xyz [525, 16, 40] mm in base_link, what `robot_demo` runs), else under the tool now; the note says which. SETUP > Vial Geometry > **Use example vial** saves the example as the real fixture on request. **Step through** under the view: |◀ ◀ slider ▶ ▶| picks one move (loops unrolled); the ghost repeats only that move, it is orange on the path, and the line under it says which step and loop turn it is (e.g. `Move 6 / 79 · step 8.5 · Loop 8 · 2/37 · Move relative [0, 0, -41] mm in vial`). The path is drawn for the **active TCP**: a taught pose puts its own TCP at the target (as the runner does) and the line shows where the active one goes; changing or editing the active TCP redraws it. A pose's TCP can be `active` (whichever TCP is selected when it runs; the Franka baseline example uses it) or a named TCP (TCP dropdown in the waypoint editor). A path that goes below the robot base (z < 0) is flagged in red under the preview. Screenshots: `docs/ux/web_programs_play.png`, `docs/ux/web_programs_step.png`. |
 | AUTOMATION | policy list, readiness with **Fix** buttons (use the TCP, switch mode, apply the trained gains, open SETUP/DIAGNOSTICS), Prepare (shows PREPARING…, Cancel), Run, STOP POLICY, recording on/off, live feedback (when the runner gives it) |
-| SETUP | TCPs, Parts, Vial Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is a reminder to press Zero now after Apply, not a FAIL. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial Geometry): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), Cameras (MJPEG preview of any image topic) |
+| SETUP | TCPs, Parts, Vial Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is a reminder to press Zero now after Apply, not a FAIL. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial Geometry): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), **Drivers & cameras** (start / stop camera drivers and pipelines, live picture, log; see below) |
 | DIAGNOSTICS | controllers, state, **recording** (rosbag2/MCAP, see below), **run history** (every program and policy run: when, how long, result, policy log folder; kept in `~/.config/moveit_gui/history/<profile>.jsonl`), log with filter, "problems only" and download |
 
 Still desktop-only: pivot calibration of TCPs, the fixture wizard, the detailed control-stack
@@ -293,11 +293,34 @@ come back here. Recording never moves the robot. Starting needs control, but any
 
 ## Parts, camera calibration, setups, restart (SETUP)
 
+The SETUP menu is in three groups, in the order a new user needs them: **Robot** (Setups, Parts, TCPs),
+**Calibrate** (Camera calibration, F/T + Payload, Vial Geometry) and **Cell** (Drivers & cameras, Keep-out zones,
+Controller gains). Each item shows a short status: the setup in use (or *changed*), how many parts / TCPs / keep-out boxes, ✓
+when a camera, payload or vial is calibrated. One bar at the top of every SETUP page says when saved parts (or
+calibrated cameras, or a base switch) are not in the robot model yet, with **Restart robot stack…**.
+
+**TCPs** (SETUP › TCPs): one list (Edit, Delete, Set active) and one editor: name and parent once, then
+*Type the offset* or *Measure the tip (pivot)*: hold the tip on one fixed point in freedrive, tilt, Capture 6-12
+times, Solve, Save TCP. The pivot gives the position only; the rotation is typed (usually 0 0 0).
+
 **Parts** (SETUP › Parts): things bolted to the robot or the cell, without editing URDF. A part is a box, cylinder,
 sphere, mesh (.stl, .obj or .dae upload) or a bare frame, on a parent (a robot link, or another part) at an offset in
 mm / deg. A shape sits on its frame and grows along +Z, so **+** on a part (or *on far face*) stacks the next piece
 where the previous one ends, like the real tool. Presets: spatula on the gripper, wrist camera bracket, RealSense
 D435, table, frame only.
+
+The editor shows an unsaved part as a translucent **draft** in the SETUP 3D view. Move / Rotate uses the same
+drag gizmo as OPERATE's Goal TCP; Local / Parent chooses the axes and Snap can use 1 mm / 1° or 5 mm / 5° steps.
+Typing XYZ / RPY moves the draft too. **Import mesh…** starts a new mesh draft immediately, places it standing on
+its frame and uses **auto** collision by default; nothing becomes TF / MoveIt geometry until **Save part**.
+Cancel removes the draft and restores the saved part when editing.
+
+For a mesh, **auto (recommended)** builds a few light convex collision meshes automatically: it keeps the CAD mesh
+for the visual (so a .dae keeps its colours), but MoveIt and the generated URDF use the simplified pieces. The
+collision line reports piece / triangle count and volume excess; Advanced can change the piece limit, triangles per
+piece and tolerance, or regenerate. **Collision** in the 3D view shows the same generated pieces, including an
+unsaved draft once its preview is ready. Existing saved mesh parts without a collision setting keep the old
+single-convex-hull behaviour.
 
 * **Live at once:** a static TF frame (parent → part), a MoveIt collision object `gui_part/<name>` (attached to the
   arm link the part rides on, with that link's neighbours as touch links, so plans carry it; a world object for
@@ -315,11 +338,12 @@ D435, table, frame only.
 * **Meshes:** STL and OBJ are in whatever unit the CAD used. The upload guesses it from the size (mm / m / inch can be
   changed; the size shown in mm must match the real part). A .dae carries its unit and keeps its own colours. *Place
   it* puts the mesh's origin where you want it on the part frame: *as exported*, *centred*, or *standing on the
-  frame* (centred in X / Y, bottom on the frame, so it stacks like the other shapes). Up to 20 MB and 200 000
+  frame* (centred in X / Y, bottom on the frame, so it stacks like the other shapes). Up to 20 MB and 400 000
   triangles; textures are not used.
-* **Collision** per part: *as shown*, *convex hull* (default for meshes: light, and MoveIt plans faster with it),
-  *bounding box*, or *none* (shown only: MoveIt ignores it, nothing is attached). The hull is made once per mesh in
-  `parts/generated/hulls/`. The same shape goes live and into the generated URDF.
+* **Collision** per part: new meshes default to *auto (recommended)*, which generates a small deterministic set of
+  conservative convex pieces under `parts/generated/collision/`. *Full visual mesh*, *single convex hull*,
+  *bounding box* and *none* remain available; saved mesh parts that omit `collision` still use the historical
+  single-hull behaviour. The same collision geometry goes live in MoveIt and into the generated URDF.
 * **Visual / Collision** (bottom right of every 3D view): show the robot's visual meshes, its collision shapes
   (translucent green: what MoveIt checks, robot links and parts), or both. Every 3D view follows the choice.
 * A new tool changes the payload: redo SETUP › F/T + Payload.
@@ -330,6 +354,9 @@ Screenshot: `docs/ux/web_setup_parts.png`.
 DICT_5X5_100 by default; **Print board…** opens it at true size; print at 100 %, measure a square, enter it, *Save
 board*). Eye-in-hand (camera on the tool, board still in the cell: gives flange → camera) or eye-to-hand (camera on
 a stand, board on the tool: gives base → camera).
+
+The page is four steps and the next step's button is the blue one (Start, Collect all…, Solve, Save + add to robot).
+The board is one line (*7 × 5 squares of 35 mm …*); *Change the board* opens its fields.
 
 1. Pick the camera and **Start**: intrinsics come from its CameraInfo (RealSense / ZED are factory calibrated).
 2. **Look** shows what the detector sees (corners, reprojection error, distance). Then either **Capture here**
@@ -364,17 +391,44 @@ stack too when the setup's parts or base differ from the running robot model. So
 build it in Parts, save it as a setup, and load setups to switch; the files in use before are kept as an automatic backup (`_before_…`, newest 5). Stored in
 `config_dir()/setups/<name>/`.
 
-**Restart** (SETUP › Setups, and the Parts banner): *Restart GUI* (exit code 76) or *Restart robot stack* (75: the
+The top of the page says which setup is **in use** (the last one saved or loaded) and what changed since
+(*Changed since saved: TCPs + fixtures*), with **Save into "<name>"**. Under the save form, *Saves:* lists what a
+save would hold. **Load…** first shows only what differs from the files in use, a base change, and what restarts.
+The setup in use is kept in `config_dir()/setups/current.yaml`; the comparison leaves out the generated URDF/SRDF.
+
+**Restart** (SETUP › Setups, and the bar on every SETUP page): *Restart GUI* (exit code 76) or *Restart robot stack* (75: the
 container stops and starts again with the parts, about a minute; press Play on the pendant again unless headless).
 `ur7e_gui.sh` does the restart; refused while anything moves, runs or pushes. Every browser takes control again.
 
+## Drivers & cameras (SETUP › Cell)
+
+One list of the ROS processes the GUI starts and stops for you: camera drivers now, vision pipelines later.
+**+ Add…** asks *what is it?* (Intel RealSense, USB / webcam, Stereolabs ZED, a ROS launch file, a ROS node),
+then a name (it becomes the ROS namespace) and a few settings. Each row has a status dot and **Start / Stop**;
+selecting it shows the live picture, its topics (green = publishing) and the log.
+
+- **Ready** = every topic it should make publishes. *No data* = it runs, but a topic is missing after 25 s (see the
+  log). *Failed* = it stopped by itself. *Not installed* = its ROS package is not in the robot image.
+- **Needs**: a pipeline can need a camera. Start starts the camera first and the pipeline once the camera is
+  ready; Stop stops the pipeline first. Programs will use the same "ready" check.
+- **Start with the GUI** starts it whenever the GUI starts (so after a robot stack restart too).
+- Stop sends Ctrl-C (SIGINT), then SIGTERM after 8 s, then SIGKILL. A GUI-only restart leaves the drivers running
+  (the new GUI takes them over); closing the GUI or restarting the robot stack stops them.
+- Nothing here moves the robot. The command is `ros2 launch …` / `ros2 run …` without a shell; it is shown under
+  the log. The list is `config_dir()/services/<profile>.yaml`, the logs `config_dir()/services/logs/` (newest 5
+  per driver). Calibrated camera colour topics appear first in Camera calibration.
+- The robot image needs the drivers (`ros-jazzy-realsense2-camera`, `ros-jazzy-usb-cam` in `docker/Dockerfile`)
+  and the container needs the USB devices: `-v /dev:/dev --device-cgroup-rule='c 81:* rmw'
+  --device-cgroup-rule='c 189:* rmw'` on the launcher's `docker run`. ZED needs the ZED SDK (CUDA): not in the
+  image yet.
+
 ## Cameras over the tailnet
 
-Only one image topic is subscribed, and only while someone has SETUP › Cameras open. It is sent as JPEG at
+Only one image topic is subscribed, and only while someone looks at a picture in SETUP › Drivers & cameras. It is sent as JPEG at
 up to 10 frames/s. If two browsers watch different topics, the last one to open wins.
 
 ## Files
 
 `moveit_gui/web/server.py` (HTTP, standard library only), `moveit_gui/web/service.py` (lease, commands, state;
-tested without HTTP in `test/test_web.py`), `moveit_gui/web/workcell.py` (Parts, Camera calibration, Setups, restart; `test/test_workcell.py`), `moveit_gui/web/static/` (the app: HTML, CSS, `app.js`, `workcell.js`, `view3d.js`, no build
-step). Logic without the web: `moveit_gui/parts.py`, `handeye.py`, `setups.py`. Screenshots: `docs/ux/web_*.png` (`tools/web_screenshots.py`).
+tested without HTTP in `test/test_web.py`), `moveit_gui/web/workcell.py` (Parts, Camera calibration, Setups, restart; `test/test_workcell.py`), `moveit_gui/web/static/` (the app: HTML, CSS, `app.js`, `workcell.js`, `drivers.js`, `view3d.js`, no build
+step). Logic without the web: `moveit_gui/parts.py`, `handeye.py`, `setups.py`, `services.py` (drivers; `test/test_services.py`). Screenshots: `docs/ux/web_*.png` (`tools/web_screenshots.py`).
