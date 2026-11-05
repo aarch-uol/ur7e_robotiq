@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-colcon-common-extensions \
       ros-jazzy-moveit \
       ros-jazzy-parallel-gripper-controller \
+      ros-jazzy-realsense2-camera \
       ros-jazzy-ur \
+      ros-jazzy-usb-cam \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /opt/ur7e_robotiq
