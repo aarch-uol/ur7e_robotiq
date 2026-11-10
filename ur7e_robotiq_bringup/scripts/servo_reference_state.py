@@ -8,15 +8,18 @@ jumps at every jog start. Feeding Servo this topic (reference instead of measure
 first trajectory point start exactly at the current reference.
 
 If no reference arrived within ``max_reference_age`` (JTC inactive, e.g. Position mode) or a message has
-no joint in the reference (gripper-only), the measured message is passed through unchanged.
+no joint in the reference (gripper-only), the measured message is passed through unchanged: as the raw bytes,
+without decoding it. Every /joint_states message comes through here (500 Hz arm + the gripper), and decoding,
+copying and encoding each one in Python took ~75 % of a Jetson core.
 """
 
-import copy
+import time
 
 import rclpy
 from control_msgs.msg import JointTrajectoryControllerState
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import JointState
 
 
@@ -27,7 +30,8 @@ class ServoReferenceState(Node):
         self.declare_parameter("output_topic", "~/joint_states")
         self.declare_parameter("controller_state_topic", "/admittance_trajectory_controller/controller_state")
         self._ref = {}  # joint name -> (position, velocity or None)
-        self._ref_time = None
+        self._ref_time = None  # time.monotonic() of the last reference
+        self._age_limit = float(self.get_parameter("max_reference_age").value)
         self._pub = self.create_publisher(JointState, self.get_parameter("output_topic").value, 10)
         # Reliable subscription: matches JTC's default (reliable) publisher; a best-effort one would also match.
         self.create_subscription(
@@ -36,7 +40,7 @@ class ServoReferenceState(Node):
             self._on_state,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE),
         )
-        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
+        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data, raw=True)
 
     def _on_state(self, msg):
         pos, vel = msg.reference.positions, msg.reference.velocities
@@ -45,19 +49,20 @@ class ServoReferenceState(Node):
             for i, n in enumerate(msg.joint_names)
             if i < len(pos)
         }
-        self._ref_time = self.get_clock().now()
+        self._ref_time = time.monotonic()
 
-    def _on_joint_states(self, msg):
-        out = copy.deepcopy(msg)
-        age_limit = self.get_parameter("max_reference_age").value
-        if self._ref_time is not None and (self.get_clock().now() - self._ref_time).nanoseconds * 1e-9 < age_limit:
-            for i, name in enumerate(out.name):
-                ref = self._ref.get(name)
-                if ref is None or i >= len(out.position):
-                    continue
-                out.position[i] = ref[0]
-                if ref[1] is not None and i < len(out.velocity):
-                    out.velocity[i] = ref[1]
+    def _on_joint_states(self, data):
+        if self._ref_time is None or time.monotonic() - self._ref_time >= self._age_limit:
+            self._pub.publish(data)  # no reference (not admittance): pass the message on as it came
+            return
+        out = deserialize_message(data, JointState)
+        for i, name in enumerate(out.name):
+            ref = self._ref.get(name)
+            if ref is None or i >= len(out.position):
+                continue
+            out.position[i] = ref[0]
+            if ref[1] is not None and i < len(out.velocity):
+                out.velocity[i] = ref[1]
         self._pub.publish(out)
 
 
