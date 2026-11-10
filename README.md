@@ -2,6 +2,8 @@
 
 ROS 2 **Jazzy** bringup and MoveIt configuration for a **UR7e** arm with an **ATI Gamma** F/T sensor and a **Robotiq 2F-85** gripper.
 
+**Using the lab robot** (web GUI, your own setup, your own scripts): **[docs/USERS.md](docs/USERS.md)**.
+
 ## Table of Contents
 - [About](#about)
 - [Setup](#setup)
