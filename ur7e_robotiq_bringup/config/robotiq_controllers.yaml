@@ -1,6 +1,9 @@
 robotiq_controller_manager:
   ros__parameters:
-    update_rate: 500
+    # The driver talks to the gripper at 100 Hz (Modbus over the wrist RS-485), so a faster loop only repeats
+    # the same values. At 500 Hz this manager took ~40 % of a Jetson core and put 500 Hz of gripper joint states
+    # on /joint_states for everyone to read.
+    update_rate: 100
 
     # Don't connect at startup; drivers.launch.py activates the gripper once
     # the robot's tool TCP port is reachable.

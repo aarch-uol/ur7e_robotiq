@@ -345,6 +345,9 @@ tcp_pose_broadcaster:
     pose_name: $(var tf_prefix)tcp_pose
     tf:
       child_frame_id: $(var tf_prefix)tool0_controller
+      # No TF: at 500 Hz it was most of /tf, and every TF listener (GUI, MoveIt) decoded it for a frame nothing
+      # looks up. The robot's own TCP pose is still on /tcp_pose_broadcaster/pose.
+      enable: false
 
 tool_contact_controller:
   ros__parameters:
