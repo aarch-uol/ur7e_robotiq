@@ -9,8 +9,14 @@ Open **http://X.X.X.38:XXXX/** in a browser.
 * **STOP** (top right, or Esc) works from every browser. It is a software stop: the red button on the pendant
   is the emergency stop.
 * Check that nobody is near the robot before you move it.
-* The first time, pick your **profile** (your name, or *New profile…*). It keeps your setups and your screen
-  layout. Change it with your name at the top right (*Change my name*).
+* The first time, pick your **profile** (your name, or *New profile…*). It keeps your own settings (TCPs,
+  keep-out zones, fixtures, vials, gains, F/T bias, limit and payload, parts, camera calibrations), your setups,
+  programs and screen layout. Change it with your name at the top right (*Change my name*).
+* The robot runs the settings of the person in control. When you take control and someone else's settings are in
+  use, the GUI asks to switch to yours and restarts (about a minute). Their settings stay in their profile. The first
+  time, you choose what yours start from: a copy of the ones in use, or a setup. SETUP › Setups shows whose
+  settings are in use.
+* Nobody can change another person's settings, setups or programs. Copy them into your profile instead.
 * Nobody using the robot? SETUP › Setups › Robot › **Stop robot stack…** stops everything. The address then shows
   a page with **Start robot stack** (about a minute).
 
