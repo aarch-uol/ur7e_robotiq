@@ -17,9 +17,10 @@ from launch.actions import (
     IncludeLaunchDescription,
     RegisterEventHandler,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.event_handlers import OnProcessExit
+from launch.event_handlers import OnProcessExit, OnShutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
@@ -30,6 +31,29 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def restart_tool_comm():
+    """Restart the UR tool-communication forwarder (ur_control.launch.py's ur_tool_comm) when it ends.
+
+    It is a socat between /tmp/ttyUR and the robot's RS-485 port (TCP 54321). When the robot closes that
+    connection (Tool I/O settings changed on the pendant, the robot restarted, a network drop), socat ends
+    "cleanly" and ur_control.launch.py does not restart it: /tmp/ttyUR is gone and the gripper stays dead until
+    the whole stack restarts. Seen on the Jetson. The gripper driver reconnects to /tmp/ttyUR by itself.
+    """
+    stopping = []
+
+    def on_exit(event, _context):
+        if stopping or event.action.name.rpartition("-")[0] != "ur_tool_comm":     # "ur_tool_comm-<n>" once it ran
+            return None
+        # again after 2 s (each new one ends up here too when it ends: socat ends at once while the robot is away)
+        return TimerAction(period=2.0, actions=[
+            ExecuteProcess(cmd=list(event.cmd), name="ur_tool_comm", output="screen")])
+
+    return [
+        RegisterEventHandler(OnShutdown(on_shutdown=lambda *_: stopping.append(1))),
+        RegisterEventHandler(OnProcessExit(on_exit=on_exit)),
+    ]
 
 
 def generate_launch_description():
@@ -311,6 +335,7 @@ def generate_launch_description():
             # No F/T driver: no TopicSensorBridge in the arm's model either (the Gamma's links stay).
             SetEnvironmentVariable("UR7E_FT_BRIDGE", load_ft_sensor),
             ur_driver,
+            *restart_tool_comm(),
             robotiq_robot_state_publisher,
             gripper_manager,
             ft_robot_state_publisher,
