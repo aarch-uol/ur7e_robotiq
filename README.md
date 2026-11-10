@@ -67,6 +67,12 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
    On a desktop PC this builds `ur7e_robotiq:jazzy`. On an NVIDIA Jetson (arm64) it builds `ur7e_robotiq:jazzy-arm64`
    from `ros:jazzy-ros-base`, because `osrf/ros` has no arm64 image. That takes about an hour.
 
+   The expensive part (third-party drivers, rosdep) is a layer made only from the files `docker/deps_hash.sh`
+   lists: `docker/`, `scripts/setup_workspace.sh`, `patches/` and the `package.xml` files. Changing anything else
+   rebuilds only the last, short step. The image is labelled `ur7e_robotiq.deps=<that hash>`; moveit_gui's
+   `ur7e_gui.sh` rebuilds it only when the hash changes and builds this repo's packages from the checkout at each
+   start (an overlay in `~/ur7e_data/overlay`), so launch, yaml and script changes need no new image there.
+
 3. **Run the container:**
    ```bash
    ./docker/run.sh

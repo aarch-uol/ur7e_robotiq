@@ -4,10 +4,15 @@
 #
 #   scripts/setup_workspace.sh              # workspace in ~/ros2_ws
 #   scripts/setup_workspace.sh /some/dir    # workspace somewhere else
+#   scripts/setup_workspace.sh --deps-only /some/dir
+#       only what this repo's packages need (third-party drivers, rosdep from the package.xml files), not the
+#       packages themselves: the Docker image's expensive layer, which then only needs the package.xml files
 #
 # Safe to run again: it skips steps that are already done.
 set -eo pipefail
 
+DEPS_ONLY=0
+if [ "$1" = --deps-only ]; then DEPS_ONLY=1; shift; fi
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="${1:-$HOME/ros2_ws}"
 ROBOTIQ_URL="https://github.com/robotiq/ros.git"
@@ -132,8 +137,15 @@ rosdep install -y --rosdistro jazzy --ignore-src \
   -t buildtool -t buildtool_export -t build -t build_export -t exec \
   --from-paths "$REPO_DIR" "$ROBOTIQ_DIR/grippers" "$NET_FT_DIR" "$CARTESIAN_IMPEDANCE_DIR"
 
-echo "==> Building"
 cd "$WS"
+if [ "$DEPS_ONLY" = 1 ]; then
+  echo "==> Building the third-party packages (not this repo's)"
+  # shellcheck disable=SC2046
+  colcon build --symlink-install --packages-up-to ur7e_robotiq_bringup \
+    --packages-skip $(colcon list --names-only --base-paths "$REPO_DIR")
+  exit 0
+fi
+echo "==> Building"
 colcon build --symlink-install --packages-up-to ur7e_robotiq_bringup
 
 echo

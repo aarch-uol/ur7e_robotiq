@@ -32,4 +32,6 @@ git checkout -- . && git clean -fd grippers/robotiq_driver    # discards local c
 git apply ../ur7e_robotiq/patches/robotiq_driver_pty_transport.patch
 ```
 
-With Docker, run `git pull` and then `./docker/build.sh` again.
+With Docker, run `git pull` and then `./docker/build.sh` again (only the last, short layer is rebuilt unless
+`docker/deps_hash.sh` changed). With moveit_gui's `ur7e_gui.sh`, just start it again: it rebuilds the image only
+when that hash changed and builds the packages from the checkout itself.
