@@ -1,6 +1,10 @@
-FROM osrf/ros:jazzy-desktop
+# docker/build.sh picks the base for this PC: osrf/ros:jazzy-desktop on amd64 (the default), and on arm64
+# (Jetson) the official ros:jazzy-ros-base plus ros-jazzy-desktop, because osrf/ros is amd64 only.
+ARG BASE_IMAGE=osrf/ros:jazzy-desktop
+FROM ${BASE_IMAGE}
+ARG EXTRA_APT=""
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends ${EXTRA_APT} \
       git \
       libserialport-dev \
       python3-colcon-common-extensions \

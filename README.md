@@ -64,6 +64,8 @@ The image contains ROS 2, all dependencies and the built workspace. Nothing else
    ```bash
    ./docker/build.sh
    ```
+   On a desktop PC this builds `ur7e_robotiq:jazzy`. On an NVIDIA Jetson (arm64) it builds `ur7e_robotiq:jazzy-arm64`
+   from `ros:jazzy-ros-base`, because `osrf/ros` has no arm64 image. That takes about an hour.
 
 3. **Run the container:**
    ```bash

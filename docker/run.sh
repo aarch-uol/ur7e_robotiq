@@ -6,6 +6,10 @@
 # are left behind between sessions. Files you want to keep (like the
 # robot calibration) go in /data, which is ~/ur7e_data on the host.
 set -e
+case "$(uname -m)" in                       # the tag docker/build.sh builds on this CPU
+  aarch64|arm64) IMAGE=${UR7E_IMAGE:-ur7e_robotiq:jazzy-arm64} ;;
+  *)             IMAGE=${UR7E_IMAGE:-ur7e_robotiq:jazzy} ;;
+esac
 mkdir -p "$HOME/ur7e_data"
 xhost +local:root >/dev/null 2>&1 || true
 #
@@ -23,4 +27,4 @@ docker run -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "$HOME/ur7e_data:/data" \
   -v "$HOME/ws:/ws" \
-  ur7e_robotiq:jazzy bash
+  "$IMAGE" bash
