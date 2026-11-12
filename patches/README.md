@@ -10,7 +10,19 @@ The Robotiq driver opens its serial port through libserialport, which rejects ps
 
 On activation the driver clears the sensor's software bias and treated a failure as fatal (`ERROR`), which aborted activation of the ATI Gamma. The patch only calls `clear_bias()` when hardware biasing is requested, and downgrades a failure there from FATAL/ERROR to a warning so the sensor still activates.
 
-## cartesian_impedance_controller_ur6dof.patch  (mrceki/Cartesian-Impedance-Controller @ 0a1c635)
+## third_party/net_ft_driver: reads the newest packet (overrides the image's copy)
+
+The ATI streams RDT packets at `ft_sampling_rate` (1000 Hz) and the `/ft` controller manager reads at 500 Hz. Upstream
+`receive_data()` takes one packet per read, so the socket's receive buffer filled up and every value was the oldest
+one queued: the F/T reading, the GUI and the admittance controller were about 2 s late. `third_party/net_ft_driver` is
+upstream @ dbe9916 with `net_ft_gamma_runtime.patch` and one change: `receive_data()` reads every packet already
+queued and keeps the newest (waits for one only when none is queued); the diagnostic counters still count every packet.
+
+It lives in `third_party/` (with a `COLCON_IGNORE`) so it does not change the image's dependency hash or clash with the
+image's own clone: moveit_gui's `ur7e_gui.sh` builds `third_party/*` into the overlay by path, which overrides the
+image's `net_ft_driver`. When the image is next rebuilt anyway, fold the change into `net_ft_gamma_runtime.patch`.
+
+  (mrceki/Cartesian-Impedance-Controller @ 0a1c635)
 
 The upstream controller is written for 7-DOF arms. The patch (1) replaces the hard-coded 7x7 identity in the null-space torque with `n_joints_` so the UR's 6 joints work, and (2) on activation, validates all command and state handles and initializes the equilibrium pose and null-space configuration from the measured state (after `read_state_from_hardware()`, and writing zero torque first) instead of calling `update()` against a zero reference, which could cause a large torque transient on a real arm.
 
