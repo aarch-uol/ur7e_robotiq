@@ -10,6 +10,8 @@ Starts:
 The two are separate so a gripper link problem never takes the arm down.
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -74,6 +76,12 @@ def generate_launch_description():
     pkg_share = FindPackageShare("ur7e_robotiq_bringup")
     controllers_yaml = PathJoinSubstitution([pkg_share, "config", "robotiq_controllers.yaml"])
     ft_controllers_yaml = PathJoinSubstitution([pkg_share, "config", "ft_controllers.yaml"])
+    # SETUP > F/T + payload > Reading axes (moveit_gui ft_axes.py): the broadcaster's axis mapping for a sensor
+    # mounted turned (interface_names / multiplier). Loaded after ft_controllers.yaml, so it wins; the launcher
+    # (ur7e_gui.sh) sets UR7E_FT_AXES_PARAMS when the GUI saved one. The spawner keeps ft_controllers.yaml only: a
+    # second --param-file there is not used, and the controller manager's parameters are what the broadcaster gets.
+    ft_axes_params = os.environ.get("UR7E_FT_AXES_PARAMS", "")
+    ft_cm_params = [ft_controllers_yaml] + ([ft_axes_params] if ft_axes_params and os.path.isfile(ft_axes_params) else [])
 
     ur_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -181,7 +189,7 @@ def generate_launch_description():
         namespace="ft",
         name="controller_manager",
         output="screen",
-        parameters=[ft_controllers_yaml],
+        parameters=ft_cm_params,
         remappings=[("robot_description", "/ft/robot_description")],
         condition=IfCondition(load_ft_sensor),
     )
