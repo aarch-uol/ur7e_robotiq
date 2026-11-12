@@ -115,20 +115,31 @@
   <!-- ATI factory sensing frame. With the mounting side toward the robot,
        the drawing defines +Z toward the tool side. The installation assumes
        the Gamma +X mark is aligned with tool0 +X; verify only the remaining
-       rotation about Z on the physical assembly. -->
+       rotation about Z on the physical assembly.
+       UR7E_FT_FRAME (xacro arg ft_frame, "x,y,z,roll,pitch,yaw" in mm and
+       degrees, on ati_gamma_body_link) sets another pose: the launcher passes
+       the one set in the GUI (SETUP > F/T + payload > Sensor frame). -->
+  <xacro:arg name="ft_frame" default="$(optenv UR7E_FT_FRAME 0,0,${ati_gamma_sensing_origin_z * 1000.0},0,0,0)"/>
+  <xacro:property name="ft_frame" value="${[float(v) for v in str('$(arg ft_frame)').split(',')]}"/>
+  <xacro:if value="${len(ft_frame) != 6}">
+    ${xacro.fatal('UR7E_FT_FRAME (ft_frame) must be x,y,z,roll,pitch,yaw (mm, degrees), not $(arg ft_frame)')}
+  </xacro:if>
   <joint name="ft_fts_joint" type="fixed">
     <parent link="ati_gamma_body_link"/>
     <child link="ft_fts_link"/>
-    <origin xyz="0 0 ${ati_gamma_sensing_origin_z}" rpy="0 0 0"/>
+    <origin xyz="${ft_frame[0] / 1000.0} ${ft_frame[1] / 1000.0} ${ft_frame[2] / 1000.0}"
+            rpy="${radians(ft_frame[3])} ${radians(ft_frame[4])} ${radians(ft_frame[5])}"/>
   </joint>
   <link name="ft_fts_link"/>
 
   <!-- The physical customer tool interface is 0.6 mm beyond ATI's sensing
-       reference origin according to drawing 9230-05-1329. -->
+       reference origin according to drawing 9230-05-1329. It hangs on the
+       body, not on ft_fts_link, so another sensing frame leaves the tool where
+       it is. -->
   <joint name="ft_tool_mount_joint" type="fixed">
-    <parent link="ft_fts_link"/>
+    <parent link="ati_gamma_body_link"/>
     <child link="ft_tool_mount_link"/>
-    <origin xyz="0 0 ${ati_gamma_tool_face_offset}" rpy="0 0 0"/>
+    <origin xyz="0 0 ${ati_gamma_sensing_origin_z + ati_gamma_tool_face_offset}" rpy="0 0 0"/>
   </joint>
   <link name="ft_tool_mount_link"/>
   <joint name="ati_sensor_alias_joint" type="fixed">
