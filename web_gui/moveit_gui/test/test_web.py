@@ -1,5 +1,6 @@
 """Web front end: the control lease and its safety rules, commands, and the HTTP layer (no browser)."""
 import json
+import math
 import os
 import time
 import urllib.error
@@ -15,7 +16,7 @@ from moveit_gui.core import RobotCore  # noqa: E402
 from moveit_gui.fake_bridge import FakeBridge  # noqa: E402
 from moveit_gui.profile import RobotProfile  # noqa: E402
 from moveit_gui.web import service as svc_mod  # noqa: E402
-from moveit_gui.web.server import Server  # noqa: E402
+from moveit_gui.web.server import Server, _safe_json  # noqa: E402
 from moveit_gui.web.service import CommandError, WebService  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -67,6 +68,88 @@ def test_commands_need_the_lease_but_stop_does_not(env):
 def test_policy_stop_does_not_need_the_lease(env):
     s, _, _, _ = env
     assert s.command("without-control", "policy_stop", {})["ok"]
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "lease", "profile"])
+def test_policy_start_during_prepare_never_launches_backend(env, interrupt):
+    import threading
+    from moveit_gui.policies import PolicyManifest
+
+    s, _, _, _ = env
+    s.take_lease("a")
+    s.core.policies.library.manifests["p"] = PolicyManifest(
+        name="p", command=["fake"], required_mode="position")
+
+    class BlockingBackend:
+        supports_feedback = True
+
+        def __init__(self):
+            self.prepare_started = threading.Event()
+            self.release_prepare = threading.Event()
+            self.run_called = False
+            self.cancel_called = False
+
+        @property
+        def busy(self):
+            return self.prepare_started.is_set() and not self.release_prepare.is_set()
+
+        def prepare(self, goal, on_feedback, on_done):
+            self.prepare_started.set()
+
+            def wait_then_finish():
+                self.release_prepare.wait(2)
+                on_done(type("Result", (), {"success": True, "stop_reason": "ready"})())
+
+            threading.Thread(target=wait_then_finish, daemon=True).start()
+
+        def run(self, *args):
+            self.run_called = True
+
+        def cancel(self):
+            self.cancel_called = True
+
+    backend = BlockingBackend()
+    s.core.policies.backend = backend
+    job = s.command("a", "policy_start", {"name": "p"})["job"]
+    assert backend.prepare_started.wait(2)
+    if interrupt == "stop":
+        s.stop("test")
+    elif interrupt == "lease":
+        with s._lease_lock:
+            s.lease = s._new_lease()
+    else:
+        s._needs_switch = lambda: True
+    backend.release_prepare.set()
+    assert wait(lambda: any(r["id"] == job for r in s.results))
+    result = next(r for r in s.results if r["id"] == job)
+    assert not result["ok"] and not backend.run_called
+    assert (backend.cancel_called if interrupt == "stop" else True)
+    expected = {"stop": "STOP", "lease": "control changed", "profile": "settings changed"}[interrupt]
+    assert expected in result["msg"]
+
+
+def test_server_json_sanitises_nonfinite_values():
+    text = _safe_json({"keep": 1, "bad": [math.nan, math.inf, -math.inf]})
+    assert "NaN" not in text and "Infinity" not in text
+    assert json.loads(text) == {"keep": 1, "bad": [None, None, None]}
+
+
+def test_policy_state_drops_stale_step_warnings_and_exposes_card_chart_meta(env):
+    s, _, _, tmp_path = env
+    from moveit_gui.policies import PolicyManifest
+
+    card = tmp_path / "card.json"
+    card.write_text(json.dumps({"action_names": ["travel", "turn"], "action_units": ["m", "rad"]}))
+    s.core.policies.library.manifests["p"] = PolicyManifest(
+        name="p", command=["fake"], required_mode="position", files={"policy_card": str(card)})
+    s._policy_chart_policy = "p"
+    s._policy_was_busy = True
+    s._policy_last_step = {"_received": time.time() - 3, "out_of_range": ["old warning"]}
+    state = s.state()
+    assert state["policy"]["step_warnings"] == []
+    assert s._policy_last_step is None
+    assert state["policy"]["action_names"] == ["travel", "turn"]
+    assert state["policy"]["action_units"] == ["m", "rad"]
 
 
 def test_takeover_is_refused_while_the_robot_moves(env):
@@ -430,3 +513,22 @@ def test_an_image_frame_the_preview_drops_is_only_counted():
     assert not w.wants()                               # within the period: the bridge skips deserializing it
     w.tick()
     assert len(w.stats.times) == 2
+
+
+def test_http_events_stream_live_ft_and_joints_at_30_hz(http):
+    """F/T and joints come in their own small 'live' event at 30 Hz; the full state stays at 10 Hz."""
+    base, _, _ = http
+    counts, live = {"state": 0, "live": 0}, None
+    with urllib.request.urlopen(base + "/api/events", timeout=5) as r:
+        t_end = time.monotonic() + 1.5
+        while time.monotonic() < t_end:
+            line = r.readline().decode()
+            if line.startswith("event: "):
+                kind = line[7:].strip()
+                data = r.readline().decode()
+                if kind in counts:
+                    counts[kind] += 1
+                if kind == "live":
+                    live = json.loads(data[len("data: "):])
+    assert counts["live"] >= 2.5 * counts["state"] and counts["live"] >= 30, counts
+    assert len(live["wrench"]) == 6 and len(live["joints_deg"]) == 6 and "ft_samples" in live

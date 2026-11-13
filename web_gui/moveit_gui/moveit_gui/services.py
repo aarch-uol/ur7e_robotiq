@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -321,19 +321,31 @@ def make_service(d: dict, known: Optional[set] = None) -> Service:
 
 
 # ====================================================================== processes
+HAVE_PACKAGE_S = 30.0          # installs do not change under a running GUI; the answer is cached this long
+_have_cache: Dict[Tuple[str, str], Tuple[float, bool]] = {}
+
+
 def have_package(pkg: str) -> bool:
-    """Is a ROS package installed (the ament index of every prefix in AMENT_PREFIX_PATH)?"""
-    for pre in os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep):
-        if pre and (Path(pre) / "share" / "ament_index" / "resource_index" / "packages" / pkg).exists():
-            return True
-    return False
+    """Is a ROS package installed (the ament index of every prefix in AMENT_PREFIX_PATH)? Cached: the state
+    update asks for every driver type 10 times a second, and on the robot PC each look-up is one file check per
+    prefix (dozens), each of which gives up the GIL to the busy ROS threads (measured: updates took ~1 s)."""
+    prefixes = os.environ.get("AMENT_PREFIX_PATH", "")
+    key, now = (pkg, prefixes), time.monotonic()
+    hit = _have_cache.get(key)
+    if hit is not None and now - hit[0] < HAVE_PACKAGE_S:
+        return hit[1]
+    found = any(pre and (Path(pre) / "share" / "ament_index" / "resource_index" / "packages" / pkg).exists()
+                for pre in prefixes.split(os.pathsep))
+    _have_cache[key] = (now, found)
+    return found
 
 
 def spawn_process(argv: List[str], log_path: Path):
     """The real thing: the command in its own process group (SIGINT reaches every child of `ros2 launch`)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as f:
-        env = {**os.environ, "PYTHONUNBUFFERED": "1", "RCUTILS_COLORIZED_OUTPUT": "0"}
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "RCUTILS_COLORIZED_OUTPUT": "0",
+               "MOVEIT_GUI_SERVICE_LOG": str(log_path)}            # marks it as ours (a later GUI finds it)
         return subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 start_new_session=True, env=env)
 
@@ -449,6 +461,32 @@ def _cmdline(pid: int) -> List[str]:
         return []
 
 
+def _matches(cmd: List[str], argv: List[str]) -> bool:
+    """The process runs argv: `ros2 launch ...` shows in /proc as `/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch ...`
+    (the interpreter in front, the program by its full path)."""
+    n = len(argv)
+    return bool(argv) and len(cmd) >= n and cmd[len(cmd) - n + 1:] == argv[1:] and \
+        os.path.basename(cmd[-n]) == os.path.basename(argv[0])
+
+
+def _environ(pid: int, key: str) -> Optional[str]:
+    try:
+        for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+            k, _, v = kv.partition(b"=")
+            if k.decode(errors="replace") == key:
+                return v.decode(errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def _started(pid: int) -> int:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
 @dataclass
 class Run:
     proc: object
@@ -485,6 +523,7 @@ class Services:
         self.waiting: Dict[str, float] = {}   # name -> since: start asked, a needed service is not ready yet
         self.error = ""
         self._autostarted = False
+        self._respawn: Dict[str, List[int]] = {}   # name -> stray pids: start it once they are gone
         self._load()
         self._adopt()
 
@@ -690,6 +729,11 @@ class Services:
         """Call often (the web tick): reap, escalate stops, count publishers, start waiting services."""
         with self._lock:
             now = self.clock()
+            for n, pids in list(self._respawn.items()):
+                if not any(_alive(p) for p in pids):
+                    del self._respawn[n]
+                    if n in self.services and n not in self.runs:
+                        self._spawn(self.services[n])
             if not self._autostarted:
                 self._autostarted = True
                 for n, s in self.services.items():
@@ -825,13 +869,71 @@ class Services:
             except (OSError, ValueError, KeyError, TypeError):
                 continue
             cmd = _cmdline(pid)
-            if name in self.services and _alive(pid) and cmd[-len(argv):] == argv:   # not a reused pid
+            if name in self.services and _alive(pid) and _matches(cmd, argv):   # not a reused pid
                 self.runs[name] = Run(Adopted(pid), argv, Path(d.get("log", "")), self.clock())
                 self.log(f"service {name}: still running from before (pid {pid})")
                 if self.on_change:
                     self.on_change(self.services[name], True)
             else:
                 self._pidfile(name, None)
+        self._adopt_strays()
+
+    def _adopt_strays(self):
+        """Copies of our drivers that no pid file names (an older GUI lost track of them). One copy: adopted. More
+        than one (they fight over the camera, and which one holds it is not known here): all are stopped and one
+        fresh copy is started once they are gone."""
+        mine = {n: s.argv() for n, s in self.services.items() if not (s.type == "zed" and self.remote_root)}
+        found: Dict[str, List[int]] = {}
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            pid = int(d.name)
+            try:
+                if pid == os.getpid() or os.getpgid(pid) != pid:          # services lead their process group
+                    continue
+            except OSError:
+                continue
+            cmd = _cmdline(pid)
+            for n, argv in mine.items():
+                if not _matches(cmd, argv):
+                    continue
+                tag = _environ(pid, "MOVEIT_GUI_SERVICE_LOG")
+                if tag is None or tag.startswith(str(self.log_dir / f"{n}_")):   # untagged: from before the tag
+                    found.setdefault(n, []).append(pid)
+        for n, pids in found.items():
+            if len(pids) == 1:
+                if n not in self.runs:
+                    log = (self._logs(n) or [Path("")])[-1]
+                    self.runs[n] = Run(Adopted(pids[0]), mine[n], log, self.clock())
+                    self._pidfile(n, pids[0], mine[n], log)
+                    self.log(f"service {n}: found running without a pid file (pid {pids[0]}): adopted")
+                    if self.on_change:
+                        self.on_change(self.services[n], True)
+                continue
+            self.log(f"service {n}: {len(pids)} copies running (pids {', '.join(map(str, sorted(pids)))}, left by "
+                     f"earlier GUIs): stopping them all, then starting one")
+            self.runs.pop(n, None)
+            self._pidfile(n, None)
+            for pid in pids:
+                self._kill_stray(pid)
+            self._respawn[n] = pids
+
+    def _kill_stray(self, pid: int):
+        def go():
+            for sig, wait in ((signal.SIGINT, 5.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 0.0)):
+                try:
+                    os.killpg(pid, sig)
+                except ProcessLookupError:
+                    return
+                except PermissionError as e:
+                    self.log(f"cannot stop pid {pid}: {e}")
+                    return
+                end = time.monotonic() + wait
+                while time.monotonic() < end and _alive(pid):
+                    time.sleep(0.1)
+                if not _alive(pid):
+                    return
+        threading.Thread(target=go, daemon=True, name=f"stop-{pid}").start()
 
     # ---------------------------------------------------------------- logs
     def _logs(self, name: str) -> List[Path]:

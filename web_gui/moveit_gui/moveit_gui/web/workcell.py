@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -60,6 +61,7 @@ class WorkcellCommands:
         self._drivers_init()
         self.he: dict = {"topic": "", "info_topic": "", "mount": "eye_in_hand", "K": None, "D": None,
                          "frame": "", "samples": [], "result": None, "poses": [], "last": None,
+                         "ee_link": "", "base_link": "", "method": "park",
                          "progress": {"running": False, "done": 0, "total": 0, "error": ""}}
 
     def _base_model(self) -> dict:
@@ -1060,8 +1062,22 @@ class WorkcellCommands:
                                                            "cy": h["K"][5], "D": h["D"][:5]},
                 "samples": [{"corners": s.corners, "reproj_px": round(s.reproj_px, 3)} for s in h["samples"]],
                 "poses": len(h["poses"]), "result": res, "last": h["last"], "progress": dict(h["progress"]),
-                "flange": self.core.profile.planning_link, "base": self.core.profile.base_link,
-                "min_samples": he.MIN_SAMPLES}
+                "flange": self._he_ee(), "base": self._he_base(), "links": self._he_links(),
+                "default_ee": self.core.profile.planning_link, "default_base": self.core.profile.base_link,
+                "method": h["method"], "methods": list(he.METHODS),
+                "min_samples": he.MIN_SAMPLES, "good_samples": he.GOOD_SAMPLES}
+
+    def _he_ee(self) -> str:
+        return self.he["ee_link"] or self.core.profile.planning_link
+
+    def _he_base(self) -> str:
+        return self.he["base_link"] or self.core.profile.base_link
+
+    def _he_links(self) -> list:
+        """Frames a camera can be calibrated against: the robot's links and the parts (not camera parts)."""
+        parts = [n for n, q in self.parts.parts.items() if not (q.meta or {}).get("camera")]
+        p = self.core.profile
+        return sorted(set(self._robot_links()) | set(parts) | {p.planning_link, p.base_link, self._he_ee(), self._he_base()})
 
     def cmd_handeye_get(self):
         return self._ok(he=self.he_view())
@@ -1077,11 +1093,17 @@ class WorkcellCommands:
         return self._ok(svg=he.board_svg(self.cams.board))
     cmd_handeye_board_svg.read_only = True
 
-    def cmd_handeye_start(self, topic, info_topic="", mount="eye_in_hand"):
+    def cmd_handeye_start(self, topic, info_topic="", mount="eye_in_hand", ee_link="", base_link=""):
         if self.he["progress"]["running"]:
             raise he.HandEyeError("a pose run is in progress")
         if mount not in he.MOUNTS:
             raise he.HandEyeError(f"mount is one of {', '.join(he.MOUNTS)}")
+        p = self.core.profile
+        ee, base = str(ee_link or "").strip() or p.planning_link, str(base_link or "").strip() or p.base_link
+        if ee == base:
+            raise he.HandEyeError("the end-effector link and the base link must differ")
+        if self.core.bridge.lookup_transform(base, ee) is None:
+            raise he.HandEyeError(f"no transform {base} -> {ee} in TF: pick links of this robot")
         topic = str(topic).strip()
         info_topic = str(info_topic or "").strip() or re.sub(r"/[^/]+$", "/camera_info", topic)
         info, why = self.core.bridge.camera_info(info_topic)
@@ -1091,9 +1113,11 @@ class WorkcellCommands:
         if not any(info["K"]):
             raise he.HandEyeError(f"{info_topic}: the camera matrix is all zeros (camera not calibrated)")
         self.he.update(topic=topic, info_topic=info_topic, mount=mount, K=info["K"], D=info["D"],
+                       size=(int(info["width"]), int(info["height"])),
+                       ee_link="" if ee == p.planning_link else ee, base_link="" if base == p.base_link else base,
                        frame=info["frame_id"], samples=[], result=None, poses=[], last=None)
         self.core.bridge.log(f"hand-eye: {mount} with {topic} ({info['width']}x{info['height']}, frame "
-                             f"{info['frame_id']})")
+                             f"{info['frame_id']}), {base} -> {ee}")
         return self._ok(f"calibrating {topic} ({mount.replace('_', '-')})", he=self.he_view())
 
     def _he_require(self):
@@ -1108,6 +1132,9 @@ class WorkcellCommands:
             return he.Detection(False, why=frame), None
         d = he.detect(img, self.cams.board, self.he["K"], self.he["D"])
         vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if d.quads:                                         # the ArUco markers found, blue
+            cv2.polylines(vis, [np.asarray(q, np.int32) for q in d.quads], True, (230, 140, 30),
+                          max(1, img.shape[1] // 640))
         for x, y in d.points:
             cv2.circle(vis, (int(x), int(y)), max(2, img.shape[1] // 320), (40, 200, 40), -1)
         if d.ok:
@@ -1119,7 +1146,7 @@ class WorkcellCommands:
         return d, base64.b64encode(jpg.tobytes()).decode() if ok else None
 
     def _he_last(self, d: he.Detection) -> dict:
-        self.he["last"] = {"ok": d.ok, "corners": d.corners, "reproj_px": None if not d.ok else round(d.reproj_px, 3),
+        self.he["last"] = {"ok": d.ok, "corners": d.corners, "markers": d.markers, "reproj_px": None if not d.ok else round(d.reproj_px, 3),
                            "why": d.why, "distance_mm": None if not d.ok else
                            round(float(np.linalg.norm(d.T_cam_board[:3, 3])) * 1000)}
         return self.he["last"]
@@ -1132,9 +1159,59 @@ class WorkcellCommands:
                         detection=self._he_last(d), jpeg=jpg)
     cmd_handeye_look.read_only = True
 
+    @staticmethod
+    def _he_depth_topic(color: str) -> str:
+        """The depth image registered to a colour topic: RealSense aligned_depth_to_color, ZED depth_registered."""
+        if "/color/" in color:                                          # RealSense: .../color/image_raw
+            return color.split("/color/")[0] + "/aligned_depth_to_color/image_raw"
+        if "/rgb/" in color:                                            # ZED: .../rgb/color/rect/image
+            return color.split("/rgb/")[0] + "/depth/depth_registered"
+        return ""
+
+    def cmd_handeye_cloud(self, depth_topic="", stride=4, max_m=1.5):
+        """The camera's point cloud for the 3D view, in the optical frame, with where the camera's parent link was
+        when it was taken. The page places it with the calibration (or the pose being edited), so a good result
+        puts the cloud on the real table and parts. Packed: int16 x, y, z in mm, then uint8 r, g, b; zlib, base64."""
+        self._he_require()
+        color = self.he["topic"]
+        depth = str(depth_topic or "").strip() or self._he_depth_topic(color)
+        if not depth:
+            raise he.HandEyeError("no depth topic known for this camera: type it")
+        stride = int(min(16, max(1, int(stride))))
+        p, b = self.core.profile, self.core.bridge
+        T0 = b.lookup_transform(p.base_link, self._he_ee() if self.he["mount"] == "eye_in_hand" else self._he_base())
+        rgb, d, why = b.grab_rgbd(color, depth)
+        T1 = b.lookup_transform(p.base_link, self._he_ee() if self.he["mount"] == "eye_in_hand" else self._he_base())
+        if rgb is None:
+            raise he.HandEyeError(why)
+        if T0 is None or T1 is None:
+            raise he.HandEyeError("no TF for the camera's parent link")
+        H, W = d.shape
+        K = np.asarray(self.he["K"], float).reshape(3, 3)
+        if rgb.shape[:2] != d.shape:                       # colour at another size: pick its pixels by scale
+            ys = (np.arange(H) * rgb.shape[0] / H).astype(int)
+            xs = (np.arange(W) * rgb.shape[1] / W).astype(int)
+            rgb = rgb[ys][:, xs]
+        cw, ch = self.he.get("size") or (W, H)
+        sx, sy = W / float(cw), H / float(ch)
+        fx, fy, cx, cy = K[0, 0] * sx, K[1, 1] * sy, K[0, 2] * sx, K[1, 2] * sy   # K is for the colour size
+        v, u = np.mgrid[0:H:stride, 0:W:stride]
+        z = d[v, u]
+        ok = np.isfinite(z) & (z > 0.05) & (z < float(max_m))
+        u, v, z = u[ok], v[ok], z[ok]
+        xyz = np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], axis=1)
+        q = np.clip(np.round(xyz * 1000), -32767, 32767).astype("<i2")
+        col = rgb[v, u].astype(np.uint8)
+        blob = zlib.compress(q.tobytes() + col.tobytes(), 3)
+        moved = float(np.linalg.norm(T0[:3, 3] - T1[:3, 3])) > 0.002
+        return self._ok("", n=int(len(q)), data=base64.b64encode(blob).decode(), stride=stride, depth_topic=depth,
+                        T_view_parent=[round(float(x), 7) for x in T1.reshape(-1)], moving=moved,
+                        mount=self.he["mount"], frame=self.he["frame"])
+    cmd_handeye_cloud.read_only = True
+
     def _flange(self) -> Optional[np.ndarray]:
-        p = self.core.profile
-        return self.core.bridge.lookup_transform(p.base_link, p.planning_link)
+        """T_base_ee of the links picked at Start (default: the profile's base and planning link)."""
+        return self.core.bridge.lookup_transform(self._he_base(), self._he_ee())
 
     def _he_capture_here(self) -> tuple:
         b = self.core.bridge
@@ -1195,7 +1272,20 @@ class WorkcellCommands:
                 pivot = T[:3, 3] + T[:3, 2] * dist
         else:
             pivot = (self.core.geo.current_pose(self.core.profile.base_link, self.core.store.active_tcp).T())[:3, 3]
-        self.he["poses"] = he.sample_poses(T, pivot, tilt)
+            if self._he_base() != self.core.profile.base_link:                 # into the picked base frame
+                T_b_b0 = self.core.bridge.lookup_transform(self._he_base(), self.core.profile.base_link)
+                if T_b_b0 is None:
+                    raise he.HandEyeError(f"no TF {self._he_base()} -> {self.core.profile.base_link}")
+                pivot = (T_b_b0 @ np.r_[pivot, 1])[:3]
+        poses = he.sample_poses(T, pivot, tilt)
+        p = self.core.profile
+        if self._he_ee() != p.planning_link or self._he_base() != p.base_link:   # MoveIt moves the planning link
+            T_b0_b = self.core.bridge.lookup_transform(p.base_link, self._he_base())
+            T_ee_pl = self.core.bridge.lookup_transform(self._he_ee(), p.planning_link)
+            if T_b0_b is None or T_ee_pl is None:
+                raise he.HandEyeError("no TF between the picked links and the planning link")
+            poses = [T_b0_b @ P_ @ T_ee_pl for P_ in poses]
+        self.he["poses"] = poses
         return self._ok(f"{len(self.he['poses'])} poses planned (±{tilt:g} deg about "
                         f"{'the board' if self.he['mount'] == 'eye_in_hand' else 'the tool tip'})", he=self.he_view(),
                         poses=[tf.T_to_mm_deg(P_) for P_ in self.he["poses"]])
@@ -1265,27 +1355,66 @@ class WorkcellCommands:
         return self._submit("camera calibration", job)
 
     def _he_solve(self) -> dict:
-        r = he.solve(self.he["samples"], self.he["mount"])
+        r = he.solve(self.he["samples"], self.he["mount"], self.he["method"])
         self.he["result"] = r
         return r
 
-    def cmd_handeye_solve(self):
+    def cmd_handeye_solve(self, method=None):
         self._he_require()
+        if method is not None:
+            if method not in he.METHODS:
+                raise he.HandEyeError(f"solver is one of {', '.join(he.METHODS)}")
+            self.he["method"] = method
         r = self._he_solve()
         return self._ok(f"{r['verdict']}: board placed within {r['rms_mm']} mm / {r['rms_deg']} deg (rms) by "
                         f"{r['n']} samples", he=self.he_view())
 
-    def cmd_handeye_save(self, name, as_part=True):
+    def cmd_handeye_save(self, name, as_part=True, xyz_mm=None, rpy_deg=None):
+        """Save the result; with xyz_mm / rpy_deg, the pose as adjusted by hand (checked against the point cloud)."""
         r = self.he["result"]
         if r is None:
             raise he.HandEyeError("solve first")
+        if xyz_mm is not None or rpy_deg is not None:
+            try:
+                xyz, rpy = [float(v) for v in xyz_mm], [float(v) for v in rpy_deg]
+            except (TypeError, ValueError):
+                raise he.HandEyeError("the adjusted pose is x, y, z in mm and roll, pitch, yaw in deg") from None
+            if len(xyz) != 3 or len(rpy) != 3 or not all(np.isfinite(xyz + rpy)):
+                raise he.HandEyeError("the adjusted pose is x, y, z in mm and roll, pitch, yaw in deg")
+            X = tf.mm_deg_to_T(xyz, rpy)
+            dmm = float(np.linalg.norm(X[:3, 3] - r["X"][:3, 3]) * 1000)
+            ddeg = float(np.degrees(tf.rotation_angle(r["X"][:3, :3].T @ X[:3, :3])))
+            if dmm > 0.05 or ddeg > 0.005:
+                r = {**r, "X": X, "edited": {"mm": round(dmm, 2), "deg": round(ddeg, 3)}}
+                self.he["result"] = r
         p = self.core.profile
-        e = self.cams.save(str(name), self.he["topic"], self.he["info_topic"], self.he["frame"], p.planning_link,
-                           p.base_link, r, self.he["samples"], self.he["K"])
-        msg = f"camera {name} saved ({e['verdict']})"
+        old = self.cams.cameras.get(str(name))
+        e = self.cams.save(str(name), self.he["topic"], self.he["info_topic"], self.he["frame"], self._he_ee(),
+                           self._he_base(), r, self.he["samples"], self.he["K"])
+        if r.get("loaded") and not self.he["samples"] and old:     # re-saved after a check: keep its samples
+            e.update(sample_data=old.get("sample_data", []), samples=old.get("samples", 0))
+            self.cams._write()
+        msg = f"camera {name} saved ({e['verdict']}" + (f", adjusted by hand {r['edited']['mm']} mm / "
+                                                         f"{r['edited']['deg']} deg" if r.get("edited") else "") + ")"
         if as_part:
             msg += "; " + self._camera_part(str(name))
         return self._ok(msg, he=self.he_view(), parts=self.parts_view())
+
+    def cmd_handeye_load(self, name):
+        """Open a saved camera calibration to check it against the point cloud and adjust it by hand."""
+        e = self.cams.cameras.get(str(name))
+        if e is None:
+            raise he.HandEyeError(f"no camera calibration '{name}'")
+        p = self.core.profile
+        ee = e.get("ee_link") or (e["parent"] if e["mount"] == "eye_in_hand" else p.planning_link)
+        base = e.get("base_link") or (e["parent"] if e["mount"] == "eye_to_hand" else p.base_link)
+        self.cmd_handeye_start(e["topic"], e.get("info_topic", ""), e["mount"], ee_link=ee, base_link=base)
+        self.he["method"] = e.get("method", "park")
+        self.he["result"] = {"X": self.cams.T_parent_optical(str(name)), "mount": e["mount"], "method": self.he["method"],
+                             "verdict": e["verdict"], "rms_mm": e["rms_mm"], "rms_deg": e["rms_deg"],
+                             "per_sample": [], "methods": e.get("methods", {}), "orientation_spread_deg": "—",
+                             "n": e["samples"], "loaded": str(name)}
+        return self._ok(f"camera {name} opened: check it with the point cloud, adjust, Save", he=self.he_view())
 
     def cmd_handeye_apply(self, name):
         if str(name) not in self.cams.cameras:

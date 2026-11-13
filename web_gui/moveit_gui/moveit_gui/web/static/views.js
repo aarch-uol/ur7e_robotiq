@@ -30,15 +30,21 @@ const base = (o) => Object.assign({ name: "", fixed: false, l: ["manual", "fts"]
 // 1 Main (the page as it always was): what you command left with the F/T chart, the 3D view, the robot right.
 // The chart "att"ached to the F/T sensor card: it sits right under it, moves with it, never minimises.
 const MAIN = base({ name: "Main", fixed: true, l: ["manual", "fts", "chart"],
-  r: ["robot", "arm", "grip", "joints", "policy"],
-  tiles: { chart: { type: "ft", att: true }, policy: { type: "policy" } }, h: { chart: 300, policy: 640 } });
-// 2 and 3: ready-made layouts of your own (edit, rename or delete them in SETTINGS › Layouts)
+  tiles: { chart: { type: "ft", att: true } }, h: { chart: 300 } });
+// 2 to 4: ready-made layouts of your own (edit, rename or delete them in SETTINGS › Layouts)
 const PRESETS = [
   base({ name: "Force", l: ["manual", "fts", "chart"], r: ["robot", "arm", "joints", "grip"], right: ["c1"], rw: [1], f: 0.66,
     tiles: { chart: { type: "ft", att: true }, c1: { type: "cam", pick: 0 } }, h: { chart: 320 }, min: ["grip"] }),
   base({ name: "Cameras", l: ["manual", "grip", "drv"], r: ["robot", "arm", "fts", "joints"], bottom: ["c1", "c2"], bw: [1, 1], bh: 340,
     tiles: { c1: { type: "cam", pick: 0 }, c2: { type: "cam", pick: 1 }, drv: { type: "drv" } } }),
+  POLICY_PRESET(),
 ];
+// the Policy window next to the 3D view, full height; added once to layouts saved before it existed
+function POLICY_PRESET() {
+  return base({ name: "Policy", l: ["manual", "fts", "chart"], right: ["pol"], rw: [1], f: 0.58,
+    tiles: { chart: { type: "ft", att: true }, pol: { type: "policy" } }, h: { chart: 300 } });
+}
+const hasPolicy = (L) => Object.values(L.tiles || {}).some((t) => t?.type === "policy");
 
 // every card exactly once in a side column; tiles referenced exist; numbers sane (a stored layout may be old)
 function sane(x) {
@@ -87,6 +93,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
   let stored = null;
   try { stored = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) { stored = null; }
   const own = Array.isArray(stored?.list) ? stored.list.slice(0, MAX_LAYOUTS - 1).map(sane) : PRESETS.map(clone);
+  if (Array.isArray(stored?.list) && !stored.pol && !own.some(hasPolicy) && own.length < MAX_LAYOUTS - 1) own.push(sane(POLICY_PRESET()));
   // Main is fixed, but what is minimised and where its chart sits (beside F/T sensor or under the 3D view) is kept
   const main = clone(MAIN);
   if (Array.isArray(stored?.main?.min)) main.min = stored.main.min.filter((id) => CARDS.includes(id));
@@ -94,7 +101,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
   const W = { list: [main, ...own], cur: Math.min(Math.max(0, +stored?.cur || 0), own.length), edit: false, shown: false,
     cams: [], auto: { l: false, r: false }, drag: null, busy: false, ar: {}, mid: { w: 0, h: 0 }, ch: { w: 16, h: 60 } };
   const L = () => W.list[W.cur];
-  const save = () => localStorage.setItem(KEY, JSON.stringify({ v: 1, cur: W.cur, list: W.list.slice(1),
+  const save = () => localStorage.setItem(KEY, JSON.stringify({ v: 1, pol: 1, cur: W.cur, list: W.list.slice(1),
     main: { min: W.list[0].min, under: !!W.list[0].tiles.chart?.under } }));
   const isTile = (id) => !!L().tiles[id];
   const isAtt = (id) => !!L().tiles[id]?.att;

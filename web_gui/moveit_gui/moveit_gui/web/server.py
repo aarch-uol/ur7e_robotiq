@@ -25,6 +25,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import signal
@@ -35,12 +36,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import perf
 from ..robot_model import mesh_path
 from .service import CommandError, WebService
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 1 << 20
 MAX_UPLOAD = 28 << 20          # /api/upload: an STL for SETUP > Parts (20 MB, base64 in JSON)
+MAX_POLICY_UPLOAD = 300 << 20   # decoded policy folder total; the request limit includes base64 overhead
+MAX_POLICY_UPLOAD_BODY = (MAX_POLICY_UPLOAD * 4 // 3) + (16 << 20)
 # a camera window's picture in the browser: ?q= -> (at most this wide in pixels, frames/s); low is the default
 PREVIEW = {"low": (640, 10.0), "med": (960, 15.0), "high": (1280, 30.0)}
 ERR_EVERY_S = 30.0
@@ -103,6 +107,9 @@ def frame_jpeg(f):
     return encode_jpeg(f.rgb) if f.rgb is not None else None
 
 
+LIVE_HZ = 30.0                 # the "live" event (F/T, joints); the full state stays at Hub's hz
+
+
 class Hub:
     """Ticks the service, and lets SSE clients wait for the next state."""
 
@@ -117,9 +124,14 @@ class Hub:
         self._camera_requests = {}                         # topic -> token -> (fps, width)
         self.running = True
         self._last_err = -1e9
+        self.stats = perf.TickStats(self.period, lambda m: self.service.core.bridge.log(m))
         self.service.on_result = self.wake
         self._thread = threading.Thread(target=self._loop, daemon=True, name="web-tick")
         self._thread.start()
+        # F/T and joints at LIVE_HZ in their own small event: the full state is ~13 KB and stays at `hz`
+        self.live_version, self.live_json = 0, "{}"
+        self._live_t = time.time() - 0.2
+        threading.Thread(target=self._live_loop, daemon=True, name="web-live").start()
 
     def wake(self):
         """A background job finished: wake SSE now instead of waiting for the next 10 Hz state tick."""
@@ -151,7 +163,9 @@ class Hub:
             t0 = time.monotonic()
             try:
                 self.service.tick()
+                t1 = time.monotonic()
                 st = self.service.state()
+                t2 = time.monotonic()
                 st["cameras"] = {}                                     # what the browser's camera pictures get
                 for t, w in self.service.core.bridge.open_images().items():
                     f = w.latest()
@@ -159,9 +173,10 @@ class Hub:
                                         "width": f.width if f else 0, "height": f.height if f else 0,
                                         "encoding": f.encoding if f else "", "frame_id": f.frame_id if f else "",
                                         "error": f.error if f else ""}
-                js = json.dumps(st, default=_json_default)
+                js = _safe_json(st)
+                self.stats.add({"tick": t1 - t0, "state": t2 - t1, "json": time.monotonic() - t2})
             except Exception as e:                           # keep ticking: the lease watchdog lives here
-                js = json.dumps({"error": f"{type(e).__name__}: {e}"})
+                js = _safe_json({"error": f"{type(e).__name__}: {e}"})
                 now = time.monotonic()
                 if now - self._last_err > ERR_EVERY_S:
                     self._last_err = now
@@ -174,6 +189,33 @@ class Hub:
                 self.version += 1
                 self.cond.notify_all()
             time.sleep(max(0.0, self.period - (time.monotonic() - t0)))
+
+    def live(self) -> dict:
+        b = self.service.core.bridge
+        snap = b.snapshot()
+        fn = getattr(b, "wrench_samples", None)
+        samples = fn(self._live_t) if fn is not None else []
+        if samples:
+            self._live_t = samples[-1][0]
+        return {"t": time.time(),
+                "joints_deg": [round(math.degrees(v), 3) for v in snap.joints] if snap.joints else None,
+                "wrench": [round(v, 3) for v in snap.wrench] if snap.wrench else None,
+                "ft_samples": samples}
+
+    def _live_loop(self):
+        period = 1.0 / LIVE_HZ
+        while self.running:
+            t0 = time.monotonic()
+            try:
+                js = _safe_json(self.live())
+            except Exception:                                  # the full state reports errors
+                js = None
+            if js is not None:
+                with self.cond:
+                    self.live_json = js
+                    self.live_version += 1
+                    self.cond.notify_all()
+            time.sleep(max(0.0, period - (time.monotonic() - t0)))
 
     def stop(self):
         self.running = False
@@ -194,6 +236,23 @@ def _json_default(o):
     if hasattr(o, "name"):
         return o.name
     return str(o)
+
+
+def _json_safe_value(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return _json_safe_value(_json_default(value))
+
+
+def _safe_json(value) -> str:
+    """Encode JSON accepted by browsers even when a ROS/fake sample contains a non-finite number."""
+    return json.dumps(_json_safe_value(value), allow_nan=False)
 
 
 def make_handler(hub: Hub, allow_hosts=()):
@@ -275,7 +334,7 @@ def make_handler(hub: Hub, allow_hosts=()):
             return True
 
         def _json(self, code: int, obj):
-            body = json.dumps(obj, default=_json_default).encode()
+            body = _safe_json(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -399,9 +458,10 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.end_headers()
             self.close_connection = True
             seen_version = hub.version if hub.state_json == "{}" else -1
+            seen_live = hub.live_version
             seen_result, log_seq = (-1 if service.results else hub.result_version), 0
             if uid:                                           # this page's own public id (to find itself in "users")
-                self.wfile.write(f"event: hello\ndata: {json.dumps({'id': uid})}\n\n".encode())
+                self.wfile.write(f"event: hello\ndata: {_safe_json({'id': uid})}\n\n".encode())
                 self.wfile.flush()
             # Replay the small result history on reconnect. The browser ignores jobs it did not start, and this lets
             # a command that finished during an SSE interruption resolve instead of leaving its button pending forever.
@@ -411,17 +471,21 @@ def make_handler(hub: Hub, allow_hosts=()):
             while hub.running:
                 with hub.cond:
                     hub.cond.wait_for(lambda: hub.version != seen_version or hub.result_version != seen_result
-                                             or not hub.running, timeout=5.0)
+                                             or hub.live_version != seen_live or not hub.running, timeout=5.0)
                     state_changed = hub.version != seen_version
+                    live_changed = hub.live_version != seen_live
                     seen_version, seen_result, js = hub.version, hub.result_version, hub.state_json
+                    seen_live, live_js = hub.live_version, hub.live_json
                 out = [f"event: state\ndata: {js}\n\n"] if state_changed else []
+                if live_changed and live_js != "{}":
+                    out.append(f"event: live\ndata: {live_js}\n\n")
                 logs = [[seq, line] for seq, line in list(service.logs) if seq > log_seq]
                 if logs:
                     log_seq = logs[-1][0]                      # the page dedupes by these sequence numbers
-                    out.append(f"event: log\ndata: {json.dumps(logs)}\n\n")
+                    out.append(f"event: log\ndata: {_safe_json(logs)}\n\n")
                 for r in [r for r in list(service.results) if r["id"] > res_id]:
                     res_id = r["id"]
-                    out.append(f"event: result\ndata: {json.dumps(r)}\n\n")
+                    out.append(f"event: result\ndata: {_safe_json(r)}\n\n")
                 if out:
                     self.wfile.write("".join(out).encode())
                     self.wfile.flush()
@@ -462,7 +526,8 @@ def make_handler(hub: Hub, allow_hosts=()):
             if not self._host_ok():
                 return
             try:
-                body = self._body(MAX_UPLOAD if path == "/api/upload" else MAX_BODY)
+                body = self._body(MAX_UPLOAD if path == "/api/upload" else
+                                  MAX_POLICY_UPLOAD_BODY if path == "/api/policy-upload" else MAX_BODY)
                 client = str(body.get("token") or body.get("client") or "")        # the lease secret; STOP and /api/lease need none
                 if path == "/api/stop":
                     return self._json(200, service.stop(self._who(), str(body.get("bid") or ""), self._key(), self._role(need_origin=False)))
@@ -492,6 +557,10 @@ def make_handler(hub: Hub, allow_hosts=()):
                 if path == "/api/upload":
                     return self._json(200, service.command(client, "parts_mesh_upload", {
                         "filename": str(body.get("filename", "")), "data_b64": str(body.get("data_b64", ""))},
+                        local=self._local(), role=self._role()))
+                if path == "/api/policy-upload":
+                    return self._json(200, service.command(client, "policy_upload", {
+                        "folder": body.get("folder", ""), "files": body.get("files", [])},
                         local=self._local(), role=self._role()))
                 self._json(404, {"ok": False, "msg": "not found"})
             except CommandError as e:
@@ -562,6 +631,9 @@ class Server:
 
 
 def main(argv=None):
+    # The ROS threads take the GIL hundreds of times a second (joint states, F/T, speed scaling). With the
+    # default 5 ms switch interval a page request or the state update waits up to 5 ms at every hand-over.
+    sys.setswitchinterval(0.001)
     from ..app import data_dir, prepare_dirs, resolve_profile
     from ..core import RobotCore
     from ..profile import RobotProfile
@@ -574,7 +646,10 @@ def main(argv=None):
     ap.add_argument("--policy-import-root", action="append", default=[], metavar="DIR",
                     help="allowed model folder for SETUP > Policies (repeatable)")
     ap.add_argument("--policy-card-command", default=None,
-                    help="command used for export_policy_card.py (default: python3 tools/export_policy_card.py)")
+                    help="argument-list command used to make policy cards (none by default)")
+    ap.add_argument("--policy-run-command", default=None,
+                    help="run command template for imported policies, with {model} {normalization} "
+                         "{training_config} {robot_config} (default: ros2 run my_robot_policy)")
     ap.add_argument("--fake", action="store_true", help="no ROS: simulated robot")
     ap.add_argument("--urdf", help="--fake only: a URDF file for the 3D view")
     ap.add_argument("--real-cameras", action="store_true",
@@ -609,7 +684,7 @@ def main(argv=None):
         bridge = RosBridge(profile)
     core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake,
                      policy_import_roots=args.policy_import_root or None,
-                     policy_card_command=args.policy_card_command)
+                     policy_card_command=args.policy_card_command, policy_run_command=args.policy_run_command)
     service = WebService(core)
     server = Server(service, args.host, args.port, args.allow_host, args.also_host)
     print(f"MoveIt GUI web: {'  '.join('http://' + a + '/' for a in server.addresses)}  ({profile.display_name}"

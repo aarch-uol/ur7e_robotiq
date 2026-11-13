@@ -19,7 +19,7 @@ export function meshPartDefaults(file, parent, existing = [], scale = 0.001) {
 }
 
 export function workcell(ctx) {
-  const { h, btn, note, cmd, toast, lease, ask, askText, navTo } = ctx;
+  const { h, btn, note, cmd, scmd, toast, lease, ask, askText, navTo } = ctx;
   // the views are built once and only one is in the page at a time: look in the page, then in the hidden views
   const roots = [];
   const $ = (sel) => document.querySelector(sel) || roots.map((r) => r.querySelector(sel)).find(Boolean) || null;
@@ -422,10 +422,18 @@ export function workcell(ctx) {
 
   // ================================================================ Camera calibration
   function buildCalib() {
-    const C = { data: null, jpeg: null };
+    const C = { data: null, jpeg: null, live: false, cloudOn: false, edit: null, parentT: null, resKey: "" };
+    const ax = ["x", "y", "z", "roll", "pitch", "yaw"];
+    const editIn = ax.map((a, i) => h("input", { type: "number", class: "num", step: i < 3 ? "0.5" : "0.1", style: "width:74px",
+      title: i < 3 ? `${a} in mm` : `${a} in degrees`, oninput: () => { C.edit = { xyz: editIn.slice(0, 3).map((e) => +e.value), rpy: editIn.slice(3).map((e) => +e.value) }; place(); editNote(); } }));
     const camSel = h("select", { id: "he-cam", style: "min-width:200px" });
     const mount = h("select", { id: "he-mount" }, h("option", { value: "eye_in_hand" }, "on the robot's tool (eye-in-hand)"),
       h("option", { value: "eye_to_hand" }, "fixed in the cell (eye-to-hand)"));
+    const eeSel = h("select", { id: "he-ee", title: "The link the camera is fixed to (eye-in-hand), or the link that holds the board (eye-to-hand)" });
+    const baseSel = h("select", { id: "he-base", title: "The fixed frame: the robot base, or any link that does not move with the arm" });
+    const solverSel = h("select", { id: "he-solver", title: "The OpenCV solver whose result is used; the others are shown as a cross-check",
+      onchange: () => cmd("handeye_solve", { method: solverSel.value }).then((r) => r.ok && fill(r.he)) },
+      ...["park", "tsai", "horaud", "andreff", "daniilidis"].map((m) => h("option", { value: m }, m[0].toUpperCase() + m.slice(1))));
     const bf = (id, label, step) => [h("span", { class: "k" }, label), num(id, "", step, "70px")];
     const img = h("img", { id: "he-img", style: "max-width:100%;display:none;border-radius:6px" });
     const stepBtn = (b, step) => { b.dataset.step = step; return b; };
@@ -434,7 +442,9 @@ export function workcell(ctx) {
         note("Locate a camera from 10–15 pictures of a printed board."),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
           h("span", { class: "k" }, "Camera"), h("div", { class: "row" }, camSel, h("input", { type: "text", id: "he-topic", placeholder: "or an image topic", style: "flex:1" })),
-          h("span", { class: "k" }, "Mounted"), mount),
+          h("span", { class: "k" }, "Mounted"), mount,
+          h("span", { class: "k" }, "End effector"), eeSel,
+          h("span", { class: "k" }, "Base"), baseSel),
         h("div", { class: "row" }, lease(stepBtn(btn("Start", "", () => start(), "Read the camera's intrinsics and begin (clears the samples)"), 1)),
           h("span", { class: "muted small grow", id: "he-intr" }))),
       h("div", { class: "card" }, h("div", { class: "section" }, "2 · Board"),
@@ -445,7 +455,10 @@ export function workcell(ctx) {
             h("select", { id: "he-bd" }, ["DICT_4X4_50", "DICT_5X5_100", "DICT_6X6_250"].map((d) => h("option", { value: d }, d)))),
           h("div", { class: "row" }, lease(btn("Save board", "", () => saveBoard(), "Enter the square size you MEASURE on the print"))))),
       h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3 · Capture"),
+          h("label", { class: "small", title: "Show the camera with what the board detector sees, about twice a second (records nothing)" },
+            h("input", { type: "checkbox", id: "he-live", checked: true, onchange: () => liveLoop() }), " Live"),
           btn("Look", "quiet", () => look(), "Grab a frame and show what the board detector sees (records nothing)")),
+        h("div", { class: "row" }, h("span", { id: "he-seen" }), h("span", { class: "muted small grow", id: "he-seen-why" })),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr;align-items:center" },
           h("span", { class: "k" }, "Automatic"),
           h("div", { class: "row wrap" }, h("span", { class: "muted small" }, "the robot moves to 12 poses around this one, tilted"), num("he-tilt", 20, "1", "56px"), h("span", { class: "muted small" }, "°"),
@@ -453,14 +466,31 @@ export function workcell(ctx) {
             lease(stepBtn(btn("Run all", "", () => collect(), "Move to each planned pose and take a picture"), 2))),
           h("span", { class: "k" }, "By hand"),
           h("div", { class: "row wrap" }, h("span", { class: "muted small" }, "move the arm yourself, then"), ctx.freedriveButton(),
-            lease(btn("Capture here", "", () => capture(), "Take a picture where the arm is now (freedrive or jog between pictures)")))),
+            lease(btn("Capture here", "", () => capture(), "Take a picture where the arm is now (freedrive or jog between pictures)")),
+            h("span", { class: "small", id: "he-count" })),
+          h("span", {}), note("Vary the tilt (±20–30°) and the distance between pictures; the whole board does not have to be in view.")),
         h("div", { class: "muted small", id: "he-status" }), img,
         h("div", { class: "row wrap", id: "he-samples" }),
         h("div", { class: "row" }, lease(btn("Clear pictures", "quiet", () => cmd("handeye_drop").then((r) => r.ok && fill(r.he)))))));
-    const right = h("div", { class: "card", style: "width:380px" },
+    const right = h("div", { class: "card" },
       h("div", { class: "section" }, "4 · Solve"),
-      h("div", { class: "row" }, stepBtn(btn("Solve", "", () => cmd("handeye_solve").then((r) => r.ok && fill(r.he))), 3)),
+      h("div", { class: "row" }, stepBtn(btn("Solve", "", () => cmd("handeye_solve", { method: solverSel.value }).then((r) => r.ok && fill(r.he))), 3),
+        h("span", { class: "muted small" }, "solver"), solverSel),
       h("div", { id: "he-result" }),
+      h("div", { class: "section" }, "Check in 3D"),
+      h("div", { class: "row wrap" },
+        h("label", { class: "small", title: "The camera's depth as points, placed with the calibration: on a good one the table and parts sit where the robot model says" },
+          h("input", { type: "checkbox", id: "he-cloud", checked: true, onchange: () => { if (!$("#he-cloud").checked) ctx.view3d()?.clearCloud(); cloudLoop(); } }), " Point cloud"),
+        h("select", { id: "he-dens", title: "Point density: every 2nd, 4th or 8th pixel" },
+          h("option", { value: "2" }, "fine"), h("option", { value: "4", selected: true }, "medium"), h("option", { value: "8" }, "coarse")),
+        h("input", { type: "text", id: "he-depth", placeholder: "depth topic (auto)", style: "flex:1;min-width:120px", title: "Registered depth for this camera; empty: RealSense aligned_depth_to_color / ZED depth_registered" })),
+      h("div", { class: "muted small", id: "he-cloud-st" }),
+      h("div", { id: "he-edit", style: "display:none" },
+        h("div", { class: "row" }, h("span", { class: "small grow" }, "Adjust by hand"),
+          btn("Reset", "quiet", () => { C.edit = null; fillEdit(true); place(); editNote(); }, "Back to the solved pose")),
+        h("div", { class: "grid small", style: "grid-template-columns:auto 1fr auto 1fr auto 1fr;align-items:center" },
+          ...ax.flatMap((a, i) => [h("span", { class: "k" }, a + (i < 3 ? " mm" : " °")), editIn[i]])),
+        h("div", { class: "muted small", id: "he-edit-note" })),
       h("div", { class: "row" }, h("input", { type: "text", id: "he-name", placeholder: "camera name", style: "flex:1" }),
         lease(stepBtn(btn("Save", "", () => saveCam(), "Save the calibration and add the camera"), 4))),
       note("Save adds the camera to the robot."),
@@ -469,7 +499,8 @@ export function workcell(ctx) {
     async function start() {
       const opt = C.data?.cameras.find((c) => c.topic === camSel.value);
       const topic = $("#he-topic").value.trim() || camSel.value;
-      const r = await cmd("handeye_start", { topic, info_topic: $("#he-topic").value.trim() ? "" : (opt?.info || ""), mount: mount.value });
+      const r = await cmd("handeye_start", { topic, info_topic: $("#he-topic").value.trim() ? "" : (opt?.info || ""), mount: mount.value,
+        ee_link: eeSel.value, base_link: baseSel.value });
       if (r.ok) fill(r.he);
     }
     async function saveBoard() {
@@ -498,13 +529,87 @@ export function workcell(ctx) {
     async function saveCam() {
       const n = $("#he-name").value.trim();
       if (!n) return toast("name the camera first", false);
-      const r = await cmd("handeye_save", { name: n });
+      const r = await cmd("handeye_save", C.edit ? { name: n, xyz_mm: C.edit.xyz, rpy_deg: C.edit.rpy } : { name: n });
       if (r.ok) { fill(r.he); W.parts?.fill(r.parts); }
+    }
+    // live: grab and detect about twice a second while this page is shown, the camera is started and no pose run
+    async function liveLoop() {
+      if (C.live) return;
+      C.live = true;
+      try {
+        while ($("#he-live")?.checked && left.isConnected && left.offsetParent !== null && !document.hidden &&
+               C.data?.intrinsics && !C.running) {
+          const t0 = Date.now();
+          const r = await scmd("handeye_look");
+          if (!$("#he-live")?.checked || C.running) break;
+          shot(r);
+          if (r.detection && r.jpeg) status(r.detection);
+          else seen(null, r.detection?.why || r.msg);
+          await new Promise((ok) => setTimeout(ok, Math.max(150, 500 - (Date.now() - t0))));
+        }
+      } finally { C.live = false; }
+    }
+    function seen(d, why) {
+      const el = $("#he-seen");
+      el.replaceChildren(!d ? h("span", { class: "chip err" }, "no picture") : d.ok ? h("span", { class: "chip ok" }, `board found · ${d.markers ?? "?"} markers, ${d.corners} corners`) :
+        d.markers ? h("span", { class: "chip warn" }, `${d.markers} markers, ${d.corners} corners: not enough`) : h("span", { class: "chip err" }, "no ArUco markers"));
+      if (!d) $("#he-seen-why").textContent = why || "";
+    }
+    // ---- the point cloud in the 3D view, placed with the result (or the pose being adjusted)
+    const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
+    async function inflate(b64) {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      return new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer();
+    }
+    function pose() {
+      if (C.edit) return C.edit;
+      const r = C.data?.result;
+      return r ? { xyz: r.xyz_mm, rpy: r.rpy_deg } : null;
+    }
+    function place() {
+      const v = ctx.view3d(), p = pose();
+      if (!v) return;
+      if (!p || !C.parentT) { v.setCloudPose(null); return; }
+      v.setCloudPose(C.parentT, p.xyz, p.rpy);
+    }
+    function fillEdit(force) {
+      const r = C.data?.result;
+      $("#he-edit").style.display = r ? "" : "none";
+      if (!r) return;
+      const vals = [...r.xyz_mm, ...r.rpy_deg];
+      editIn.forEach((e, i) => { if (force || (!C.edit && document.activeElement !== e)) e.value = (+vals[i]).toFixed(i < 3 ? 2 : 3); });
+    }
+    function editNote() {
+      const r = C.data?.result, e = C.edit;
+      $("#he-edit-note").textContent = !r ? "" : !e ? "The cloud moves as you type: line up the table and parts you know. Save keeps the adjusted pose." :
+        `Adjusted: ${Math.hypot(...e.xyz.map((v, i) => v - r.xyz_mm[i])).toFixed(1)} mm from the solved pose. Save keeps it.`;
+    }
+    async function cloudLoop() {
+      if (C.cloudOn) return;
+      C.cloudOn = true;
+      try {
+        while ($("#he-cloud")?.checked && right.isConnected && right.offsetParent !== null && !document.hidden &&
+               C.data?.intrinsics && !C.running && ctx.view3d()) {
+          const t0 = Date.now();
+          const r = await scmd("handeye_cloud", { stride: +$("#he-dens").value, depth_topic: $("#he-depth").value.trim() });
+          if (!$("#he-cloud")?.checked || !ctx.view3d()) break;
+          if (!r.ok) { $("#he-cloud-st").textContent = r.msg; await sleep(2000); continue; }
+          const buf = await inflate(r.data), n = r.n;
+          const q = new Int16Array(buf, 0, 3 * n), pos = new Float32Array(3 * n);
+          for (let i = 0; i < 3 * n; i++) pos[i] = q[i] / 1000;
+          C.parentT = r.T_view_parent;
+          ctx.view3d().setCloud(pos, new Uint8Array(buf, 6 * n, 3 * n), r.stride >= 8 ? 0.006 : r.stride >= 4 ? 0.004 : 0.0025);
+          place();
+          $("#he-cloud-st").textContent = `${n} points · ${Math.round(r.data.length * 0.75 / 1024)} kB · ${Date.now() - t0} ms` +
+            (pose() ? "" : " · Solve or open a saved camera to place it") + (r.moving ? " · the arm moved meanwhile" : "");
+          await sleep(Math.max(150, 700 - (Date.now() - t0)));
+        }
+      } finally { C.cloudOn = false; }
     }
     function status(d) {
       if (!d) return;
-      $("#he-status").textContent = d.ok ? `Board: ${d.corners} corners, ${d.reproj_px} px reprojection, ${d.distance_mm} mm away` : d.why;
-      $("#he-status").classList.toggle("error", !d.ok);
+      seen(d);
+      $("#he-seen-why").textContent = d.ok ? `${d.reproj_px} px reprojection, ${d.distance_mm} mm away` : d.why;
     }
     function fill(d) {
       C.data = d;
@@ -514,6 +619,14 @@ export function workcell(ctx) {
       if (d.topic && !d.cameras.some((c) => c.topic === d.topic)) $("#he-topic").value = d.topic;
       else if (d.topic) camSel.value = d.topic;
       mount.value = d.mount;
+      const opts = (sel, cur, def) => {
+        const want = sel.dataset.touched ? sel.value : cur || def;
+        sel.replaceChildren(...d.links.map((l) => h("option", { value: l }, l + (l === def ? " (default)" : ""))));
+        sel.value = d.links.includes(want) ? want : def;
+      };
+      eeSel.onchange = () => (eeSel.dataset.touched = "1"); baseSel.onchange = () => (baseSel.dataset.touched = "1");
+      if (d.links && d.links.length) { opts(eeSel, d.flange, d.default_ee); opts(baseSel, d.base, d.default_base); }
+      if (document.activeElement !== solverSel) solverSel.value = d.method || "park";
       const b = d.board;
       [["he-bx", b.squares_x], ["he-by", b.squares_y], ["he-bs", b.square_mm], ["he-bm", b.marker_mm], ["he-bd", b.dict]].forEach(([id, v]) => {
         if (document.activeElement?.id !== id) $("#" + id).value = v; });
@@ -525,10 +638,18 @@ export function workcell(ctx) {
       $("#he-intr").textContent = i ? `Camera ready · fx ${i.fx.toFixed(1)} fy ${i.fy.toFixed(1)} · cx ${i.cx.toFixed(1)} cy ${i.cy.toFixed(1)}` +
         (i.D.some((x) => Math.abs(x) > 1e-9) ? " · distortion " + i.D.map((x) => x.toFixed(3)).join(" ") : " · no distortion") : "Not started";
       status(d.last);
+      const rk = d.result ? JSON.stringify([d.result.xyz_mm, d.result.rpy_deg]) : "";
+      if (rk !== C.resKey) { C.resKey = rk; C.edit = null; fillEdit(true); place(); editNote(); }
+      cloudLoop();
+      const n = d.samples.length, good = d.good_samples || 12;
+      const cnt = $("#he-count");
+      cnt.textContent = `${n} taken · at least ${d.min_samples}, ${good} recommended`;
+      cnt.className = "small " + (n < d.min_samples ? "warn" : n < good ? "muted" : "");
+      liveLoop();
       $("#he-samples").replaceChildren(...d.samples.map((s, k) => h("span", { class: "chip", title: `${s.corners} corners, ${s.reproj_px} px` },
         `#${k + 1} ${s.corners}c`, h("a", { class: "x", title: "Remove this sample", onclick: () => cmd("handeye_drop", { index: k }).then((r) => r.ok && fill(r.he)) }, " ×"))),
         h("span", { class: "muted small" }, `${d.samples.length} picture(s)` + (d.poses ? ` · ${d.poses} poses planned` : "") +
-          (d.samples.length < d.min_samples ? ` · at least ${d.min_samples}, 12+ is better` : d.samples.length < 12 ? " · 12+ is better" : " · enough")));
+          (d.samples.length < d.min_samples ? ` · at least ${d.min_samples}, ${good} recommended` : d.samples.length < good ? ` · ${good} recommended` : " · enough")));
       const r = d.result;
       $("#he-result").replaceChildren(...(r ? [
         h("div", { class: "row" }, chip(r.verdict.toUpperCase(), r.verdict === "good" ? "ok" : r.verdict === "usable" ? "warn" : "err"),
@@ -536,7 +657,7 @@ export function workcell(ctx) {
         h("div", { class: "grid small", style: "grid-template-columns:auto 1fr" },
           h("span", { class: "k" }, r.mount === "eye_in_hand" ? `${d.flange} → camera` : `${d.base} → camera`),
           h("span", { class: "mono" }, `${r.xyz_mm.join(", ")} mm`), h("span", { class: "k" }, "R P Y"), h("span", { class: "mono" }, `${r.rpy_deg.join(", ")} °`),
-          h("span", { class: "k" }, "other methods"), h("span", { class: "mono" }, Object.entries(r.methods).map(([k, v]) => `${k} ${v.mm} mm / ${v.deg}°`).join(" · ")),
+          h("span", { class: "k" }, `vs ${r.method || "park"}`), h("span", { class: "mono" }, Object.entries(r.methods).map(([k, v]) => `${k} ${v.mm} mm / ${v.deg}°`).join(" · ")),
           h("span", { class: "k" }, "orientation spread"), h("span", {}, `${r.orientation_spread_deg}°`)),
         r.per_sample.some((p) => p.mm > 3 * Math.max(r.rms_mm, 0.5)) ? h("div", { class: "error small" }, "Outliers: " + r.per_sample.map((p, k) => p.mm > 3 * Math.max(r.rms_mm, 0.5) ? `#${k + 1} (${p.mm} mm)` : "").filter(Boolean).join(", ") + ": remove them and solve again") : "",
         note(r.verdict === "good" ? "Good: a few mm and tenths of a degree is what the robot and a printed board allow." :
@@ -546,17 +667,23 @@ export function workcell(ctx) {
         h("div", { class: "grow" }, h("div", {}, `${c.name} · ${c.mount.replace(/_/g, "-")}`),
           h("div", { class: "muted small" }, `${c.verdict} · ${c.rms_mm} mm / ${c.rms_deg}° · ${c.samples} samples · ${c.saved}`),
           h("div", { class: "mono small", title: `${c.parent} → ${c.optical_frame}` }, `${c.xyz_mm.join(", ")} mm`)),
+        lease(btn("Open", "quiet", () => cmd("handeye_load", { name: c.name }).then((r) => { if (r.ok) { $("#he-name").value = c.name; fill(r.he); } }),
+          "Check this calibration with the point cloud and adjust it")),
         lease(btn("Add to robot", "quiet", () => cmd("handeye_apply", { name: c.name }).then((r) => r.ok && W.parts?.fill(r.parts)))),
         lease(btn("✕", "quiet", async () => (await ask(`Delete calibration ${c.name}?`)) && cmd("handeye_delete", { name: c.name }).then((r) => r.ok && fill(r.he))))))
         : [h("div", { class: "muted small" }, "None yet.")]));
     }
     roots.push(left, right);
     W.he = { left, right, load: () => cmd("handeye_get").then((r) => r.ok && fill(r.he)), fill,
+      paint3d: () => { place(); cloudLoop(); },
       update: (s) => {
         const p = s.workcell?.he;
         if (!p) return;
         const key = JSON.stringify(p);
         if (key !== C.key) { C.key = key; W.he.load(); }
+        C.running = !!p.running;
+        if (!p.running) { liveLoop(); cloudLoop(); }
+        if (!p.running) $("#he-status").textContent = "";
         if (p.running) $("#he-status").textContent = `Pose ${(p.pose ?? 0) + 1} of ${p.total} · ${p.got ?? 0} sampled`;
       } };
     return W.he;

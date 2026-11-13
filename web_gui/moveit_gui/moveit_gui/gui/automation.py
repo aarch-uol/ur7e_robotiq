@@ -12,7 +12,7 @@ from pathlib import Path
 from PyQt5 import QtCore, QtWidgets
 
 from ..policies import RecordingOptions
-from ..policy_executor import FAIL, OK, RUNNER  # noqa: F401
+from ..policy_executor import FAIL, OK, RUNNER, WARN  # noqa: F401
 from .control_stack import mode_nodes
 from .theme import SPACE, mono_font
 from .widgets import (Card, Collapsible, Dot, FlowView, ReadoutGrid, button, label, muted, page_widget,
@@ -39,10 +39,10 @@ class RequirementRow(QtWidgets.QWidget):
         lay.setContentsMargins(0, 1, 0, 1)
         lay.setSpacing(6)
         dot = Dot(8)
-        dot.set_state({OK: True, FAIL: False, RUNNER: None}[r.state])
+        dot.set_state({OK: True, FAIL: False}.get(r.state))
         lay.addWidget(dot, 0, QtCore.Qt.AlignVCenter)
         lay.addWidget(label(r.label), 0)
-        detail = label(r.detail if r.state == FAIL else "", "muted", wrap=True)
+        detail = label(r.detail if r.state in (FAIL, WARN) else "", "muted", wrap=True)
         detail.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         lay.addWidget(detail, 1)
         if r.detail:

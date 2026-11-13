@@ -246,6 +246,8 @@ def test_handeye_eye_in_hand_on_the_fake_wrist_camera(env):
     run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC)                   # info topic found next to the image
     look = run(s, "handeye_look")
     assert look["detection"]["ok"] and look["jpeg"]
+    assert look["detection"]["markers"] >= 4                           # the ArUco markers are counted too
+    assert run(s, "handeye_get")["he"]["good_samples"] == 12
     run(s, "handeye_plan", tilt_deg=20)
     r = run(s, "handeye_collect")
     assert wait(lambda: not s.he["progress"]["running"], 60)
@@ -493,3 +495,76 @@ def test_a_late_tf_takes_the_tcp_pose_from_the_joints(env, monkeypatch):
     assert max(abs(a - b) for a, b in zip(got["xyz_mm"], xyz)) < 0.01
     s.core.last_snap.joint_state_age = 5.0             # old joints: not used; the last pose is held, marked stale
     assert s.state()["tcp"]["stale"] is True
+
+
+def test_handeye_detection_says_when_no_aruco_marker_is_seen():
+    from moveit_gui import handeye as he
+    K = [600, 0, 320, 0, 600, 240, 0, 0, 1]
+    d = he.detect(np.full((480, 640), 110, np.uint8), dict(he.DEFAULT_BOARD), K, [0] * 5)
+    assert not d.ok and d.markers == 0 and "no ArUco markers" in d.why
+
+
+def test_handeye_on_a_picked_link_with_a_picked_solver(env):
+    s, b, _ = env
+    b.time_scale = 20.0
+    with pytest.raises(CommandError, match="no transform"):
+        run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC, ee_link="no_such_link")
+    run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC, ee_link="ft_fts_link")
+    v = run(s, "handeye_get")["he"]
+    assert v["flange"] == "ft_fts_link" and v["links"] and v["method"] == "park"
+    run(s, "handeye_plan", tilt_deg=20)
+    run(s, "handeye_collect")
+    assert wait(lambda: not s.he["progress"]["running"], 60) and s.results[-1]["ok"], s.results[-1]
+    r = run(s, "handeye_solve", method="tsai")["he"]["result"]
+    assert r["method"] == "tsai" and "tsai" not in r["methods"] and "park" in r["methods"]
+    truth = b.lookup_transform("ft_fts_link", "tool0") @ fb.FAKE_T_TOOL0_CAMLINK @ fb.FAKE_T_LINK_OPTICAL
+    E = tf.inv(s.he["result"]["X"]) @ truth
+    assert np.linalg.norm(E[:3, 3]) < 0.003 and np.degrees(tf.rotation_angle(E[:3, :3])) < 0.3
+    with pytest.raises(CommandError, match="solver is one of"):
+        run(s, "handeye_solve", method="magic")
+    run(s, "handeye_save", name="wrist_w3", as_part=False)
+    e = s.cams.cameras["wrist_w3"]
+    assert e["parent"] == "ft_fts_link" and e["method"] == "tsai" and e["ee_link"] == "ft_fts_link"
+
+
+def test_handeye_point_cloud_for_the_3d_view(env):
+    import base64
+    import zlib
+    s, b, _ = env
+    with pytest.raises(CommandError, match="Start"):
+        run(s, "handeye_cloud")
+    run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC)
+    r = run(s, "handeye_cloud", stride=8)
+    assert r["depth_topic"] == fb.FAKE_DEPTH_TOPIC and r["n"] == (720 // 8) * (1280 // 8)
+    raw = zlib.decompress(base64.b64decode(r["data"]))
+    xyz = np.frombuffer(raw[:6 * r["n"]], "<i2").reshape(-1, 3)
+    assert len(raw) == 9 * r["n"] and (xyz[:, 2] == 400).all()          # the fake scene is 0.4 m away
+    centre = xyz[np.argmin(np.abs(xyz[:, 0]) + np.abs(xyz[:, 1]))]
+    assert abs(centre[0]) <= 3 and abs(centre[1]) <= 3                 # optical axis through cx, cy
+    T = np.array(r["T_view_parent"]).reshape(4, 4)
+    assert np.allclose(T, b.lookup_transform(s.core.profile.base_link, "tool0"), atol=1e-6)
+    with pytest.raises(CommandError, match="no image"):
+        run(s, "handeye_cloud", depth_topic="/nothing")
+
+
+def test_handeye_adjusted_by_hand_and_reopened(env):
+    s, b, _ = env
+    b.time_scale = 20.0
+    run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC)
+    run(s, "handeye_plan", tilt_deg=20)
+    run(s, "handeye_collect")
+    assert wait(lambda: not s.he["progress"]["running"], 60) and s.results[-1]["ok"]
+    xyz, rpy = tf.T_to_mm_deg(s.he["result"]["X"])
+    with pytest.raises(CommandError, match="adjusted pose"):
+        run(s, "handeye_save", name="wrist", xyz_mm=[1, 2], rpy_deg=[0, 0, 0])
+    out = run(s, "handeye_save", name="wrist", as_part=False, xyz_mm=[xyz[0] + 2.0, xyz[1], xyz[2]], rpy_deg=list(rpy))
+    assert "adjusted by hand 2.0 mm" in out["msg"]
+    e = s.cams.cameras["wrist"]
+    n = e["samples"]
+    assert e["edited_by_hand"]["mm"] == pytest.approx(2.0, abs=0.01) and n >= 10
+    assert tf.T_to_mm_deg(s.cams.T_parent_optical("wrist"))[0][0] == pytest.approx(xyz[0] + 2.0, abs=1e-3)
+    v = run(s, "handeye_load", name="wrist")["he"]
+    assert v["result"]["loaded"] == "wrist" and v["result"]["xyz_mm"][0] == pytest.approx(xyz[0] + 2.0, abs=0.01)
+    assert not v["samples"]
+    run(s, "handeye_save", name="wrist", as_part=False, xyz_mm=list(xyz), rpy_deg=list(rpy))   # back, samples kept
+    assert s.cams.cameras["wrist"]["samples"] == n and len(s.cams.cameras["wrist"]["sample_data"]) == n

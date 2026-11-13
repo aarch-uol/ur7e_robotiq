@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
+import yaml
 
 from .servo_pause import ServoPause
 from . import cart_speed, force, jog
@@ -45,7 +46,8 @@ Result = Tuple[bool, str]
 
 class RobotCore:
     def __init__(self, bridge, profile: RobotProfile, profiles_dir: Path, programs_dir: Path, policies_dir: Path,
-                 fake: bool = False, policy_import_roots=None, policy_card_command=None):
+                 fake: bool = False, policy_import_roots=None, policy_card_command=None,
+                 policy_run_command=None):
         self.bridge, self.profile, self.fake = bridge, profile, fake
         self.profiles_dir, self.programs_dir, self.policies_dir = Path(profiles_dir), Path(programs_dir), \
             Path(policies_dir)
@@ -73,7 +75,8 @@ class RobotCore:
             policy_running=lambda: self.policies.busy,
             program_running=lambda: self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active))
         # One policy runtime path: AUTOMATION and the program `policy` step both go through this.
-        library = PolicyLibrary(policies_dir, allowed_roots=policy_import_roots, card_command=policy_card_command)
+        library = PolicyLibrary(policies_dir, allowed_roots=policy_import_roots, card_command=policy_card_command,
+                                run_command=policy_run_command)
         # SETUP > F/T + payload > Match simulation: the result in use goes into every policy run's robot config
         self.ft_match = FtMatchStore(ft_match_path(_config_dir(), profile.name))
         self.settings_owner: Callable[[], str] = lambda: ""      # whose settings are in use (set by the web GUI)
@@ -83,11 +86,21 @@ class RobotCore:
                                        MockPolicyRunner() if fake else SubprocessPolicyRunner(library, self.modes),
                                        active_tcp=lambda: self.store.active_tcp,
                                        frame_exists=lambda f: f in self.store.frame_names())
-        self.policies.range_check = lambda m: policy_range_warnings(
-            m, raw_ft=(self.last_snap.wrench if hasattr(self, "last_snap") else None),
-            tcp_z=(self.geo.current_T_base_tcp(self.store.active_tcp)[2, 3]
-                   if self.store.active_tcp else None),
-            ft_result=self.ft_match.load())
+        def policy_ranges(m):
+            robot_config = m.expanded_files().get("robot_config")
+            tcp_z = None
+            if robot_config and self.store.active_tcp:
+                frame = self.profile.base_link
+                try:
+                    config = yaml.safe_load(Path(robot_config).read_text()) or {}
+                    obs = config.get("observations") or {}
+                    frame = (obs.get("ee_frame") or obs.get("position_frame") or config.get("ee_frame") or
+                             (config.get("servo_admittance") or {}).get("ee_frame") or frame)
+                    tcp_z = float(self.geo.current_pose(str(frame), self.store.active_tcp).T()[2, 3])
+                except Exception:
+                    tcp_z = None
+            return policy_range_warnings(m, tcp_z=tcp_z, ft_result=self.ft_match.load() if robot_config else None)
+        self.policies.range_check = policy_ranges
         # MoveIt Servo is paused while no jog or policy uses it (servo_pause.py)
         self.servo_pause = ServoPause(bridge, (profile.servo.get("routes") or {}).keys(), bridge.log)
         self.policies.servo_pause = self.servo_pause
@@ -140,6 +153,11 @@ class RobotCore:
         self._jog_restore_mode = ""
         self._servo_home_mode = ""             # the user's mode while a Servo jog borrows a hidden mode (shown_mode)
         self._jog_shape = True
+        # Jog tab open: Servo kept ready (unpaused, its controller switched in) so a press moves at once.
+        # {"route", "restore", "kind", "t"}; renewed by the page, dropped JOG_ARM_S after the last renewal.
+        self._jog_arm: Optional[dict] = None
+        self._arm_lock = threading.RLock()
+        self._disarming = False
         self.jog_cfg = jog.jog_config(profile)
         self._force: Optional[force.ForceStream] = None
         self.force_cfg = force.force_config(profile)
@@ -181,6 +199,7 @@ class RobotCore:
                 threading.Thread(target=self.force_stop, args=("control mode changed: zeroed at once",),
                                  daemon=True).start()
         self._robot_watchdog()
+        self._jog_arm_watch()
         self.servo_pause.tick()
         p = self._plan
         if p is not None and s.joints and \
@@ -321,7 +340,8 @@ class RobotCore:
     # ----------------------------------------------------------------- motion
     def motion_refusal(self) -> Optional[str]:
         """Why manual MoveIt motion is not allowed right now, or None."""
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
+        if (self.busy and not self.jog_ready_only()) or self.runner.state != RunState.IDLE or self.policies.busy \
+                or self.batch.active:
             return "robot is busy"
         if self.modes.control_state_unknown:
             return ("control state is UNKNOWN: GUI motion is disabled until it is recovered "
@@ -329,11 +349,13 @@ class RobotCore:
         robot = self.robot_refusal()
         if robot:
             return robot
-        if not self.modes.mode_supports_moveit(self.mode):
-            m = self.profile.modes.get(self.mode)
+        # Servo kept ready for the Jog tab: a motion gives the arm back first, so the user's own mode counts
+        mode = self.shown_mode if self.jog_ready_only() else self.mode
+        if not self.modes.mode_supports_moveit(mode):
+            m = self.profile.modes.get(mode)
             why = ("a direct-torque mode: MoveIt trajectories are not available" if m and m.direct_torque
                    else "a mode without a trajectory controller")
-            return f"{m.label if m else self.mode} is {why}. Change to Position or Admittance."
+            return f"{m.label if m else mode} is {why}. Change to Position or Admittance."
         return None
 
     STATE_STALE_S = 1.0                  # joint states older than this: the robot / driver is gone
@@ -383,6 +405,7 @@ class RobotCore:
                      refusal: Optional[Callable[[], Optional[str]]] = None) -> Optional[str]:
         """Claim the arm for one manual action. Returns the refusal, or None (then call end_motion).
         refusal: the rule to check instead of motion_refusal (e.g. force, which needs no MoveIt)."""
+        self.jog_disarm()                             # Servo kept ready for the Jog tab: give the arm back first
         with self._lock:
             why = (refusal or self.motion_refusal)()
             if why is None:
@@ -505,47 +528,31 @@ class RobotCore:
         if not any(velocity.values):
             return False, "move at least one jog slider away from zero"
         speed = max(0.01, speed * self.speed_override)
-        why = self.begin_motion(f"jog {velocity.describe()} (Servo)")
-        if why:
-            return False, why
-        start_mode = self.mode
-        route_name, route_cfg = jog.servo_route(self.profile, start_mode)
-        restore_mode = ""
-        ok, msg = self.servo_pause.hold(route_name or "")
-        if not ok:
-            self.end_motion()
-            return False, msg
-        self._jog_hold_route = route_name or ""
-        try:
-            ok, msg = self.bridge.servo_command_type(
-                velocity.kind if velocity.kind == "joint" else "twist", route_name)
-            if not ok:
-                self._jog_release_servo()
-                self.end_motion()
-                return False, f"Servo: {msg}"
-
-            # Position Servo streams to its own joint_trajectory_controller (servo_position mode), switched in
-            # with the same fail-closed transactional mode switching as every other controller transition.
-            stream_mode = str(route_cfg.get("control_mode") or start_mode)
-            if stream_mode != start_mode:
-                self._servo_home_mode = start_mode       # before the switch: a state poll must not see a change
-                ok, msg = self.modes.switch_to(stream_mode)
+        kind = velocity.kind if velocity.kind == "joint" else "twist"
+        with self._arm_lock:
+            arm = self._jog_arm
+            if arm is not None and arm["route"] != (jog.servo_route(self.profile, self.shown_mode)[0] or ""):
+                self.jog_disarm()                     # the mode changed since it was made ready
+                arm = None
+            if arm is None:
+                why = self.begin_motion(f"jog {velocity.describe()} (Servo)")
+                if why:
+                    return False, why
+                ok, msg, route_name, route_cfg, restore_mode = self._servo_prepare(kind)
                 if not ok:
-                    self.update()
-                    self._servo_home_mode = ""
-                    self._jog_release_servo()
                     self.end_motion()
-                    return False, f"Servo controller switch: {msg}"
-                restore_mode = start_mode
-                self.update()
-                if self.mode != stream_mode:
-                    self.modes.switch_to(restore_mode)
-                    self.update()
-                    self._servo_home_mode = ""
-                    self._jog_release_servo()
-                    self.end_motion()
-                    return False, f"Servo controller switch succeeded but mode is {self.mode}"
-
+                    return False, msg
+            else:
+                route_name, route_cfg = arm["route"], arm["cfg"]
+                restore_mode = ""                     # the arm keeps Servo's controller after the jog
+                if arm["kind"] != kind:
+                    ok, msg = self.bridge.servo_command_type(kind, route_name)
+                    if not ok:
+                        return False, f"Servo: {msg}"
+                    arm["kind"] = kind
+                arm["t"] = time.monotonic()
+                self.command_source = f"jog {velocity.describe()} (Servo)"
+        try:
             self.bridge.log(
                 f"Servo jog start: {velocity.describe()} · route {route_name} · {self.mode} · "
                 f"direct Servo output · {jog.STREAM_HZ:.0f} Hz")
@@ -562,16 +569,137 @@ class RobotCore:
                 self._jog = stream
             stream.start()
         except Exception:
-            if restore_mode:
-                ok, msg = self.modes.switch_to(restore_mode)
-                if not ok:
-                    self.bridge.log(f"Servo cleanup could not restore {restore_mode}: {msg}")
-                self.update()
-            self._servo_home_mode = ""
-            self._jog_release_servo()
-            self.end_motion()
+            if arm is None:
+                self._servo_unprepare(restore_mode, delay=False)
+                self.end_motion()
             raise
         return True, f"jogging {velocity.describe()}"
+
+    def _servo_prepare(self, kind: str):
+        """Unpause Servo, set its command type and switch in its controller (a Position jog streams to its own
+        controller in a hidden mode). Returns (ok, msg, route, route_cfg, restore_mode). On failure all undone."""
+        start_mode = self.mode
+        route_name, route_cfg = jog.servo_route(self.profile, start_mode)
+        ok, msg = self.servo_pause.hold(route_name or "")
+        if not ok:
+            return False, msg, route_name, route_cfg, ""
+        self._jog_hold_route = route_name or ""
+        restore_mode = ""
+        try:
+            ok, msg = self.bridge.servo_command_type(kind, route_name)
+            if not ok:
+                self._jog_release_servo()
+                return False, f"Servo: {msg}", route_name, route_cfg, ""
+            # Position Servo streams to its own joint_trajectory_controller (servo_position mode), switched in
+            # with the same fail-closed transactional mode switching as every other controller transition.
+            stream_mode = str(route_cfg.get("control_mode") or start_mode)
+            if stream_mode != start_mode:
+                self._servo_home_mode = start_mode       # before the switch: a state poll must not see a change
+                ok, msg = self.modes.switch_to(stream_mode)
+                if not ok:
+                    self.update()
+                    self._servo_home_mode = ""
+                    self._jog_release_servo()
+                    return False, f"Servo controller switch: {msg}", route_name, route_cfg, ""
+                restore_mode = start_mode
+                self.update()
+                if self.mode != stream_mode:
+                    self.modes.switch_to(restore_mode)
+                    self.update()
+                    self._servo_home_mode = ""
+                    self._jog_release_servo()
+                    return False, f"Servo controller switch succeeded but mode is {self.mode}", route_name, route_cfg, ""
+        except Exception:
+            self._servo_unprepare(restore_mode, delay=False)
+            raise
+        return True, "", route_name, route_cfg, restore_mode
+
+    def _servo_unprepare(self, restore_mode: str, delay: bool = True):
+        if restore_mode:
+            if delay:
+                # Servo decelerates after the zero command and then publishes a few halt messages: let them
+                # reach the controller before taking it away, so the arm stops on Servo's ramp, not abruptly.
+                time.sleep(jog.RESTORE_DELAY_S)
+            ok, msg = self.modes.switch_to(restore_mode)
+            if not ok:
+                self.bridge.log(f"Servo: could not restore {restore_mode}: {msg}")
+            self.update()
+        self._servo_home_mode = ""
+        self._jog_release_servo()
+
+    # ---- Jog tab: Servo kept ready
+    JOG_ARM_S = 3.0                            # dropped this long after the page's last renewal
+
+    def jog_ready_only(self) -> bool:
+        """Busy only because the Jog tab keeps Servo ready (no jog streams)."""
+        return self._jog_arm is not None and not self.jogging
+
+    def jog_arm(self) -> Result:
+        """Keep Servo ready for hold-to-jog while the Jog tab is open: the page calls this about every second.
+        The first call prepares Servo (as a jog press would); later ones only renew."""
+        with self._arm_lock:
+            arm = self._jog_arm
+            route_now = jog.servo_route(self.profile, self.shown_mode)[0] or ""
+            if arm is not None and arm["route"] == route_now:
+                arm["t"] = time.monotonic()
+                return True, "Servo ready"
+            if arm is not None:
+                self.jog_disarm()
+            if self.jogging:
+                return True, "jogging"
+            why = self.jog_hold_refusal()
+            if why:
+                return False, why
+            why = self.begin_motion("Jog tab: Servo ready")
+            if why:
+                return False, why
+            try:
+                ok, msg, route_name, route_cfg, restore_mode = self._servo_prepare("twist")
+            except Exception:
+                self.end_motion()
+                raise
+            if not ok:
+                self.end_motion()
+                return False, msg
+            self._jog_arm = {"route": route_name or "", "cfg": route_cfg, "restore": restore_mode,
+                             "kind": "twist", "t": time.monotonic()}
+            self.bridge.log(f"Jog tab: Servo ready (route {route_name}, {self.mode})")
+            return True, "Servo ready"
+
+    def jog_disarm(self, reason: str = ""):
+        """Give the arm back: stop a jog, switch the user's controller back in, let Servo pause again."""
+        if self._jog_arm is None:
+            return
+        self.jog_stop("Servo no longer kept ready")   # outside the lock: the stream's end takes it
+        with self._arm_lock:
+            arm, self._jog_arm = self._jog_arm, None
+            if arm is None:
+                return
+            try:
+                self._servo_unprepare(arm["restore"], delay=False)
+            finally:
+                self.end_motion()
+            self.bridge.log(f"Jog tab: Servo released{f' ({reason})' if reason else ''}")
+
+    def _jog_arm_watch(self):
+        """From update(): drop the arm when the page stopped renewing it or the robot cannot move."""
+        arm = self._jog_arm
+        if arm is None or self._disarming or self.jogging:
+            return
+        why = ("the page stopped renewing it" if time.monotonic() - arm["t"] > self.JOG_ARM_S
+               else self.robot_refusal())
+        if not why:
+            return
+        self._disarming = True
+
+        def run():
+            try:
+                self.jog_disarm(why)
+            except Exception as e:
+                self.bridge.log(f"Jog tab: releasing Servo: {type(e).__name__}: {e}")
+            finally:
+                self._disarming = False
+        threading.Thread(target=run, daemon=True, name="jog-disarm").start()
 
     def _jog_release_servo(self):
         r, self._jog_hold_route = getattr(self, "_jog_hold_route", ""), ""
@@ -686,17 +814,13 @@ class RobotCore:
             self._jog_velocity = None
             self._jog_route = ""
             self._jog_restore_mode = ""
-        if restore_mode:
-            # Servo decelerates after the zero command and then publishes a few halt messages: let them reach
-            # the controller before taking it away, so the arm stops on Servo's ramp rather than abruptly.
-            time.sleep(jog.RESTORE_DELAY_S)
-            ok, msg = self.modes.switch_to(restore_mode)
-            if not ok:
-                self.bridge.log(f"Servo jog stopped but could not restore {restore_mode}: {msg}")
-            self.update()
-        self._servo_home_mode = ""
-        self._jog_release_servo()
-        self.end_motion()
+        arm = self._jog_arm
+        if arm is not None:                        # the Jog tab keeps Servo ready: nothing to give back yet
+            arm["t"] = time.monotonic()
+            self.command_source = "Jog tab: Servo ready"
+        else:
+            self._servo_unprepare(restore_mode)
+            self.end_motion()
         if reason != "released":
             self.bridge.log(f"jog ended: {reason}")
         summary = self._jog_summary()
@@ -818,7 +942,8 @@ class RobotCore:
         return self.robot_refusal()
 
     def _force_claim_refusal(self) -> Optional[str]:
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
+        if (self.busy and not self.jog_ready_only()) or self.runner.state != RunState.IDLE or self.policies.busy \
+                or self.batch.active:
             return "robot is busy"
         return self.force_refusal()
 
@@ -1073,7 +1198,7 @@ class RobotCore:
         # each part on its own: one that raises must not keep the others (or the cancel) from running
         for part in (lambda: self.batch.stop("stopped by STOP"),                   # first: no next run of a batch starts
                      lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
-                     lambda: self.jog_stop("STOP"), self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
+                     lambda: self.jog_stop("STOP"), self.jog_disarm, self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
             try:
                 part()
             except Exception as e:
@@ -1085,7 +1210,8 @@ class RobotCore:
         """The F/T hard limit (ft_guard.py, its own thread): stop everything the GUI commands, motion first."""
         self.bridge.log(f"F/T HARD LIMIT: {why}: stopping the GUI's motion")
         for part in (self.bridge.cancel_motion, self.runner.stop, self.policies.cancel,
-                     lambda: self.jog_stop("F/T hard limit"), lambda: self.force_stop("F/T hard limit: zeroed")):
+                     lambda: self.jog_stop("F/T hard limit"), self.jog_disarm,
+                     lambda: self.force_stop("F/T hard limit: zeroed")):
             try:
                 part()
             except Exception as e:
@@ -1095,8 +1221,8 @@ class RobotCore:
 
     def commanding(self) -> bool:
         """The GUI is commanding the arm: a move, a program or policy run, a jog or a force."""
-        return bool(self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.jogging
-                    or self.force_active)
+        return bool((self.busy and not self.jog_ready_only()) or self.runner.state != RunState.IDLE
+                    or self.policies.busy or self.jogging or self.force_active)
 
     def _robot_watchdog(self):
         """While the GUI commands the arm, the robot must stay able to execute: if the program stops, the arm
@@ -1146,6 +1272,7 @@ class RobotCore:
         return ok, msg
 
     def switch_mode(self, target: str) -> Result:
+        self.jog_disarm()
         if self.busy:
             return False, "robot is busy"
         return self.modes.switch_to(target)

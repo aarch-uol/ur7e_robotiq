@@ -49,6 +49,16 @@ from .camera import IMAGE as IMAGE_TYPE, IMAGE_TYPES, ImageWatch
 from .control_modes import ReferenceShiftError, moveit_controller_for, shift_to_reference
 from .profile import RobotProfile, reorder_joints
 
+
+def _policy_json_safe(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _policy_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_policy_json_safe(v) for v in value]
+    return value
+
 try:  # UR-specific messages: optional so the GUI also works with non-UR profiles
     from ur_dashboard_msgs.msg import RobotMode, SafetyMode
     from ur_dashboard_msgs.srv import GetLoadedProgram, GetProgramState, IsInRemoteControl, Load
@@ -113,29 +123,54 @@ class CameraTopics:
     """Topics and camera images, read only (the camera preview, calibration, a program's photo, driver checks).
     Needs self.node, self.cb, self._tf (a tf2 Buffer or None), self._image_sub and self._image_watch."""
 
-    def _next_image(self, topic: str, timeout_s: float):
-        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why)."""
-        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
-        t = next((x for x in types if x in IMAGE_TYPES), None)
-        if t is None:
-            return None, f"{topic}: no image publisher"
-        got, ev = {}, threading.Event()
+    IMAGE_KEEP_S = 5.0          # a grab subscription stays this long after its last use (live preview: no churn)
 
-        def on_msg(m):
-            if not ev.is_set():
-                got["m"] = m
-                ev.set()
-        if t == IMAGE_TYPE:
-            from sensor_msgs.msg import Image as Msg
-        else:
-            from sensor_msgs.msg import CompressedImage as Msg
-        sub = self.node.create_subscription(Msg, topic, on_msg, qos_profile_sensor_data, callback_group=self.cb)
-        try:
-            if not ev.wait(timeout_s):
+    def _next_image(self, topic: str, timeout_s: float):
+        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why).
+        The subscription is kept for IMAGE_KEEP_S after the last grab: subscribing for every frame (the hand-eye
+        live view grabs twice a second) churns discovery and races the executor on destroy."""
+        if not hasattr(self, "_grabs"):
+            self._grabs, self._grab_lock = {}, threading.Lock()
+            self.node.create_timer(1.0, self._grab_reap, callback_group=self.cb)
+        with self._grab_lock:
+            g = self._grabs.get(topic)
+        if g is None:
+            types = dict(self.node.get_topic_names_and_types()).get(topic, [])
+            t = next((x for x in types if x in IMAGE_TYPES), None)
+            if t is None:
+                return None, f"{topic}: no image publisher"
+            if t == IMAGE_TYPE:
+                from sensor_msgs.msg import Image as Msg
+            else:
+                from sensor_msgs.msg import CompressedImage as Msg
+            g = {"type": t, "msg": None, "seq": 0, "cv": threading.Condition(), "used": time.monotonic()}
+
+            def on_msg(m, g=g):
+                with g["cv"]:
+                    g["msg"], g["seq"] = m, g["seq"] + 1
+                    g["cv"].notify_all()
+            g["sub"] = self.node.create_subscription(Msg, topic, on_msg, qos_profile_sensor_data, callback_group=self.cb)
+            with self._grab_lock:
+                old = self._grabs.setdefault(topic, g)
+            if old is not g:                                   # another thread subscribed first
+                self.node.destroy_subscription(g["sub"])
+                g = old
+        g["used"] = time.monotonic()
+        with g["cv"]:
+            seq = g["seq"]                                     # the NEXT frame: the arm pose is read around it
+            if not g["cv"].wait_for(lambda: g["seq"] > seq, timeout_s):
                 return None, f"{topic}: no image within {timeout_s:.0f} s"
-        finally:
+            m = g["msg"]
+        g["used"] = time.monotonic()
+        return g["type"], m
+
+    def _grab_reap(self):
+        now = time.monotonic()
+        with self._grab_lock:
+            old = [k for k, g in self._grabs.items() if now - g["used"] > self.IMAGE_KEEP_S]
+            subs = [self._grabs.pop(k)["sub"] for k in old]
+        for sub in subs:
             self.node.destroy_subscription(sub)
-        return t, got["m"]
 
     def grab_image(self, topic: str, timeout_s: float = 3.0):
         """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
@@ -155,6 +190,39 @@ class CameraTopics:
         except Exception as e:
             return None, f"{topic}: {e}"
         return img, m.header.frame_id
+
+    def grab_rgbd(self, color_topic: str, depth_topic: str, timeout_s: float = 3.0):
+        """(rgb uint8 HxWx3, depth float32 HxW in metres, "") of the next colour and depth frames (fetched together),
+        or (None, None, why). Depth: 16UC1 in mm or 32FC1 in m (NaN / 0 = no return)."""
+        from .camera import decode_image
+        got = {}
+
+        def one(key, topic):
+            got[key] = self._next_image(topic, timeout_s)
+        th = [threading.Thread(target=one, args=(k, t), daemon=True) for k, t in (("c", color_topic), ("d", depth_topic))]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join(timeout_s + 1.0)
+        (tc, mc), (td, md) = got.get("c", (None, "no colour")), got.get("d", (None, "no depth"))
+        if tc is None or td is None:
+            return None, None, mc if tc is None else md
+        if tc != IMAGE_TYPE or td != IMAGE_TYPE:
+            return None, None, "the point cloud needs raw (not compressed) colour and depth images"
+        try:
+            rgb = decode_image(mc.encoding, mc.width, mc.height, mc.step, mc.data, bool(mc.is_bigendian),
+                               max_width=100000)
+            e = md.encoding.lower()
+            if e in ("16uc1", "mono16"):
+                d = np.frombuffer(bytes(md.data), np.uint16).reshape(md.height, -1)[:, :md.width].astype(np.float32)
+                d *= 0.001
+            elif e == "32fc1":
+                d = np.frombuffer(bytes(md.data), np.float32).reshape(md.height, -1)[:, :md.width].copy()
+            else:
+                return None, None, f"{depth_topic}: depth encoding {md.encoding} is not supported"
+        except Exception as ex:
+            return None, None, f"{color_topic}: {ex}"
+        return rgb, d, ""
 
     def grab_photo(self, topic: str, timeout_s: float = 3.0):
         """(JPEG bytes at full resolution, "") of the next frame of an image topic, or (None, why). A JPEG
@@ -733,6 +801,7 @@ class RosBridge(CameraTopics):
             data = json.loads(msg.data)
             if not isinstance(data, dict):
                 return
+            data = _policy_json_safe(data)
             data["_received"] = time.time()
             with self._lock:
                 self._policy_step_buf.append(data)

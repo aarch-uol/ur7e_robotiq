@@ -295,6 +295,34 @@ export function policyStepBuffer(windowSeconds = 30) {
   };
 }
 
+export function policyActionMeta(policy = {}, sample = {}) {
+  const values = Array.isArray(sample?.command) ? sample.command : Array.isArray(sample?.action) ? sample.action : [];
+  const raw = Array.isArray(policy?.action_names) ? policy.action_names : [];
+  const names = values.map((_, i) => {
+    const item = raw[i];
+    return typeof item === "string" && item ? item : item && typeof item.name === "string" && item.name ? item.name : `a${i}`;
+  });
+  const rawUnits = policy?.action_units;
+  const units = names.map((name, i) => {
+    const item = raw[i];
+    if (item && typeof item === "object" && item.unit) return String(item.unit);
+    if (Array.isArray(rawUnits)) return rawUnits[i] ? String(rawUnits[i]) : "";
+    if (rawUnits && typeof rawUnits === "object") return rawUnits[name] ? String(rawUnits[name]) : "";
+    return "";
+  });
+  return { names, units };
+}
+
+export function policyChartStatus(state = {}, now = Date.now() / 1000) {
+  const rows = Array.isArray(state?.policy_steps) ? state.policy_steps : [];
+  const latest = rows.at(-1);
+  const supplied = state?.policy?.step_age_s;
+  const suppliedAge = typeof supplied === "number" ? supplied : NaN;
+  const age = Number.isFinite(suppliedAge) ? suppliedAge : latest && Number.isFinite(Number(latest.t))
+    ? Math.max(0, now - Number(latest.t)) : null;
+  return { age, stale: !state?.policy?.busy || age == null || age > 2 };
+}
+
 /** Live policy chart: actions and F/T on their own scales; observation sigma is shown as bars. */
 export function policyChart() {
   const buf = policyStepBuffer(30);
@@ -303,12 +331,9 @@ export function policyChart() {
   const sigmaBox = el("div", { class: "policy-sigma" });
   const root = el("div", { class: "card policy-chart" },
     el("div", { class: "section" }, "Policy chart · last 30 s"), canvas, sigmaBox, note);
+  let latestState = {};
   let dirty = true;
   // Two plots, each on its own scale: policy actions (~0.01) would be a flat line next to F/T (~10 N)
-  const PLOTS = [
-    { label: "action", names: ["dx", "dz", "dpitch"], get: (r, i) => r.action?.[i], colors: ["#d1495b", "#2e8b57", "#2f5fb3"] },
-    { label: "F/T (N)", names: ["Fx", "Fy", "Fz"], get: (r, i) => r.ft?.[i], colors: ["#c77d12", "#7b4fb3", "#14879c"] },
-  ];
   function draw() {
     dirty = false;
     const W = canvas.clientWidth || 520, H = canvas.clientHeight || 260, dpr = globalThis.devicePixelRatio || 1;
@@ -319,12 +344,21 @@ export function policyChart() {
     if (!g) return;
     g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
     const rows = buf.rows, L = 40, R = 8, B = 16, gap = 14, now = rows.length ? Number(rows.at(-1).t) : 0;
+    const meta = policyActionMeta(latestState.policy, rows.at(-1));
+    const PLOTS = [
+      { label: "action", names: meta.names.length ? meta.names : ["a0"],
+        get: (r, i) => (Array.isArray(r.command) ? r.command : r.action)?.[i],
+        colors: ["#d1495b", "#2e8b57", "#2f5fb3", "#c77d12", "#7b4fb3", "#14879c"] },
+      { label: "F/T (N)", names: ["Fx", "Fy", "Fz"], get: (r, i) => r.ft?.[i],
+        colors: ["#c77d12", "#7b4fb3", "#14879c"] },
+    ];
     const ph = (H - B - gap * PLOTS.length) / PLOTS.length, pw = W - L - R;
     const X = (t) => L + pw * (1 - (now - t) / 30);
     g.font = "10px system-ui, sans-serif";
     PLOTS.forEach((P, n) => {
       const T = gap + n * (ph + gap);
-      const vals = rows.flatMap((r) => P.names.map((_, i) => P.get(r, i))).filter(Number.isFinite);
+      const vals = rows.flatMap((r) => P.names.map((_, i) => P.get(r, i)))
+        .map((v) => typeof v === "number" && Number.isFinite(v) ? v : null).filter((v) => v != null);
       const a = axisRange(vals, n ? 1 : 0.01), Y = (v) => T + ph * (1 - (v - a.lo) / (a.hi - a.lo));
       g.textAlign = "right"; g.textBaseline = "middle"; g.strokeStyle = "#e2e5e9"; g.lineWidth = 1;
       const dec = a.step >= 1 ? 0 : Math.min(4, Math.ceil(-Math.log10(a.step)));
@@ -334,11 +368,11 @@ export function policyChart() {
       }
       g.textAlign = "left"; g.textBaseline = "alphabetic"; let lx = L;
       g.fillStyle = "#515a65"; g.fillText(P.label, lx, T - 3); lx += g.measureText(P.label).width + 10;
-      P.names.forEach((name, i) => { g.fillStyle = P.colors[i]; g.fillText("— " + name, lx, T - 3); lx += g.measureText("— " + name).width + 8; });
+      P.names.forEach((name, i) => { g.fillStyle = P.colors[i % P.colors.length]; g.fillText("— " + name, lx, T - 3); lx += g.measureText("— " + name).width + 8; });
       g.save(); g.beginPath(); g.rect(L, T, pw, ph); g.clip();
       P.names.forEach((_, i) => {
-        g.strokeStyle = P.colors[i]; g.lineWidth = 1.4; g.beginPath(); let first = true;
-        rows.forEach((r) => { const v = P.get(r, i); if (!Number.isFinite(v)) return; const x = X(Number(r.t)), y = Y(v); first ? g.moveTo(x, y) : g.lineTo(x, y); first = false; });
+        g.strokeStyle = P.colors[i % P.colors.length]; g.lineWidth = 1.4; g.beginPath(); let first = true;
+        rows.forEach((r) => { const v = P.get(r, i); if (typeof v !== "number" || !Number.isFinite(v)) return; const x = X(Number(r.t)), y = Y(v); first ? g.moveTo(x, y) : g.lineTo(x, y); first = false; });
         g.stroke();
       });
       g.restore();
@@ -347,17 +381,27 @@ export function policyChart() {
     for (let s = 30; s >= 0; s -= 10) g.fillText(s ? `-${s} s` : "now", Math.min(Math.max(L + pw * (1 - s / 30), L + 12), L + pw - 12), H - 3);
     const latest = rows.at(-1), sigma = latest?.obs_sigma || {};
     const bad = latest?.out_of_range || [];
-    sigmaBox.replaceChildren(...Object.entries(sigma).map(([name, value]) => {
-      const n = Number(value), width = Math.max(0, Math.min(100, n / 4 * 100));
+    sigmaBox.replaceChildren(...Object.entries(sigma).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).map(([name, value]) => {
+      const n = value, width = Math.max(0, Math.min(100, n / 4 * 100));
       return el("div", { class: "policy-sigma-row", title: `${name}: ${n.toFixed(1)} sigma` },
         el("span", { class: "muted small" }, name), el("div", { class: "bar grow" },
           el("div", { style: `width:${width}%;${n > 4 ? "background:var(--danger)" : ""}` })),
         el("span", { class: "mono small" }, n.toFixed(1)));
     }));
-    note.textContent = latest ? `dx ${Number(latest.action?.[0] || 0).toFixed(3)} · dz ${Number(latest.action?.[1] || 0).toFixed(3)} · dpitch ${Number(latest.action?.[2] || 0).toFixed(3)} · ` +
-      `obs sigma ${Object.entries(sigma).map(([k, v]) => `${k} ${Number(v).toFixed(1)}`).join(", ") || "—"}` +
+    const status = policyChartStatus({ ...latestState, policy_steps: rows }, Date.now() / 1000);
+    root.dataset.stale = String(status.stale);
+    canvas.style.filter = status.stale ? "grayscale(1)" : "";
+    root.style.opacity = status.stale ? "0.55" : "";
+    const action = latest ? (Array.isArray(latest.command) ? latest.command : latest.action) : null;
+    const actionText = meta.names.map((name, i) => {
+      const v = action?.[i], shown = typeof v === "number" && Number.isFinite(v) ? v.toFixed(3) : "—";
+      return `${name} ${shown}${meta.units[i] ? ` ${meta.units[i]}` : ""}`;
+    }).join(" · ");
+    const ageText = status.age == null ? "last step —" : `last step ${status.age.toFixed(1)} s ago`;
+    note.textContent = latest ? `${actionText || "action —"} · ${ageText} · ` +
+      `obs sigma ${Object.entries(sigma).filter(([, v]) => typeof v === "number" && Number.isFinite(v)).map(([k, v]) => `${k} ${v.toFixed(1)}`).join(", ") || "—"}` +
       (bad.length ? ` · out of range: ${bad.join(", ")}` : "") : "No policy step data";
   }
   return { el: root, get length() { return buf.length; }, get rows() { return buf.rows; }, draw,
-    push(state) { const n = buf.push(state?.policy_steps || []); if (n) draw(); }, clear() { buf.clear(); draw(); } };
+    push(state) { latestState = state || {}; buf.push(latestState.policy_steps || []); draw(); }, clear() { buf.clear(); draw(); } };
 }

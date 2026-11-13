@@ -171,6 +171,8 @@ def _executor(backend):
     ex.done_listeners = []
     ex.current = None
     ex._cancelled = threading.Event()
+    ex._cancel_lock = threading.Lock()
+    ex._cancel_generation = 0
     ex.ran = []
     ex.backend = SimpleNamespace(busy=False, run=lambda goal, hz, emit, finished: ex.ran.append(finished))
     return ex

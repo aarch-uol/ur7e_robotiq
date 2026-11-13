@@ -404,12 +404,22 @@ start_stack() {
   # --ulimit rtprio: the controller managers may run their control loop at real-time priority (SCHED_FIFO 50).
   # Without it they log "Could not enable FIFO RT scheduling policy" and the loop overruns on a busy PC (seen on
   # the Jetson: thousands of overruns, TF up to 0.4 s late).
+  # SETUP > Policies: when the policy runner is installed in ~/ws/scraping (/ws/scraping in here), import from its
+  # policies folder, make cards with its exporter and run imported policies with its run_policy.py
+  POLICY_ENV=()
+  if [ -f "$WS/scraping/run_policy.py" ]; then
+    POLICY_ENV=(-e MOVEIT_GUI_POLICY_IMPORT_ROOTS=/ws/scraping/policies
+      -e "MOVEIT_GUI_POLICY_RUN_COMMAND=python3 /ws/scraping/run_policy.py --model {model} --normalization {normalization} --config {training_config} --robot-config {robot_config} --robot-controller servo_admittance")
+    [ -f "$WS/scraping/export_policy_card.py" ] && \
+      POLICY_ENV+=(-e "MOVEIT_GUI_POLICY_CARD_COMMAND=python3 /ws/scraping/export_policy_card.py")
+  fi
   docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host --ulimit rtprio=99 -e ROS_DOMAIN_ID="$DOMAIN" "${NET_ENV[@]}" -e UR7E_EE_CONFIG="$BASE" $(parts_env) \
     -v /dev:/dev --device-cgroup-rule 'c 81:* rmw' --device-cgroup-rule 'c 189:* rmw' "${ZED_ENV[@]}" \
     -e UR7E_ROBOT="$ROBOT" -e UR7E_ROBOT_MODE="$([ "$FAKE" = 1 ] && echo fake || echo real)" -e UR7E_ROBOT_IP="$ROBOT_IP" -e UR7E_FT_IP="$FT_IP" \
     -e UR7E_SERVO="$SERVO" \
     -e UR7E_ROBOT_STATUS="$STATUS" "${R_RUN[@]}" \
     -e MOVEIT_GUI_LOCAL_POWER_ONLY="${MOVEIT_GUI_LOCAL_POWER_ONLY:-}" \
+    "${POLICY_ENV[@]}" \
     -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$DATA:/data" -v "$WS:/ws" \
     "$R_IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source $UNDERLAY && $STACK" >/dev/null

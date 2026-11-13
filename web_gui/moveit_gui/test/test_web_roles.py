@@ -46,6 +46,15 @@ def test_admin_commands_need_admin(env):
     assert "roles_save" in ADMIN_COMMANDS and "move_joints" not in ADMIN_COMMANDS and "restart" not in ADMIN_COMMANDS
 
 
+def test_policy_import_sources_and_upload_need_admin(env):
+    s, _, _, _ = env
+    token = s.take_lease("", "operator", role="operator")["token"]
+    for command in ("policy_sources", "policy_upload"):
+        with pytest.raises(CommandError, match="only an Admin"):
+            s.command(token, command, {"folder": "x", "files": []} if command == "policy_upload" else {},
+                      role="operator")
+
+
 def test_viewer_cannot_take_or_ask_for_control(env):
     s, _, _, _ = env
     with pytest.raises(CommandError, match="Viewer"):
@@ -60,3 +69,9 @@ def test_admin_commands_exist():
     from moveit_gui.web.service import WebService
     missing = [c for c in ADMIN_COMMANDS if not hasattr(WebService, f"cmd_{c}")]
     assert not missing, missing
+
+
+def test_admin_lists_policy_sources_without_control(env):
+    s, _, _, _ = env
+    out = s.command("", "policy_sources", {}, role="admin")
+    assert out["ok"] and out["roots"]

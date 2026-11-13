@@ -219,7 +219,6 @@ export function extraViews({ h, btn, cmd, pcmd, INFO, getS, op, navTo, logs }) {
       polState.textContent = busy ? (current ? `Running · ${current}` : "Preparing…") : "Idle";
       polStart.dataset.policyBusy = busy ? "1" : "";
       polStart.disabled = busy;
-      polStop.disabled = !busy;
       polWarn.classList.toggle("hidden", !(p.range_warnings?.length || p.step_warnings?.length));
       polWarn.textContent = [...new Set([...(p.range_warnings || []), ...(p.step_warnings || []).map((x) => `runner: ${x}`)])].join("\n");
       if (!polSel.value && INFO.policies.length) polSel.value = INFO.policies[0].name;

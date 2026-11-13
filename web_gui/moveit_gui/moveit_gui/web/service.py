@@ -16,6 +16,7 @@ Long actions run as jobs in a worker thread; their outcome comes back as a "resu
 from __future__ import annotations
 
 import contextlib
+import base64
 import itertools
 import json
 import math
@@ -23,6 +24,7 @@ import os
 import secrets
 import shutil
 import threading
+import tempfile
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -47,8 +49,9 @@ from ..geometry import ACTIVE_TCP, GeometryError, PoseSpec
 from ..geometry_calibration import VialGeometryError, estimate_vial
 from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
-from ..policies import (PolicyImportError, RecordingOptions, allowed_policy_roots, list_policy_checkpoints,
-                        policy_range_warnings, policy_path_allowed)
+from ..policies import (POLICY_UPLOAD_SUFFIXES, PolicyImportError, RecordingOptions, allowed_policy_roots,
+                        list_policy_checkpoints,
+                        policy_range_warnings, policy_path_allowed, split_range_notes)
 from ..policy_action import RunPolicyResult
 from ..activity import KINDS as ACTIVITY_KINDS, ActivityLog, summarize_args
 from .users import Users, public_id
@@ -82,6 +85,7 @@ VIAL_POINTS = ("Rim 1", "Rim 2", "Rim 3", "Bottom")
 KEEPOUT_TCP_CLEARANCE_MM = 5.0      # "Under TCP": the box top stays this far below the touching TCP
 # commands that change the setup rather than run the robot: Admin only (roles.py)
 ADMIN_COMMANDS = frozenset((
+    "debug_profile",
     "tcp_save", "tcp_delete", "pivot_reset", "pivot_capture", "pivot_remove", "pivot_solve", "pivot_save",
     "gains_apply", "gains_apply_policy", "gains_forget", "gains_restore", "gains_preset_save", "gains_preset_delete",
     "ft_bias_set", "ft_bias_clear", "ft_bias_preset_save", "ft_bias_preset_delete",
@@ -91,12 +95,15 @@ ADMIN_COMMANDS = frozenset((
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "robot_setup", "setup_save", "setup_delete", "setup_load", "setup_copy",
     "profile_delete",
-    "policy_import", "policy_rename",
+    "policy_import", "policy_rename", "policy_sources", "policy_upload",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
     "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN,
     *FTMATCH_ADMIN))
 # commands allowed while the one in control does not have their own settings in use (worksets.py)
 SWITCH_FREE = frozenset(("profile_activate", "stack_stop"))
+# commands that leave Servo ready for the Jog tab; every other command with the lease gives the arm back first
+JOG_KEEPS_READY = frozenset(("jog_arm", "jog_start", "jog_hold", "jog_stop", "hold_renew", "profile_prefs_save",
+                             "gripper", "speed_override"))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
 ACTIVITY_COMMANDS = {
     **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
@@ -207,6 +214,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         self.prepared_policy: Optional[str] = None
         self._policy_step_cursor = time.time() - 0.2
         self._policy_last_step = None
+        self._policy_was_busy = False
+        self._policy_chart_policy = None
         self.vial_points: Dict[str, List[float]] = {}
         self._pivot_parent = ""
         self._pivot_samples: List[np.ndarray] = []
@@ -560,6 +569,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError("take control first: another browser or nobody holds the control lease")
         if not read_only and cmd not in SWITCH_FREE and self._needs_switch():
             raise CommandError(self._switch_refusal())
+        if not read_only and cmd not in JOG_KEEPS_READY:
+            self.core.jog_disarm("another command")
         args = dict(args or {})
         args.pop("local", None)                           # the server says where the browser is, never the page
         if cmd == "record_delete":
@@ -1262,6 +1273,28 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         self.core.jog_stop()
         return self._ok("jog stopped")
     cmd_jog_stop.read_only = True          # stopping never needs the lease
+
+    def cmd_debug_profile(self, seconds=10):
+        """Where the GUI's time goes: samples every thread for a few seconds, then logs the busiest places."""
+        from . import perf
+        sec = min(30.0, max(1.0, float(seconds)))
+
+        def run():
+            for line in perf.sample(sec):
+                self.core.bridge.log(line)
+        threading.Thread(target=run, daemon=True, name="web-profile").start()
+        return self._ok(f"profiling for {sec:.0f} s: the result goes to the log")
+    cmd_debug_profile.read_only = True     # it only reads; admin only (ADMIN_COMMANDS)
+
+    def cmd_jog_arm(self):
+        """Jog tab open: keep Servo ready so a press moves at once. Renew about every second."""
+        ok, msg = self.core.jog_arm()
+        return {"ok": ok, "msg": msg}
+
+    def cmd_jog_disarm(self):
+        self.core.jog_disarm("Jog tab closed")
+        return self._ok("Servo released")
+    cmd_jog_disarm.read_only = True        # giving the arm back never needs the lease
 
     # ---------------------------------------------------------------- program
     def _programs_dir(self, owner="", create=False) -> Path:
@@ -2058,24 +2091,58 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError("that folder is outside the allowed policy roots")
         try:
             checkpoints = [str(x) for x in list_policy_checkpoints(p, lib.card_command)]
-            return self._ok(roots=roots, folder=str(p), checkpoints=checkpoints)
+            info = []
+            for checkpoint in checkpoints:
+                q = Path(checkpoint)
+                try:
+                    st = q.stat()
+                    try:
+                        rel = str(q.relative_to(p))
+                    except ValueError:
+                        rel = q.name
+                    info.append({"path": checkpoint, "name": q.name, "rel": rel, "size": st.st_size, "mtime": st.st_mtime})
+                except OSError:
+                    continue
+            return self._ok(roots=roots, folder=str(p), checkpoints=checkpoints, checkpoint_info=info)
         except PolicyImportError as e:
             return self._ok(roots=roots, folder=str(p), checkpoints=[], error=str(e))
-    cmd_policy_sources.read_only = True
+
+    cmd_policy_sources.read_only = True               # lists files only; still admin-only
 
     def cmd_policy_import(self, folder, checkpoint, name, description="", backend="", required_mode="",
-                          required_tcp="", overwrite=False):
+                          required_tcp="", overwrite=False, no_normalization=False):
         lib = self.core.policies.library
         folder = str(Path(folder).expanduser().resolve())
-        checkpoint = str(Path(checkpoint).expanduser().resolve())
+        checkpoint = str(Path(checkpoint).expanduser())
         def job():
             try:
                 out = lib.import_policy(folder, checkpoint, name, description, backend, required_mode, required_tcp,
-                                        overwrite=bool(overwrite))
+                                        overwrite=bool(overwrite), no_normalization=bool(no_normalization))
             except PolicyImportError as e:
                 return False, str(e)
             return True, out["msg"]
         return self._submit("policy import", job)
+
+    def cmd_policy_upload(self, folder, files):
+        lib = self.core.policies.library
+
+        def job():
+            decoded = []
+            for item in files or []:
+                if not isinstance(item, dict):
+                    return False, "uploaded file entry is invalid"
+                try:
+                    data = base64.b64decode(str(item.get("data_b64", "")), validate=True)
+                except Exception:
+                    return False, "uploaded file is not base64"
+                decoded.append((str(item.get("path", "")), data))
+            try:
+                saved = lib.save_uploaded_folder(str(folder), decoded)
+            except PolicyImportError as e:
+                return False, str(e)
+            return True, f"uploaded policy folder {saved.name}"
+
+        return self._submit("policy upload", job)
 
     def cmd_policy_rename(self, name, new_name=None, description=None, overwrite=False):
         lib = self.core.policies.library
@@ -2148,6 +2215,16 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError("robot is busy")
         goal = self.core.policies.goal(name, duration=float(duration) if duration not in (None, "") else None,
                                        recording=_recording(recording))
+        launch_epoch = getattr(self.core.bridge, "stop_epoch", 0)
+        launch_generation = self.core.policies.cancel_generation
+        caller_token = getattr(self._command_context, "token", None)
+        with self._lease_lock:
+            launch_lease = self.lease
+            launch_lease_generation = launch_lease.generation
+            launch_token = caller_token if caller_token is not None else launch_lease.token
+        self._policy_chart_policy = name
+        self._policy_last_step = None
+
         def job():
             done, out = threading.Event(), {}
             if not self.core.policies.prepare(goal, lambda res: (out.setdefault("prepare", res), done.set())):
@@ -2157,9 +2234,15 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             prepared = out["prepare"]
             if not prepared.success:
                 return False, prepared.stop_reason
+            if getattr(self.core.bridge, "stop_epoch", 0) != launch_epoch:
+                return False, "not started: STOP was pressed during prepare"
+            if not self._job_lease_still_matches(launch_lease, launch_lease_generation, launch_token):
+                return False, "not started: control changed during prepare"
+            if self._needs_switch():
+                return False, "not started: settings changed during prepare; switch to your settings first"
             self.core.policy_result, self.core.policy_feedback = None, None
             self.core.command_source = f"policy {name}"
-            if not self.core.policies.start(goal):
+            if not self.core.policies.start(goal, expected_generation=launch_generation):
                 self.core.command_source = "idle"
                 return False, self.core.policy_result.stop_reason if self.core.policy_result else "not started"
             return True, f"{name} started"
@@ -2170,6 +2253,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError("prepare this policy first")
         if not self.core.idle():
             raise CommandError("robot is busy")
+        self._policy_chart_policy = name
+        self._policy_last_step = None
         self.core.policy_result, self.core.policy_feedback = None, None
         self.core.command_source = f"policy {name}"
         if not self.core.policies.start(self.core.policies.goal(name, recording=_recording(recording)),
@@ -2469,15 +2554,28 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         self.payload_progress.update(done=0, total=0, error="")
         return self._ok("calibration samples cleared")
 
-    def cmd_payload_save(self):
+    def _payload_accept(self, accept_failed: bool):
+        r = self.payload.result
+        if not r.passed and accept_failed and not r.accepted:
+            r.accepted = True
+            issues = "; ".join(str(x) for x in r.quality.get("issues", []))
+            self.core.bridge.log(f"payload: result used although checks failed: {issues}")
+
+    def cmd_payload_save(self, accept_failed: bool = False):
         if not self.payload or not self.payload.result:
             raise CommandError("nothing to save")
+        self._payload_accept(bool(accept_failed))
         return self._ok(f"saved {self.payload.save()}")
 
-    def cmd_payload_apply(self):
+    def cmd_payload_apply(self, accept_failed: bool = False):
         cal = self.payload
         if not cal or not cal.result:
             raise CommandError("nothing to apply")
+        if not cal.result.usable and not accept_failed:
+            raise CommandError("the fit did not pass its checks: confirm to use it anyway")
+        self._payload_accept(bool(accept_failed))
+        if accept_failed and cal.saved_path is not None:
+            cal.save()                                    # the file says it was accepted
         if (self.payload_view() or {}).get("result", {}).get("bias_changed"):
             raise CommandError("the F/T bias changed since these poses were collected: collect them again "
                                "(or set the bias back) before applying")
@@ -2516,6 +2614,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                         if len(stamp) == 3 and len(stamp[-2]) == 8 else ""
                     self._pfile = {"name": files[-1].name, "path": str(files[-1]), "count": len(files), "at": at,
                                    "mass": j.get("mass_kg"), "cog": j.get("cog_m"), "passed": j.get("passed"),
+                                   "accepted": bool(j.get("accepted_despite_failed_checks")),
                                    "poses": len(j.get("samples") or []),
                                    "applied": bool(j.get("applied_to_controller"))}
                 except Exception as e:
@@ -2539,13 +2638,13 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                "saved": self._payload_saved(cal)}
         if r:
             bias = r.info.get("residual_bias")
-            out["result"] = {"passed": r.passed, "mass": r.mass, "cog": r.cog,
+            out["result"] = {"passed": r.passed, "accepted": r.accepted, "mass": r.mass, "cog": r.cog,
                              "issues": [str(x) for x in list(r.quality.get("issues", [])) +
                                         list(r.quality.get("warnings", []))],
                              "yaml": cal.admittance_yaml(), "applied": self.payload_applied,
                              "offset_n": float(np.linalg.norm(np.asarray(bias[:3], float)))
                              if bias is not None and len(bias) >= 3 else None,
-                             "can_apply": bool(r.passed and cal.apply_node),
+                             "can_apply": bool(cal.apply_node),           # a failed fit asks first
                              # the fit holds for the bias it was collected with: a later zero / clear breaks it
                              "bias_changed": bool(getattr(self, "payload_bias", None) is not None
                                                   and self.core.ft_bias.live is not None
@@ -2695,13 +2794,32 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             tcp_sig = str(c.store.active_tcp)
         fb = c.policy_feedback
         pr = c.policy_result
+        policy_busy = c.policies.busy
+        if policy_busy:
+            if not self._policy_was_busy:
+                self._policy_last_step = None
+            self._policy_was_busy = True
+        elif self._policy_was_busy:
+            self._policy_last_step = None
+            self._policy_was_busy = False
+        if c.policies.current and c.policies.current != self._policy_chart_policy:
+            self._policy_chart_policy = c.policies.current
+            self._policy_last_step = None
         policy_steps = self._policy_steps()
+        if not policy_busy:
+            self._policy_last_step = None
+        step_age = None
+        if self._policy_last_step:
+            received = self._policy_last_step.get("_received")
+            if received is not None:
+                step_age = max(0.0, time.time() - float(received))
+        chart = self._policy_chart_info(self._policy_chart_policy)
         range_warnings = []
         if c.policies.current:
             m = c.policies.manifests.get(c.policies.current)
             if m and c.policies.range_check:
                 try:
-                    range_warnings = c.policies.range_check(m)
+                    range_warnings = split_range_notes(c.policies.range_check(m))[0]
                 except Exception as e:
                     range_warnings = [f"range check unavailable: {e}"]
         return {
@@ -2718,8 +2836,9 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             "gripper_position": s.gripper_position, "gripper_status": s.gripper_status,
             "gripper_controller": s.gripper_controllers.get(c.profile.gripper.get("controller") or ""),
             "freedrive": s.freedrive,
-            "mode": c.shown_mode, "mode_label": c.mode_label(c.shown_mode), "command_source": c.command_source, "busy": c.busy,
-            "idle": c.idle(), "motion_refusal": c.motion_refusal(), "manual_refusal": self._manual_refusal(),
+            "mode": c.shown_mode, "mode_label": c.mode_label(c.shown_mode), "command_source": c.command_source,
+            "busy": c.busy and not c.jog_ready_only(),
+            "idle": c.idle() or c.jog_ready_only(), "motion_refusal": c.motion_refusal(), "manual_refusal": self._manual_refusal(),
             "unknown": c.modes.control_state_unknown, "unknown_reason": c.modes.unknown_reason,
             "last_refusal": c.last_refusal, "controllers": s.controllers,
             "runner": {"state": c.runner.state.name, "step": c.program_step,
@@ -2730,13 +2849,16 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                        "path": list(c.runner.current_path) if c.runner.current_path else None,
                        "result": c.program_result, "program": self.program.name,
                        "dirty": self._program_yaml() != self._saved_yaml, "rev": self.program_rev},
-            "policy": {"busy": c.policies.busy, "current": c.policies.current, "prepared": self.prepared_policy,
+            "policy": {"busy": policy_busy, "current": c.policies.current, "prepared": self.prepared_policy,
                        "feedback": vars(fb) if fb else None,
                        "result": {"success": pr.success, "reason": pr.stop_reason, "log_dir": pr.log_dir}
                        if pr else None,
                        "supports_feedback": c.policies.supports_feedback,
                        "range_warnings": range_warnings,
-                       "step_warnings": (self._policy_last_step or {}).get("out_of_range", [])},
+                       "step_warnings": ((self._policy_last_step or {}).get("out_of_range", [])
+                                         if policy_busy else []),
+                       "step_age_s": step_age,
+                       **chart},
             "policy_steps": policy_steps,
             "payload": self.payload_view(),
             "ftmatch": self.ftmatch_view(),
@@ -2749,7 +2871,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             "lease": self._lease_state(),
             "activity_seq": self.activity.seq, "history_last": (self.core.history.entries[-1].get("id") if self.core.history.entries else ""),
             "users": self.users.view(self.lease.uid),
-            "jog": {"active": c.jogging, "hold_refusal": c.jog_hold_refusal(),
+            "jog": {"active": c.jogging, "ready": c._jog_arm is not None, "hold_refusal": c.jog_hold_refusal(),
                     "servo_warning": c.servo_warning() if c.jogging else ""},
             "force": {**c.force_view(), "note": c.force_note()},
             "plan": self._plan_summary(),
@@ -2785,6 +2907,29 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             self._policy_last_step = row
             clean.append({k: v for k, v in row.items() if k != "_received"})
         return clean
+
+    @staticmethod
+    def _policy_chart_info_for_manifest(m):
+        card = m.card() or {}
+        raw_names = card.get("action_names")
+        names, units = [], []
+        for item in raw_names if isinstance(raw_names, list) else []:
+            if isinstance(item, dict):
+                names.append(str(item.get("name") or ""))
+                units.append(str(item.get("unit") or ""))
+            else:
+                names.append(str(item))
+                units.append("")
+        raw_units = card.get("action_units")
+        if isinstance(raw_units, list):
+            units = [str(raw_units[i] or "") if i < len(raw_units) else "" for i in range(len(names))]
+        elif isinstance(raw_units, dict):
+            units = [str(raw_units.get(name) or "") for name in names]
+        return {"action_names": names, "action_units": units}
+
+    def _policy_chart_info(self, name):
+        m = self.core.policies.manifests.get(name) if name else None
+        return self._policy_chart_info_for_manifest(m) if m else {"action_names": [], "action_units": []}
 
     def _plan_summary(self):
         p = self.core.plan_view()

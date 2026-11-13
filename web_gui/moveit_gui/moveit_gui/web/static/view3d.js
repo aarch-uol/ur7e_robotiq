@@ -425,6 +425,41 @@ export class View3D {
 
   base() { return (this.robot && this.robot.worldMatrix(this.baseLink)) || new THREE.Matrix4(); }
 
+  // ------------------------------------------------------------ point cloud (SETUP > Camera calibration)
+  // pos: Float32Array x,y,z in the camera's optical frame (m); col: Uint8Array r,g,b. null clears it.
+  setCloud(pos, col, size = 0.003) {
+    if (!this.cloud) {
+      this.cloud = new THREE.Group();
+      this.cloud.matrixAutoUpdate = false;
+      const ax = new THREE.AxesHelper(0.06);
+      ax.material.depthTest = false;
+      ax.renderOrder = 6;
+      this.cloud.add(ax);
+      this.scene.add(this.cloud);
+    }
+    if (this.cloudPts) { this.cloud.remove(this.cloudPts); this.cloudPts.geometry.dispose(); this.cloudPts.material.dispose(); this.cloudPts = null; }
+    if (pos) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+      this.cloudPts = new THREE.Points(g, new THREE.PointsMaterial({ size, vertexColors: true }));
+      this.cloud.add(this.cloudPts);
+    }
+    this.cloud.visible = !!pos || this.cloud.visible;
+    this.draw();
+  }
+  // where the optical frame is: parent (row-major 4x4, m, in baseLink) times the calibration (mm, deg)
+  setCloudPose(parentRowMajor, xyzMm, rpyDeg) {
+    if (!this.cloud) this.setCloud(null);
+    if (!parentRowMajor) { this.cloud.visible = false; this.draw(); return; }
+    const P = new THREE.Matrix4().set(...parentRowMajor);
+    this.cloud.matrix.copy(this.base()).multiply(P).multiply(poseToMatrix(xyzMm, rpyDeg));
+    this.cloud.matrixWorldNeedsUpdate = true;
+    this.cloud.visible = true;
+    this.draw();
+  }
+  clearCloud() { if (this.cloud) { this.setCloud(null); this.cloud.visible = false; this.draw(); } }
+
   // tcpOff: {link, xyz_mm, rpy_deg}, the active TCP as a fixed offset from a model link (state.tcp_off). Paths are
   // drawn at link * offset, so a virtual TCP (e.g. a spatula tip, not in the URDF) gets its own line
   setJoints(values, tcpOff) {

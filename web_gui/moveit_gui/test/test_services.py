@@ -167,3 +167,45 @@ def test_rename_while_running(mgr):
     assert m.view()["services"][0]["label"] == "Wrist webcam"
     with pytest.raises(SV.ServiceError, match="stop 'cam' first"):
         m.save({"name": "cam", "label": "Wrist webcam", "type": "usb_cam", "params": {"fps": "15"}}, replace="cam")
+
+
+def test_the_process_command_line_matches_a_ros2_command():
+    argv = ["ros2", "launch", "realsense2_camera", "rs_launch.py", "camera_name:=d405"]
+    assert SV._matches(["/usr/bin/python3", "/opt/ros/jazzy/bin/ros2", *argv[1:]], argv)
+    assert SV._matches(argv, argv)
+    assert not SV._matches(["/usr/bin/python3", "/opt/ros/jazzy/bin/ros2", *argv[1:-1], "camera_name:=d435"], argv)
+    assert not SV._matches(argv[1:], argv)
+
+
+def test_a_new_gui_adopts_a_driver_without_pid_file(mgr):
+    make, _ = mgr
+    m = make()
+    m.save({"name": "cam", "type": "usb_cam"})
+    m.start("cam")
+    proc = m.runs["cam"].proc
+    m.runs.clear()
+    (m.run_dir / "cam.json").unlink()                              # an earlier GUI lost track of it
+    m2 = make()
+    assert isinstance(m2.runs["cam"].proc, SV.Adopted) and m2.runs["cam"].proc.pid == proc.pid
+    m2.stop("cam")
+    assert wait(lambda: (m2.tick(), m2.state("cam"))[1] == "stopped") and wait(lambda: proc.poll() is not None)
+
+
+def test_two_copies_of_a_driver_are_both_stopped_and_one_is_started(mgr):
+    make, _ = mgr
+    m = make()
+    m.save({"name": "cam", "type": "usb_cam"})
+    m.start("cam")
+    first = m.runs["cam"].proc
+    m.runs.clear()
+    m.start("cam")                                                 # the pid file now names only the second
+    second = m.runs["cam"].proc
+    m.runs.clear()
+    m2 = make()
+    assert "cam" not in m2.runs
+    assert wait(lambda: first.poll() is not None and second.poll() is not None)
+    assert wait(lambda: (m2.tick(), "cam" in m2.runs)[1])
+    fresh = m2.runs["cam"].proc
+    assert fresh.pid not in (first.pid, second.pid) and fresh.poll() is None
+    m2.stop("cam")
+    assert wait(lambda: (m2.tick(), m2.state("cam"))[1] == "stopped")

@@ -970,6 +970,8 @@ main .btn:disabled, .dlg .btn:disabled { background: var(--sunken); border-color
 .page-title { font-size: 18px; line-height: 1.25; font-weight: 600; margin: 4px 0 2px; }
 .su-v3card { position: sticky; top: var(--s); align-self: flex-start; max-height: 70vh; }
 .view3d.su-v3 { height: min(430px, 58vh); min-height: 260px; max-height: calc(70vh - 48px); }
+/* SETUP > Camera: the 3D check sits above the solve card in one column, not sticky */
+.col > .su-v3card { position: static; align-self: stretch; max-height: none; }
 .xyz { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s); }
 .xyz input { width: 100% !important; min-width: 0; }
 .seg, .mseg, .tseg, .jvseg, .dr-type, .planrow, .reload-bar, .lrow { border-radius: var(--r); }

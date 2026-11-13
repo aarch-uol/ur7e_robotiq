@@ -988,6 +988,7 @@ pages.OPERATE = {
     $("#op-motion").classList.toggle("hidden", t === "f" || t === "g");   // Jog has its own speed; a force has none
     this.mmsShow();
     if (t !== "g") jogRelease();
+    setTimeout(jogReadyTick, 0);
   },
   mmsShow() {             // the mm/s field: Pose tab, straight line only
     $("#op-mms-f").classList.toggle("hidden", this.mode !== "c" || !$("#op-linear").checked);
@@ -1249,13 +1250,29 @@ pages.OPERATE = {
         this.ftTripSeen = t.at;
       }
     }
+    this.ftReadout(w);
+  },
+  ftReadout(w) {
     AXES.forEach((_, i) => {
-      $(`#op-ft${i}`).textContent = w ? (w[i] >= 0 ? "+" : "") + w[i].toFixed(i < 3 ? 2 : 3) : "—";
+      const v = $(`#op-ft${i}`);
+      if (!v) return;
+      v.textContent = w ? (w[i] >= 0 ? "+" : "") + w[i].toFixed(i < 3 ? 2 : 3) : "—";
       const lim = i < 3 ? 50 : 5, x = w ? Math.max(-1, Math.min(1, w[i] / lim)) : 0;
       const b = $(`#op-ftb${i}`);
       b.style.left = (x < 0 ? 50 + 50 * x : 50) + "%";
       b.style.width = Math.abs(50 * x) + "%";
     });
+  },
+  // the 30 Hz "live" event (F/T, joints) between full states: only what follows the sensor and the arm
+  live(l, s) {
+    if (this.ftc) this.ftc.push({ ...l, force: s.force });     // the commanded force comes with the full state
+    this.ftReadout(l.wrench);
+    if (this.view && l.joints_deg) {
+      const q = {};
+      l.joints_deg.forEach((v, i) => (q[INFO.joint_names[i]] = v * Math.PI / 180));
+      this.view.setJoints({ ...q, ...this.extraJoints(s) }, s.tcp_off);
+      this.view.setMeasuredForce(l.wrench, INFO.ft_frame);
+    }
   },
 };
 
@@ -1274,7 +1291,7 @@ function jogPanel() {
   const type = h("select", { id: "op-jog-type", onchange: () => { jogRelease(); jogLabels(); } },
     h("option", { value: "base" }, "Cartesian · base"), h("option", { value: "tool" }, "Cartesian · tool"),
     h("option", { value: "joint" }, "Joint"));
-  const step = h("select", { id: "op-jog-step", onchange: () => { jogRelease(); jogLabels(); } },
+  const step = h("select", { id: "op-jog-step", onchange: () => { jogRelease(); jogLabels(); jogReadyTick(); } },
     h("option", { value: "hold", selected: true }, "Continuous (Servo)"),
     INFO.jog.step_mm.map((v, i) => h("option", { value: i }, `${v} mm · ${INFO.jog.step_deg[i]} °`)));
   const n = Math.max(6, INFO.joint_names.length);
@@ -1418,6 +1435,23 @@ function jogRelease() {
 window.addEventListener("pointerup", () => (JOG.down || JOG.slider) && jogRelease());
 window.addEventListener("blur", () => (JOG.down || JOG.slider) && jogRelease());
 document.addEventListener("visibilitychange", () => document.hidden && (JOG.down || JOG.slider) && jogRelease());
+// Jog panel on screen in Continuous: keep MoveIt Servo ready (unpaused, its controller switched in) so a press
+// moves at once instead of after a controller switch. Renewed every second; the robot PC gives the arm back
+// 3 s after the last renewal, at once when the panel goes away or any other command comes.
+const JOG_READY = { on: false, busy: false };
+async function jogReadyTick() {
+  if (JOG_READY.busy) return;
+  const g = $("#op-g");
+  const want = !!(TOKEN && holds && g && !g.classList.contains("hidden") && g.offsetParent !== null && !document.hidden
+    && $("#op-jog-step")?.value === "hold");
+  JOG_READY.busy = true;
+  try {
+    if (want) { await post("/api/cmd", { cmd: "jog_arm", args: {} }, true); JOG_READY.on = true; }
+    else if (JOG_READY.on) { JOG_READY.on = false; await post("/api/cmd", { cmd: "jog_disarm", args: {} }, true); }
+  } finally { JOG_READY.busy = false; }
+}
+setInterval(jogReadyTick, 1000);
+document.addEventListener("visibilitychange", () => jogReadyTick());
 
 // Move the jog panel into `host` (PROGRAMS) or back into OPERATE (host null). One panel, so ids stay unique.
 function dockJog(host) {
@@ -2687,7 +2721,7 @@ pages.SETUP = {
           h("span", { class: "k" }, "R P Y °"), h("div", { class: "row" }, [3, 4, 5].map((i) => n3(i, "1")))),
         h("div", { class: "muted small", id: "su-t-rpyhint" }, ""),
         h("div", { class: "row" },
-          (() => { const b = lb(btn("Save", "primary", () => this.tcpHow === "pivot" ? this.pivotSave() : this.saveTcp())); b.id = "su-t-save"; return b; })()));
+          (() => { const b = lb(btn("Save", "primary", () => this.tcpHow === "pivot" ? this.pivotSave() : this.saveTcp())); b.id = "su-t-save"; return b; })())));
     // Vial
     const vrows = INFO.vial_points.map((n, k) => h("div", { class: "row" }, h("span", { class: "dot", id: `su-vd-${k}` }),
       h("span", { style: "width:130px" }, n + (n === "Bottom" ? " (optional)" : "")),
@@ -2798,7 +2832,7 @@ pages.SETUP = {
         h("div", { class: "section" }, "Tool weight compensation"),
         h("pre", { class: "log", id: "su-pyaml", style: "max-height:none" }, "—"),
         note("Apply this result when the robot is out of compliance mode."),
-        h("div", { class: "row" }, btn("Save result", "", () => cmd("payload_save")),
+        h("div", { class: "row" }, btn("Save result", "", () => this.savePayload()),
           h("div", { class: "grow" }), btn("Use for compliance", "primary", () => this.applyPayload()))));
     this.pcollect = $("#su-pcollect", this.views["F/T + payload"]);
     const pb = this.views["F/T + payload"].querySelectorAll(".card:last-child .btn");
@@ -2816,10 +2850,11 @@ pages.SETUP = {
       h("div", { class: "view3d su-v3", id: "su-v3" }, h("div", { class: "muted v3msg", id: "su-v3-msg" }, "Loading the robot model…")));
     // Parts, Camera calibration, Setups: workcell.js
     const lease = (b) => { b.dataset.lease = "1"; return b; };
-    this.wc = workcell({ h, btn, note, cmd, post, $, toast, ask, askText, lease, freedriveButton, navTo, fake: () => INFO.fake });
+    this.wc = workcell({ h, btn, note, cmd, scmd, post, view3d: () => (this.sub === "Camera" ? this.view : null), $, toast, ask, askText, lease, freedriveButton, navTo, fake: () => INFO.fake });
     const pt = this.wc.buildParts(() => this.svPaint(true)), hc = this.wc.buildCalib(), st = this.wc.buildSetups();
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
-    this.views["Camera"] = h("div", { class: "cols" }, hc.left, hc.right);
+    this.heSide = h("div", { class: "col", style: "flex:1.3 1 420px;min-width:0" }, hc.right);
+    this.views["Camera"] = h("div", { class: "cols" }, hc.left, this.heSide);
     this.views["Setups"] = h("div", { class: "cols" }, st.card, st.side);
     // Policy library: the card helper is an external subprocess. The browser only chooses a folder and a file;
     // PolicyLibrary validates roots, writes the manifest and keeps a missing helper non-fatal.
@@ -2829,6 +2864,8 @@ pages.SETUP = {
     const pcheck = h("select", { id: "su-pol-check", class: "grow" }, h("option", {}, "Load a folder first"));
     const pname = h("input", { id: "su-pol-name", placeholder: "policy_name" });
     const pdesc = h("input", { id: "su-pol-desc", class: "grow", placeholder: "short description" });
+    const pnoNorm = h("input", { id: "su-pol-no-norm", type: "checkbox" });
+    const pupload = h("input", { type: "file", webkitdirectory: true, multiple: true, style: "display:none" });
     const pback = h("select", { id: "su-pol-back" }, h("option", { value: "servo_admittance" }, "Servo + Admittance"),
       h("option", { value: "impedance" }, "Impedance"));
     const pmode = h("select", { id: "su-pol-mode" }, ...INFO.modes.filter((m) => !m.hidden).map((m) => h("option", { value: m.name }, m.label)));
@@ -2842,13 +2879,24 @@ pages.SETUP = {
     const pmsg = h("div", { id: "su-pol-msg", class: "muted small" });
     const plist = h("div", { id: "su-pol-list", class: "list" });
     const pfill = (r) => {
-      pcheck.replaceChildren(...(r.checkpoints?.length ? r.checkpoints.map((x) => h("option", { value: x }, x)) :
+      const meta = new Map((r.checkpoint_info || []).map((x) => [x.path, x]));
+      const size = (n) => n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + " MB" : (n / 1024).toFixed(0) + " KB";
+      pcheck.replaceChildren(...(r.checkpoints?.length ? r.checkpoints.map((x) => {
+        const m = meta.get(x);
+        return h("option", { value: x }, m ? (m.rel || m.name) + " · " + size(m.size) + " · " + new Date(m.mtime * 1000).toLocaleString() : x);
+      }) :
         [h("option", { value: "" }, r.error || "No checkpoints found")]));
       if (r.checkpoints?.length) {
-        const base = r.checkpoints[0].split("/").pop().replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+        const parts = r.checkpoints[0].split("/"), stem = parts.pop().replace(/\.[^.]+$/, "");
+        // "best_model.zip" says nothing: name it after its folder (e.g. best_heldout_model)
+        const base = (/^(best_)?model$/i.test(stem) && parts.length ? parts.pop() : stem).toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
         pname.value = base.replace(/^[^a-z]+/, "") || "policy";
       }
       pmsg.textContent = r.error || (r.roots ? `Allowed roots: ${r.roots.join(", ")}` : "");
+    };
+    const waitCommand = async (promise) => {
+      let r = await promise;
+      return r && r.job ? await waitJob(r.job) : r;
     };
     const loadPolicies = async () => {
       const r = await cmd("policy_list");
@@ -2866,19 +2914,57 @@ pages.SETUP = {
       }) : [h("div", { class: "muted" }, "No policy manifests yet.")]));
     };
     const loadFolder = () => cmd("policy_sources", { folder: pfolder.value.trim() }).then((r) => r.ok && pfill(r));
-    const importPolicy = () => cmd("policy_import", { folder: pfolder.value.trim(), checkpoint: pcheck.value,
-      name: pname.value.trim(), description: pdesc.value.trim(), backend: pback.value, required_mode: pmode.value,
-      required_tcp: ptcp.value }).then((r) => { if (r.ok) { pmsg.textContent = r.msg; setTimeout(() => location.reload(), 700); } return r; });
+    const importPolicy = async () => {
+      const args = { folder: pfolder.value.trim(), checkpoint: pcheck.value, name: pname.value.trim(),
+        description: pdesc.value.trim(), backend: pback.value, required_mode: pmode.value,
+        required_tcp: ptcp.value, no_normalization: pnoNorm.checked };
+      let r = await waitCommand(cmd("policy_import", args));
+      if (!r.ok && /confirm overwrite/.test(r.msg || "")) {
+        pmsg.textContent = r.msg;
+        if (await ask(r.msg)) r = await waitCommand(cmd("policy_import", { ...args, overwrite: true }));
+      }
+      pmsg.textContent = r.msg || (r.ok ? "Imported" : "Import failed");
+      if (r.ok) await loadPolicies();
+      return r;
+    };
+    const uploadPolicyFolder = async () => {
+      const files = [...(pupload.files || [])];
+      const allowed = new Set([".zip", ".pkl", ".yaml", ".yml", ".json", ".pt", ".pth"]);
+      const folder = files[0]?.webkitRelativePath?.split("/")[0] || "";
+      const bad = files.find((f) => !allowed.has((f.name.match(/\.[^.]+$/) || [""])[0].toLowerCase()));
+      const total = files.reduce((n, f) => n + f.size, 0);
+      if (!folder || !files.length) { pmsg.textContent = "Choose a policy folder"; return { ok: false, msg: pmsg.textContent }; }
+      if (bad) { pmsg.textContent = "File type not allowed: " + bad.name; return { ok: false, msg: pmsg.textContent }; }
+      if (total > 300 * 1024 * 1024) { pmsg.textContent = "Policy folder upload is over 300 MB"; return { ok: false, msg: pmsg.textContent }; }
+      const encoded = [];
+      for (const f of files) {
+        const data = await new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(r.result.split(",")[1]); r.readAsDataURL(f); });
+        encoded.push({ path: f.webkitRelativePath.slice(folder.length + 1), data_b64: data });
+      }
+      let r = await waitCommand(post("/api/policy-upload", { folder, files: encoded }));
+      pmsg.textContent = r.msg || (r.ok ? "Folder uploaded" : "Upload failed");
+      if (r.ok) {
+        const root = [...proots.options].map((o) => o.value).find((x) => x.endsWith("/policies")) || proots.options[0]?.value || "";
+        pfolder.value = root + "/uploads/" + folder;
+        await loadFolder();
+      }
+      pupload.value = "";
+      return r;
+    };
+    pupload.addEventListener("change", uploadPolicyFolder);
+    const uploadButton = INFO.role === "admin" ? btn("Upload folder…", "quiet", () => pupload.click()) : null;
     ptcp.replaceChildren(h("option", { value: "" }, "manifest default TCP"));
     this.views["Policies"] = h("div", { class: "col su-main" },
       h("div", { class: "card" }, h("div", { class: "section" }, "Import policy"),
-        note("Choose a checkpoint under an allowed root. The card helper is optional.", "The GUI calls export_policy_card.py as a subprocess and never loads the model."),
+        note("Choose a checkpoint under an allowed root. The import saves its files on this computer.", "A card tool is optional; configure --policy-card-command to make one. The GUI never loads the model."),
         h("div", { class: "row" }, pfolder, proots, btn("List checkpoints", "quiet", loadFolder)),
         h("div", { class: "row" }, h("span", { class: "k" }, "Checkpoint"), pcheck),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
           h("span", { class: "k" }, "Name"), pname, h("span", { class: "k" }, "Description"), pdesc,
           h("span", { class: "k" }, "Backend"), pback, h("span", { class: "k" }, "Mode"), pmode,
-          h("span", { class: "k" }, "TCP"), ptcp),
+          h("span", { class: "k" }, "TCP"), ptcp,
+          h("label", { class: "chk" }, pnoNorm, "no normaliser (model has none)")),
+        uploadButton,
         h("div", { class: "row" }, lease(btn("Import", "primary", importPolicy)), pmsg)),
       h("div", { class: "card" }, h("div", { class: "section" }, "Saved policies"), plist));
     loadPolicies();
@@ -2897,7 +2983,7 @@ pages.SETUP = {
   },
   SV_PAGES: { "TCPs": "Active tool point and saved points", "Parts": "Robot and saved parts", "Vial": "Touched points and fitted rim",
     "Flask": "Flask geometry and reachable poses", "Keep-out zones": "Planner keep-out boxes",
-    "F/T + payload": "Payload calibration poses" },
+    "F/T + payload": "Payload calibration poses", "Camera": "The arm, the camera frame and its point cloud" },
   async svInit() {
     if (this.svv) return;
     this.svv = true;
@@ -2929,6 +3015,7 @@ pages.SETUP = {
       v.setPartDraft(p, (pose) => this.wc.W.parts.poseFromGizmo(pose));
     } else v.clearPartDraft();
     if (n !== "F/T + payload") { this.pStop(); v.showGhost(null); v.setCommandedForce(null); } else this.pGhost();
+    if (n === "Camera") this.wc.W.he.paint3d(); else v.clearCloud();
     if (n === "TCPs" || n === "Vial") {
       const r = await cmd("tf_frames").catch(() => null);
       if (r && r.ok && this.sub === n)
@@ -3124,7 +3211,10 @@ pages.SETUP = {
     const title = h("div", { class: "page-title" }, this.label(n));
     this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
     if (this.SV_PAGES[n]) {
-      if (n === "F/T + payload") {            // the poses, their ghost, the result side by side under the bias
+      if (n === "Camera") {                   // the 3D check above the solve card
+        this.heSide.prepend(this.sv);
+        this.body.replaceChildren(title, this.views[n]);
+      } else if (n === "F/T + payload") {     // the poses, their ghost, the result side by side under the bias
         this.pcols.insertBefore(this.sv, this.pcols.lastChild);
         this.body.replaceChildren(title, this.views[n]);
         this.views[n].insertBefore(this.ftLimitCard(), this.pcols);
@@ -3663,7 +3753,7 @@ pages.SETUP = {
       g("Saved", `${esc(c.at)} · ${c.differs ? "controller differs (restored before Admittance)" : "on " + esc(c.node)}`, c.differs ? "warn" : "good")
       : g("Payload", "none saved: Admittance compensates no tool weight", "warn");
     html += f ? (f.error ? g("Last file", esc(f.error), "warn") :
-      g("Last file", `${f.passed ? "PASS" : "FAIL"} ${f.mass != null ? f.mass.toFixed(3) + " kg" : ""}, ${f.poses} poses, ${esc(f.at)}`)) : "";
+      g("Last file", `${f.passed ? "PASS" : f.accepted ? "FAIL (used anyway)" : "FAIL"} ${f.mass != null ? f.mass.toFixed(3) + " kg" : ""}, ${f.poses} poses, ${esc(f.at)}`)) : "";
     html += b ? g("F/T bias", `${b.in_use ? "in use" : "NOT on the sensor now"} · ${esc(b.how)} ${esc(b.at)}` +
       (b.restored ? ` · restored ${esc(b.restored)}` : ""), b.in_use ? "good" : "warn") +
       g("", `F [${b.bias.slice(0, 3).map((v) => v.toFixed(2)).join(", ")}] N`) : g("F/T bias", "none set by this GUI");
@@ -3671,12 +3761,25 @@ pages.SETUP = {
     $("#su-psaved-note").textContent = f && f.path ? `Calibration files: ${f.count} in ${f.path.replace(/\/[^/]*$/, "")}. ` +
       "The payload is restored on the controller before every switch to Admittance; the bias after a stack restart." : "";
   },
+  // a failed fit can still be used: the operator confirms, and the file records it
+  async acceptFailed(r, what) {
+    return ask(`This fit did not pass its checks:\n\n${r.issues.join("\n")}\n\n${what} anyway? ` +
+      "Compliance will push a little where the fit is off; collect again later for a better one.");
+  },
+  async savePayload() {
+    const r = S.payload && S.payload.result;
+    if (!r) return;
+    if (r.passed || r.accepted) return cmd("payload_save");
+    if (await this.acceptFailed(r, "Save it")) cmd("payload_save", { accept_failed: true });
+  },
   async applyPayload() {
     const r = S.payload && S.payload.result;
     if (!r) return;
+    const failed = !r.passed && !r.accepted;
+    if (failed && !(await this.acceptFailed(r, "Use it"))) return;
     const off = r.offset_n != null ? `\n\nThe fit found a sensor offset of ${r.offset_n.toFixed(2)} N, which the controller cannot remove. Keep ATI hardware biasing off, and keep the F/T bias (above) as it is now.` : "";
     if ((await ask(`Set the admittance gravity compensation to ${r.mass.toFixed(3)} kg at ${r.cog.map((c) => (c * 1000).toFixed(1)).join(", ")} mm?` + off)))
-      cmd("payload_apply");
+      cmd("payload_apply", failed ? { accept_failed: true } : {});
   },
   // the small status after each menu item, and the robot-model bar
   navStatus(s) {
@@ -3708,6 +3811,9 @@ pages.SETUP = {
     this.mbar.classList.toggle("hidden", !msg);
     if (msg) $("#su-modelbar-msg").textContent = msg + (w.restarting ? "" : " Restart the robot stack to write them into the robot model (URDF).");
     this.mbar.querySelector("button").classList.toggle("hidden", !!w.restarting);
+  },
+  live(l, s) {
+    if (this.sub === "F/T + payload" && this.fbChart) this.fbChart.push({ ...l, force: s.force });
   },
   update(s) {
     this.navStatus(s);
@@ -3785,7 +3891,7 @@ pages.SETUP = {
       gate($("#su-preset"), !p.running && have > 0);
       this.pSaved(p.saved, s);
       const r = p.result;
-      $("#su-pverdict").textContent = r ? (r.passed ? "PASS" : "FAIL") +
+      $("#su-pverdict").textContent = r ? (r.passed ? "PASS" : r.accepted ? "FAIL · used anyway" : "FAIL") +
         (r.applied ? " · applied and saved" : "") : "Not evaluated";
       $("#su-pres").innerHTML = r ? `<span class="k">Mass</span><span class="v">${r.mass.toFixed(3)} kg</span>` +
         ["X", "Y", "Z"].map((a, i) => `<span class="k">CoG ${a}</span><span class="v">${(r.cog[i] * 1000).toFixed(1)} mm</span>`).join("") : "";
@@ -4366,6 +4472,14 @@ async function boot() {
     if (S.boot) boot = S.boot;
     modelWatch(S);
     render();
+  });
+  es.addEventListener("live", (e) => {
+    if (!S || srvError) return;
+    let l;
+    try { l = JSON.parse(e.data); } catch (x) { return; }
+    S.wrench = l.wrench; S.joints_deg = l.joints_deg;          // the next full state brings the rest
+    const p = pages[current];
+    if (p && p.live) p.live(l, S);
   });
   es.addEventListener("log", (e) => {
     const fresh = JSON.parse(e.data).filter(([seq]) => seq > logSeq);   // a reconnect resends the last 200 lines

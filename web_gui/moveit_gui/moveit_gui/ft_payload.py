@@ -89,10 +89,15 @@ class PayloadResult:
     quality: dict
     info: dict
     samples: List[PoseSample] = field(default_factory=list)
+    accepted: bool = False          # the operator chose to use it although a check failed
 
     @property
     def passed(self) -> bool:
         return bool(self.quality.get("passed"))
+
+    @property
+    def usable(self) -> bool:
+        return self.passed or self.accepted
 
 
 class PayloadCalibration:
@@ -206,6 +211,7 @@ class PayloadCalibration:
         _atomic_write(path, json.dumps({
             "robot": self.profile.name, "sensor_frame": self.sensor_frame, "reference_frame": self.reference_frame,
             "mass_kg": r.mass, "cog_m": r.cog, "passed": r.passed,
+            "accepted_despite_failed_checks": bool(r.accepted and not r.passed),
             "issues": r.quality.get("issues", []), "warnings": r.quality.get("warnings", []),
             "metrics": _jsonable(r.quality.get("metrics", {})),
             "residual_bias": _jsonable(r.info.get("residual_bias")),
@@ -250,8 +256,8 @@ class PayloadCalibration:
             return False, "profile ft_calibration.apply_to.node is not set"
         if self.result is None:
             return False, "nothing to apply: evaluate first"
-        if not self.result.passed:
-            return False, "the fit did not pass its quality checks"
+        if not self.result.usable:
+            return False, "the fit did not pass its quality checks (accept it first to use it anyway)"
         if current_mode == self.apply_mode:
             return False, f"switch out of {self.apply_mode} first: the new compensation would move the arm"
         params = self.admittance_params()

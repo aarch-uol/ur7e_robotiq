@@ -2,6 +2,8 @@
 import sys
 import threading
 import time
+import json
+from collections import deque
 from pathlib import Path
 from unittest import mock
 
@@ -38,7 +40,22 @@ def _bare_bridge(rb):
     b._velocities_ok = True
     b._freedrive_on = False
     b._ctrl_ref, b._follow_clients = {}, {}
+    b._policy_step_buf = deque()
     return b
+
+
+def test_policy_step_nonfinite_values_become_null_without_dropping_row(ros_bridge_module):
+    b = _bare_bridge(ros_bridge_module)
+    b.log = lambda *_: None
+    b._on_policy_step(type("Msg", (), {"data": json.dumps({
+        "t": 1.0, "step": 4, "action": [float("nan"), float("inf"), -float("inf")],
+        "command": [0.1, 0.2], "obs_sigma": {"vision": float("nan")},
+        "other": [1, {"bad": float("inf")}],
+    }, allow_nan=True)})())
+    rows = b.policy_step_samples(0)
+    assert rows == [{"t": 1.0, "step": 4, "action": [None, None, None],
+                    "command": [0.1, 0.2], "obs_sigma": {"vision": None},
+                    "other": [1, {"bad": None}], "_received": rows[0]["_received"]}]
 
 
 def test_snapshot_does_not_deadlock(ros_bridge_module):

@@ -438,3 +438,21 @@ def test_the_log_says_what_the_broadcaster_has_at_gui_start_and_when_it_is_missi
     b.get_node_parameters = orig
     fb.read()                                                    # back: says what it has again
     assert len(seen) == 3 and seen[2].startswith("F/T bias on")
+
+
+def test_a_failed_payload_fit_is_used_only_after_the_operator_accepts_it(s, tmp_path):
+    import json
+    from moveit_gui import ft_payload as fp
+    cal = s.payload
+    cal.result = fp.PayloadResult(1.18, [0.0, -0.015, 0.07],
+                                  {"passed": False, "issues": ["torque noise 0.0300 > 0.0100 Nm"]}, {})
+    assert s.payload_view()["result"]["can_apply"] and not s.payload_view()["result"]["accepted"]
+    ok, msg = cal.apply_to_admittance("position")
+    assert not ok and "accept" in msg
+    with pytest.raises(CommandError, match="confirm"):
+        cmd(s, "payload_apply")
+    cmd(s, "payload_save", accept_failed=True)
+    assert cal.result.accepted and s.payload_view()["result"]["accepted"]
+    saved = json.loads(cal.saved_path.read_text())
+    assert saved["passed"] is False and saved["accepted_despite_failed_checks"] is True
+    assert cal.apply_to_admittance("position")[0]

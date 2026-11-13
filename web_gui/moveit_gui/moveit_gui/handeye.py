@@ -34,6 +34,7 @@ DICTS = ("DICT_4X4_50", "DICT_5X5_100", "DICT_6X6_250")
 DEFAULT_BOARD = {"squares_x": 7, "squares_y": 5, "square_mm": 35.0, "marker_mm": 26.0, "dict": "DICT_5X5_100"}
 MIN_CORNERS = 8
 MIN_SAMPLES = 5
+GOOD_SAMPLES = 12                    # recommended: more pictures, smaller error
 GOOD_MM, GOOD_DEG, OK_MM, OK_DEG = 2.0, 0.3, 5.0, 1.0
 NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
@@ -122,6 +123,8 @@ class Detection:
     reproj_px: float = float("nan")
     why: str = ""
     points: List[List[float]] = field(default_factory=list)      # image corners, for the preview
+    markers: int = 0                                                # ArUco markers found (before corners)
+    quads: List[List[List[float]]] = field(default_factory=list)    # their outlines, for the preview
 
 
 def detect(gray: np.ndarray, b: dict, K, D) -> Detection:
@@ -132,15 +135,20 @@ def detect(gray: np.ndarray, b: dict, K, D) -> Detection:
     K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     D = np.asarray(D if D is not None else [], dtype=np.float64).reshape(-1)
     if hasattr(a, "CharucoDetector"):
-        corners, ids, _, mids = a.CharucoDetector(board).detectBoard(gray)
+        corners, ids, mc, mids = a.CharucoDetector(board).detectBoard(gray)
     else:
         mc, mids, _ = a.detectMarkers(gray, d, parameters=a.DetectorParameters_create())
         if mids is None or len(mids) == 0:
-            return Detection(False, why="no markers seen")
+            return Detection(False, why="no ArUco markers seen")
         _, corners, ids = a.interpolateCornersCharuco(mc, mids, gray, board, cameraMatrix=K, distCoeffs=D)
+    nm = 0 if mids is None else len(mids)
+    quads = [[[round(float(x), 1), round(float(y), 1)] for x, y in np.asarray(q).reshape(-1, 2)] for q in (mc if mc is not None else [])]
     n = 0 if ids is None else len(ids)
+    if nm == 0:
+        return Detection(False, why="no ArUco markers seen (board out of view, too far, blurred or the wrong dictionary)")
     if n < MIN_CORNERS:
-        return Detection(False, n, why=f"{n} board corners seen (need {MIN_CORNERS}): show more of the board")
+        return Detection(False, n, why=f"{nm} markers, {n} board corners seen (need {MIN_CORNERS}): show more of the board",
+                         markers=nm, quads=quads)
     obj = _object_corners(board)[np.asarray(ids).reshape(-1)]
     img = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
     ok, rvec, tvec = cv2.solvePnP(obj, img, K, D, flags=cv2.SOLVEPNP_ITERATIVE)
@@ -150,7 +158,7 @@ def detect(gray: np.ndarray, b: dict, K, D) -> Detection:
     err = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
     R, _ = cv2.Rodrigues(rvec)
     return Detection(True, n, tf.from_rotation(R, tvec.reshape(3)), err,
-                     points=[[round(float(x), 1), round(float(y), 1)] for x, y in img])
+                     points=[[round(float(x), 1), round(float(y), 1)] for x, y in img], markers=nm, quads=quads)
 
 
 def render_board(b: dict, K, T_cam_board: np.ndarray, size: Tuple[int, int], noise: float = 2.0,
@@ -192,13 +200,19 @@ def _rot_deg(R: np.ndarray) -> float:
     return math.degrees(tf.rotation_angle(R))
 
 
-def solve(samples: List[Sample], mount: str) -> dict:
-    """X and its quality. eye_in_hand: X = T_flange_cam; eye_to_hand: X = T_base_cam."""
+METHODS = ("park", "tsai", "horaud", "andreff", "daniilidis")
+
+
+def solve(samples: List[Sample], mount: str, method: str = "park") -> dict:
+    """X and its quality. eye_in_hand: X = T_flange_cam; eye_to_hand: X = T_base_cam. `method` is the OpenCV
+    solver whose X is used; the others are shown as a cross-check."""
     cv2 = _cv()
+    if method not in METHODS:
+        raise HandEyeError(f"solver is one of {', '.join(METHODS)}")
     if mount not in MOUNTS:
         raise HandEyeError(f"mount is one of {', '.join(MOUNTS)}")
     if len(samples) < MIN_SAMPLES:
-        raise HandEyeError(f"{len(samples)} sample(s): at least {MIN_SAMPLES} (12 or more is better)")
+        raise HandEyeError(f"{len(samples)} sample(s): at least {MIN_SAMPLES} ({GOOD_SAMPLES} or more is better)")
     A = [s.T_base_flange if mount == "eye_in_hand" else tf.inv(s.T_base_flange) for s in samples]
     spread = max((_rot_deg(A[i][:3, :3].T @ A[j][:3, :3]) for i in range(len(A)) for j in range(i)), default=0.0)
     if spread < 10.0:
@@ -219,11 +233,12 @@ def solve(samples: List[Sample], mount: str) -> dict:
                 sols[name] = X
         except cv2.error:
             continue
-    if "park" not in sols:
-        raise HandEyeError("the solver failed: collect samples with more varied orientations")
-    X = sols["park"]
+    if method not in sols:
+        raise HandEyeError(f"the {method} solver failed: collect samples with more varied orientations, or pick "
+                           f"another solver")
+    X = sols[method]
     agree = {n: {"mm": round(float(np.linalg.norm(S[:3, 3] - X[:3, 3]) * 1000), 2),
-                 "deg": round(_rot_deg(S[:3, :3].T @ X[:3, :3]), 3)} for n, S in sols.items() if n != "park"}
+                 "deg": round(_rot_deg(S[:3, :3].T @ X[:3, :3]), 3)} for n, S in sols.items() if n != method}
     # where every sample puts the board (base frame for eye-in-hand, flange frame for eye-to-hand)
     boards = [a @ X @ s.T_cam_board for a, s in zip(A, samples)]
     Tm, _ = tf.average_transforms(boards)
@@ -232,7 +247,7 @@ def solve(samples: List[Sample], mount: str) -> dict:
     rms_mm, rms_deg = float(np.sqrt(np.mean(np.square(dt)))), float(np.sqrt(np.mean(np.square(dr))))
     verdict = ("good" if rms_mm <= GOOD_MM and rms_deg <= GOOD_DEG else
                "usable" if rms_mm <= OK_MM and rms_deg <= OK_DEG else "poor")
-    return {"X": X, "mount": mount, "verdict": verdict, "rms_mm": round(rms_mm, 2), "rms_deg": round(rms_deg, 3),
+    return {"X": X, "mount": mount, "method": method, "verdict": verdict, "rms_mm": round(rms_mm, 2), "rms_deg": round(rms_deg, 3),
             "per_sample": [{"mm": round(a, 2), "deg": round(b, 3)} for a, b in zip(dt, dr)],
             "methods": agree, "orientation_spread_deg": round(spread, 1), "n": len(samples),
             "T_board": Tm}
@@ -319,7 +334,9 @@ class CameraCalibrations:
         e = {"topic": topic, "info_topic": info_topic, "optical_frame": optical_frame, "mount": mount,
              "parent": flange if mount == "eye_in_hand" else base, "T_parent_optical": _T(result["X"]),
              "verdict": result["verdict"], "rms_mm": result["rms_mm"], "rms_deg": result["rms_deg"],
-             "methods": result["methods"], "samples": len(samples), "board": dict(self.board),
+             "methods": result["methods"], "method": result.get("method", "park"), "ee_link": flange,
+             "base_link": base, "samples": len(samples), "board": dict(self.board),
+             "edited_by_hand": result.get("edited"),
              "K": [round(float(v), 4) for v in np.asarray(K).reshape(-1)],
              "saved": time.strftime("%Y-%m-%d %H:%M"), "sample_data": [s.to_yaml() for s in samples]}
         self.cameras[name] = e

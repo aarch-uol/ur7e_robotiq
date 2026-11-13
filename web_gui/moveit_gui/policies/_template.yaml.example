@@ -1,4 +1,4 @@
-# Copy to ~/moveit_gui_policies/<name>.yaml and adapt. Files ending in .example are ignored.
+# Copy to ~/ur7e_data/policies/<name>/manifest.yaml and adapt. Files ending in .example are ignored.
 # The GUI does not load models: it checks this manifest, then starts and stops the real runner:
 #   ros2 run my_robot_policy run_policy.py --model ... --normalization ... --config ...
 #        --robot-config ... --robot-controller <backend> [recording arguments]
@@ -11,10 +11,10 @@ required_tcp: spatula_tip         # the active TCP must be this one
 # required_frames: [vial_rack]    # only if the policy truly depends on a saved workcell frame
 control_hz: 5.0                   # must match robot_config policy.control_hz
 requires_ft: true
-model: ~/policies/v4/model.zip
-normalization: ~/policies/v4/vec_normalize.pkl
-training_config: ~/policies/v4/config.yaml
-robot_config: ~/ur7e_ws/src/ur7e_robotiq/ur7e_robotiq_bringup/config/ur7e_policy_deployment.yaml
+model: model.zip
+normalization: vec_normalize.pkl
+training_config: config.yaml
+robot_config: robot_config.yaml
 sim_ft_reference: ~/policies/v4/sim_ft_reference.json   # optional, SETUP > F/T + payload > Match simulation
                                   # (default: sim_ft_reference.json next to robot_config)
 entrypoint: run_policy            # run_policy | run_scraping_policy

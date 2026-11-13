@@ -17,7 +17,7 @@ from typing import Callable, List, Optional
 
 import yaml
 
-from .policies import PolicyLibrary, PolicyManifest, RecordingOptions
+from .policies import PolicyLibrary, PolicyManifest, RecordingOptions, split_range_notes
 from .policy_action import RunPolicyFeedback, RunPolicyGoal, RunPolicyResult
 
 OK, FAIL, RUNNER = "ok", "fail", "runner"          # RUNNER = only the runner can check it, at its start
@@ -87,6 +87,8 @@ class PolicyExecutor:
         self.done_listeners: List[Callable[[RunPolicyResult], None]] = []
         self.current: Optional[str] = None
         self._cancelled = threading.Event()
+        self._cancel_lock = threading.RLock()
+        self._cancel_generation = 0
         # (mode, {param: value}) -> (ok | None, detail): live controller gains vs. the trained ones (RobotCore)
         self.gains_check: Optional[Callable[[str, dict], tuple]] = None
         self.range_check: Optional[Callable[[PolicyManifest], List[str]]] = None
@@ -118,6 +120,11 @@ class PolicyExecutor:
     @property
     def running(self) -> bool:
         return self.busy
+
+    @property
+    def cancel_generation(self) -> int:
+        with self._cancel_lock:
+            return self._cancel_generation
 
     # --------------------------------------------------------------- preflight
     def requirements(self, name: str) -> List[Requirement]:
@@ -180,8 +187,11 @@ class PolicyExecutor:
                 warnings = self.range_check(m)
             except Exception as e:  # range warnings never make the readiness page fail
                 warnings = [f"range check unavailable: {e}"]
+            warnings, notes = split_range_notes(warnings)
             if warnings:
                 out.append(Requirement("Policy ranges", WARN, "; ".join(warnings)))
+            if notes:
+                out.append(Requirement("Range checks", RUNNER, "; ".join(notes)))
         if not m.command:
             out.append(Requirement("Observation contract", RUNNER, "validated by the runner at start"))
         return out
@@ -215,8 +225,12 @@ class PolicyExecutor:
         self.backend.prepare(goal, self._emit, on_done)
         return True
 
-    def start(self, goal: RunPolicyGoal, on_done: Optional[Callable[[RunPolicyResult], None]] = None) -> bool:
+    def start(self, goal: RunPolicyGoal, on_done: Optional[Callable[[RunPolicyResult], None]] = None,
+              expected_generation: Optional[int] = None) -> bool:
         """Non-blocking. Every run goes through here, with a fresh preflight."""
+        with self._cancel_lock:
+            launch_generation = self._cancel_generation if expected_generation is None else expected_generation
+
         def finished(res: RunPolicyResult):
             self.current = None
             for fn in list(self.done_listeners):
@@ -241,11 +255,17 @@ class PolicyExecutor:
             def finished(res):                           # noqa: F811  (released when the policy ends)
                 sp.release(route)
                 done(res)
-        self._cancelled.clear()
-        self.current = goal.policy
-        self.started = (goal.policy, time.time())
-        hz = self.manifests[goal.policy].control_hz or 5.0
-        self.backend.run(goal, hz, self._emit, finished)
+        # Keep the generation check and backend launch together.  cancel() takes the same lock, so a STOP
+        # cannot land between the final check and a backend which clears its own stop event at launch.
+        with self._cancel_lock:
+            if self._cancel_generation != launch_generation:
+                finished(RunPolicyResult(False, "stopped before policy launch"))
+                return False
+            self._cancelled.clear()
+            self.current = goal.policy
+            self.started = (goal.policy, time.time())
+            hz = self.manifests[goal.policy].control_hz or 5.0
+            self.backend.run(goal, hz, self._emit, finished)
         return True
 
     def run(self, name: str, modes=None, duration=None, stop_event: Optional[threading.Event] = None, log=print,
@@ -260,7 +280,8 @@ class PolicyExecutor:
         def finished(res):
             result.append(res)
             done.set()
-        if not self.start(self.goal(name, duration, recording), finished):
+        if not self.start(self.goal(name, duration, recording), finished,
+                          expected_generation=self.cancel_generation):
             log(f"policy '{name}': {result[0].stop_reason if result else 'not started'}")
             return False
         log(f"policy '{name}' started")
@@ -272,7 +293,9 @@ class PolicyExecutor:
         return result[0].success
 
     def cancel(self):
-        self._cancelled.set()
+        with self._cancel_lock:
+            self._cancel_generation += 1
+            self._cancelled.set()
         self.backend.cancel()
 
     stop = cancel

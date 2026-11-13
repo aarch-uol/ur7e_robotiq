@@ -407,3 +407,68 @@ def test_servo_warning_reaches_the_jog_view(core):
         assert s.state()["jog"]["servo_warning"] == ""                    # only shown while jogging
     finally:
         s.shutdown()
+
+
+# ------------------------------------------------- Jog tab: Servo kept ready
+def _switches(core):
+    return sum(1 for c in core.bridge.calls if c[0] in ("switch", "switch_controllers"))
+
+
+def test_jog_tab_keeps_servo_ready_so_presses_switch_no_controllers(core):
+    core.bridge.servo_available = True
+    ok, msg = core.jog_arm()
+    assert ok, msg
+    core.update()
+    assert core.mode == "servo_position" and core.shown_mode == "position"
+    n = len(core.bridge.calls)
+    for _ in range(2):                                    # two presses: no switch, no restore in between
+        ok, msg = core.jog_start(JogCommand.parse("cartesian", "x", 1), 0.2)
+        assert ok, msg
+        _hold(core, 0.2)
+        core.jog_stop()
+        core.update()
+        assert core.mode == "servo_position" and core.busy and core.jog_ready_only()
+    switched = [c for c in core.bridge.calls[n:] if "switch" in str(c[0])]
+    assert not switched, switched
+    assert core.motion_refusal() is None                  # the page keeps the jog buttons enabled
+    core.jog_disarm("test")
+    core.update()
+    assert core.mode == "position" and not core.busy
+    assert core.bridge.controllers["scaled_joint_trajectory_controller"] == "active"
+
+
+def test_servo_ready_is_given_back_when_the_page_stops_renewing(core, monkeypatch):
+    core.bridge.servo_available = True
+    assert core.jog_arm()[0]
+    monkeypatch.setattr(RobotCore, "JOG_ARM_S", 0.1)
+    time.sleep(0.2)
+    core.update()
+    t0 = time.monotonic()
+    while core._jog_arm is not None and time.monotonic() - t0 < 3:
+        time.sleep(0.05)
+    core.update()
+    assert core._jog_arm is None and core.mode == "position" and not core.busy
+
+
+def test_any_other_command_gives_servo_back_first(core):
+    s = WebService(core)
+    core.bridge.servo_available = True
+    s.take_lease("a")
+    assert s.command("a", "jog_arm", {})["ok"]
+    core.update()
+    assert core.mode == "servo_position"
+    s.command("a", "gripper", {"percent": 50})            # kept: used between jogs
+    assert core._jog_arm is not None
+    r = s.command("a", "switch_mode", {"mode": "admittance"})
+    assert r["ok"], r
+    core.update()
+    assert core._jog_arm is None and core.mode == "admittance"
+
+
+def test_stop_gives_servo_back(core):
+    core.bridge.servo_available = True
+    assert core.jog_arm()[0]
+    core.jog_start(JogCommand.parse("joint", 0, 1), 0.2)
+    core.stop_all()
+    core.update()
+    assert not core.jogging and core._jog_arm is None and core.mode == "position" and not core.busy

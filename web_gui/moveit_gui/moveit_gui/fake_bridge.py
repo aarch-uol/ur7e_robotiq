@@ -37,6 +37,7 @@ FAKE_PAYLOAD_MASS = 0.9
 # front of the camera at the start pose. Nothing publishes tool0 -> camera_link until a part does (SETUP > Parts).
 FAKE_CAM_TOPIC, FAKE_CAM_INFO = "/camera/camera/color/image_rect_raw", "/camera/camera/color/camera_info"
 FAKE_CAM_LINK, FAKE_CAM_OPTICAL = "camera_link", "camera_color_optical_frame"
+FAKE_DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 FAKE_T_LINK_OPTICAL = tf.mm_deg_to_T([0, 15, 0], [-90, 0, -90])
 FAKE_T_TOOL0_CAMLINK = tf.mm_deg_to_T([0, -75, 35], [0, -90, 90])
 FAKE_CAM_K = [910.0, 0.0, 640.0, 0.0, 910.0, 360.0, 0.0, 0.0, 1.0]
@@ -925,6 +926,17 @@ class FakeBridge:
             return np.full((720, 1280), 110, np.uint8), FAKE_CAM_OPTICAL
         self._grab_n = getattr(self, "_grab_n", 0) + 1
         return he.render_board(b, FAKE_CAM_K, T_cam_board, (1280, 720), seed=self._grab_n), FAKE_CAM_OPTICAL
+
+    def grab_rgbd(self, color_topic: str, depth_topic: str, timeout_s: float = 3.0):
+        """The fake wrist camera: its board picture in colour and a flat scene 0.4 m away."""
+        if self.real and color_topic != FAKE_CAM_TOPIC:
+            return self.real.grab_rgbd(color_topic, depth_topic, timeout_s)
+        if color_topic != FAKE_CAM_TOPIC or depth_topic != FAKE_DEPTH_TOPIC:
+            return None, None, f"{depth_topic}: no image within {timeout_s:.0f} s"
+        g, why = self.grab_image(color_topic, timeout_s)
+        if g is None:
+            return None, None, why
+        return np.repeat(g[..., None], 3, axis=2), np.full(g.shape, 0.4, np.float32), ""
 
     def grab_photo(self, topic: str, timeout_s: float = 3.0):
         """A generated JPEG of a simulated camera (a program's photo step)."""
