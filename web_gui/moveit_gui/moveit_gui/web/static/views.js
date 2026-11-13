@@ -24,6 +24,13 @@ const QUALITY = [["low", "Low", "640 px, 10 fps"], ["med", "Med", "960 px, 15 fp
 const typeName = (k) => (TYPES.find((x) => x[0] === k) || [k, k])[1];
 const CARDS = ["manual", "fts", "robot", "arm", "grip", "joints"];
 const clone = (o) => JSON.parse(JSON.stringify(o));
+// Camera streams (MJPEG) hold an HTTP connection each; over plain HTTP a browser has only 6 per server, shared by
+// all tabs. They start once the 3D model is in (or after 15 s), so the model and mesh requests are not starved.
+let camGate = null;
+export function holdCameraStreams(p) {
+  camGate = Promise.race([Promise.resolve(p).catch(() => null), new Promise((r) => setTimeout(r, 15000))])
+    .then(() => { camGate = null; });
+}
 const base = (o) => Object.assign({ name: "", fixed: false, l: ["manual", "fts"], r: ["robot", "arm", "grip", "joints"],
   right: [], rw: [], bottom: [], bw: [], f: 0.62, bh: 300, tiles: {}, min: [], fold: { l: false, r: false },
   w: { l: 360, r: 340 }, h: {} }, o);
@@ -235,8 +242,9 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
       ftEl.open = true;
       ftEl.dispatchEvent(new Event("toggle"));
     } else if (t.type === "cam" && topic) {
-      T.img = h("img", { class: "vcam", alt: "", draggable: "false",
-        src: on ? "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&q=" + q + "&t=" + Date.now() : "" });
+      const src = on ? "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&q=" + q + "&t=" + Date.now() : "";
+      T.img = h("img", { class: "vcam", alt: "", draggable: "false", src: camGate ? "" : src });
+      if (camGate && src) { const img = T.img; camGate.then(() => { if (T.img === img && T.key === key) img.src = src; }); }
       T.msg = h("div", { class: "vmsg" }, "");
       T.img.onerror = () => { if (T.img && W.shown) { T.msg.textContent = "No picture"; T.msg.title = "Is the camera running? SETUP › Cameras"; } };
       T.img.onload = () => { T.msg.textContent = ""; aspect(T, topic); };

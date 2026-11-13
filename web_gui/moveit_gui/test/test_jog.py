@@ -472,3 +472,15 @@ def test_stop_gives_servo_back(core):
     core.stop_all()
     core.update()
     assert not core.jogging and core._jog_arm is None and core.mode == "position" and not core.busy
+    # the Jog tab's next renewals do not switch Servo in again after STOP: only a jog press does
+    n = _switches(core)
+    for _ in range(3):
+        ok, msg = core.jog_arm()
+        assert not ok and "jog press" in msg
+    core.update()
+    assert _switches(core) == n and core.mode == "position" and core._jog_arm is None
+    ok, msg = core.jog_start(JogCommand.parse("joint", 0, 1), 0.2)
+    assert ok, msg
+    core.jog_stop()
+    core.update()
+    assert core.jog_arm()[0]

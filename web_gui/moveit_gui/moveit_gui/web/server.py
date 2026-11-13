@@ -200,7 +200,13 @@ class Hub:
         return {"t": time.time(),
                 "joints_deg": [round(math.degrees(v), 3) for v in snap.joints] if snap.joints else None,
                 "wrench": [round(v, 3) for v in snap.wrench] if snap.wrench else None,
-                "ft_samples": samples}
+                "ft_samples": samples, "ft_payload": self._payload()}
+
+    def _payload(self):
+        try:
+            return self.service.core.ft_payload_view()
+        except Exception as e:                    # never let it stop the live stream
+            return {"w": None, "kg": 0.0, "why": f"payload unavailable: {e}"}
 
     def _live_loop(self):
         period = 1.0 / LIVE_HZ
@@ -342,6 +348,16 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.end_headers()
             self.wfile.write(body)
 
+        def _binary(self, code: int, body: bytes, headers=None):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for name, value in (headers or {}).items():
+                self.send_header(name, str(value))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _body(self, limit: int = MAX_BODY) -> dict:
             # JSON only: a cross-site HTML form cannot send it without a CORS preflight, which is never granted.
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
@@ -382,6 +398,18 @@ def make_handler(hub: Hub, allow_hosts=()):
                     return self._camera(q.get("topic", [""])[0], q.get("q", ["low"])[0])
                 if path == "/api/robot_model":
                     return self._json(200, service.robot_model())
+                if path == "/api/pointcloud/topics":
+                    return self._json(200, service.point_cloud_topics())
+                if path == "/api/pointcloud":
+                    q = parse_qs(url.query)
+                    packet, msg = service.point_cloud_packet(q.get("topic", [""])[0])
+                    if packet is None:
+                        return self._json(409, {"ok": False, "msg": msg})
+                    return self._binary(200, packet, {
+                        "X-Pointcloud-Frame": service.core.profile.base_link,
+                        "X-Pointcloud-Count": str((len(packet) - 12) // 15),
+                        "X-Pointcloud-Colors": "rgb",
+                    })
                 if path == "/api/record.mcap":
                     q = parse_qs(url.query)
                     file = service.record_mcap(q.get("name", [""])[0])
@@ -457,7 +485,7 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             self.close_connection = True
-            seen_version = hub.version if hub.state_json == "{}" else -1
+            seen_version = -1                         # every new client gets one full state before live samples
             seen_live = hub.live_version
             seen_result, log_seq = (-1 if service.results else hub.result_version), 0
             if uid:                                           # this page's own public id (to find itself in "users")
@@ -470,9 +498,12 @@ def make_handler(hub: Hub, allow_hosts=()):
                 log_seq = max(0, service.logs[-1][0] - 200)
             while hub.running:
                 with hub.cond:
-                    hub.cond.wait_for(lambda: hub.version != seen_version or hub.result_version != seen_result
-                                             or hub.live_version != seen_live or not hub.running, timeout=5.0)
-                    state_changed = hub.version != seen_version
+                    if seen_version < 0 and hub.state_json == "{}":
+                        hub.cond.wait_for(lambda: hub.state_json != "{}" or not hub.running, timeout=5.0)
+                    else:
+                        hub.cond.wait_for(lambda: hub.version != seen_version or hub.result_version != seen_result
+                                                 or hub.live_version != seen_live or not hub.running, timeout=5.0)
+                    state_changed = hub.state_json != "{}" and hub.version != seen_version
                     live_changed = hub.live_version != seen_live
                     seen_version, seen_result, js = hub.version, hub.result_version, hub.state_json
                     seen_live, live_js = hub.live_version, hub.live_json

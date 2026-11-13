@@ -34,7 +34,9 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import yaml
 
+from ..policy_vision import vision_issues
 from .. import bases as B
+from ..ft_axes import FtAxesError
 from .. import robots as R
 from .. import cart_speed
 from .. import transforms as tf
@@ -47,6 +49,7 @@ from ..ft_bias import FtBiasError
 from ..gains import GainsError
 from ..geometry import ACTIVE_TCP, GeometryError, PoseSpec
 from ..geometry_calibration import VialGeometryError, estimate_vial
+from ..point_cloud import pack_point_cloud
 from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
 from ..policies import (POLICY_UPLOAD_SUFFIXES, PolicyImportError, RecordingOptions, allowed_policy_roots,
@@ -94,6 +97,7 @@ ADMIN_COMMANDS = frozenset((
     "payload_collect", "payload_evaluate", "payload_reset", "payload_save", "payload_apply", "record_configure",
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "robot_setup", "setup_save", "setup_delete", "setup_load", "setup_copy",
+    "ft_axes_save",
     "profile_delete",
     "policy_import", "policy_rename", "policy_sources", "policy_upload",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
@@ -106,7 +110,7 @@ JOG_KEEPS_READY = frozenset(("jog_arm", "jog_start", "jog_hold", "jog_stop", "ho
                              "gripper", "speed_override"))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
 ACTIVITY_COMMANDS = {
-    **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
+    **{c: "program" for c in ("program_run", "program_restart", "program_pause", "program_resume", "program_stop", "program_scrape",
                               "program_scrape_baseline", "program_flask_scrape", "program_save", "program_open", "program_new",
                               "program_copy", "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
     **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_start", "policy_stop")},
@@ -122,6 +126,10 @@ ACTIVITY_COMMANDS = {
 
 # changes on every GUI start: an open page compares it to the one it loaded with and offers a reload
 BOOT_ID = f"{time.time():.3f}"
+
+
+# UR robot modes where the arm cannot move (no power, or brakes on): a paused / loaded pendant program does not matter
+ARM_OFF_MODES = ("DISCONNECTED", "CONFIRM_SAFETY", "BOOTING", "POWER_OFF", "POWER_ON", "IDLE", "NO_CONTROLLER")
 
 class CommandError(Exception):
     pass
@@ -496,7 +504,11 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             return "joint speeds are unavailable: cannot verify the robot is still"
         if any(abs(float(v)) > self.core.profile.stationary_joint_velocity for v in qd):
             return "the robot is moving"
-        if snap.program_state == "PAUSED" or (snap.program_state == "PLAYING" and snap.program_running is not True):
+        if getattr(snap, "robot_mode", None) in ARM_OFF_MODES:     # no arm power or brakes on: a program cannot move it
+            return None
+        if snap.program_state == "PAUSED":
+            return "a pendant program is paused (press Stop robot or Stop on the pendant)"
+        if snap.program_state == "PLAYING" and snap.program_running is not True:
             return "a pendant program is running"
         return None
 
@@ -591,7 +603,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
                     GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError, R.RobotError,
                     TeachError, BatchError, ProfileError, FlaskGeometryError, FlaskScrapeError, FlaskSetupError,
-                    FtMatchError) as e:
+                    FtMatchError, FtAxesError) as e:
                 raise CommandError(str(e)) from None
             finally:
                 if previous_token is None:
@@ -1790,6 +1802,33 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError("the previous run is still ending: try again")
         return self._ok("program started")
 
+    def cmd_program_restart(self):
+        """Stop the current GUI run, then run the open program from its first step."""
+        if self.teach is not None:
+            raise CommandError("finish teaching first (Teach & more)")
+        if self.core.modes.control_state_unknown:
+            raise CommandError("control state is UNKNOWN: recover first")
+        running = self.core.runner.program_name if self.core.runner.state != RunState.IDLE else None
+        if running and running != self.program.name:
+            raise CommandError(f"'{running}' is running but '{self.program.name}' is open: stop it, or open it first")
+        problems = self.core.runner.preflight(self.program, 0)
+        if problems:
+            raise CommandError("preflight failed: " + "; ".join(problems))
+        if self.core.busy or self.core.policies.busy or self.core.batch.active:
+            raise CommandError("robot is busy")
+        if self.core.runner.state != RunState.IDLE:
+            self.core.note_stop(self._actor()["name"] or "the operator")
+            self.core.runner.stop()
+            self.core.runner.join(2.0)
+        if not self.core.idle():
+            raise CommandError("robot is busy")
+        self.core.program_result = None
+        if not self.core.runner.start(self.program, 0, False, False):
+            if self.core.program_result is not None:
+                raise CommandError(self.core.program_result[1])
+            raise CommandError("the previous run is still ending: try again")
+        return self._ok("program restarted")
+
     def cmd_program_pause(self):
         self.core.runner.pause()
         return self._ok("paused")
@@ -2060,7 +2099,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         if p is None:
             raise CommandError(f"no F/T bias set named '{name}'")
         b = self._ft_bias_ready()
-        return self._submit(f"F/T bias '{name}'", lambda: b.set(p["bias"], f"set '{name}'"))
+        return self._submit(f"F/T bias '{name}'", lambda: b.set(b.saved_bias(p), f"set '{name}'"))
 
     def cmd_ft_bias_preset_save(self, name, bias):
         return self._ok(self.core.ft_bias.save_preset(name, bias)[1], ft_bias=self.core.ft_bias.view())
@@ -2073,12 +2112,12 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         return self._ok(policies=[self._policy_info(m) for m in self.core.policies.manifests.values()],
                         errors=dict(self.core.policies.errors))
 
-    @staticmethod
-    def _policy_info(m):
+    def _policy_info(self, m):
         card = m.card() or {}
         return {"name": m.name, "description": m.description, "algorithm": m.algorithm or card.get("algorithm", ""),
                 "backend": m.backend, "mode": m.required_mode, "tcp": m.required_tcp, "hz": m.control_hz,
-                "duration": m.duration, "policy_card": bool(card)}
+                "duration": m.duration, "policy_card": bool(card),
+                "vision_issues": [vars(i) for i in vision_issues(m, self.core.bridge.topic_publishers)]}
     cmd_policy_list.read_only = True
 
     def cmd_policy_sources(self, folder=""):
@@ -2504,7 +2543,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             raise CommandError(why)
         if fresh:
             cal.reset()
-            self.payload_bias = live
+            self.payload_bias, self.payload_shift = live, None
         if not hasattr(cal, "base_velocity"):
             cal.base_velocity = cal.velocity
         cal.velocity = max(0.01, cal.base_velocity * self.core.speed_override)   # GUI SPEED applies here too
@@ -2549,7 +2588,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         if self.payload is None or self.payload_progress["running"]:
             raise CommandError("a pose is being collected" if self.payload else "no F/T calibration in this profile")
         self.payload.reset()
-        self.payload_bias = None
+        self.payload_bias, self.payload_shift = None, None
         self.payload_applied = False
         self.payload_progress.update(done=0, total=0, error="")
         return self._ok("calibration samples cleared")
@@ -2584,8 +2623,40 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         def job():
             ok, msg = cal.apply_to_admittance(self.core.mode)
             self.payload_applied = self.payload_applied or ok
+            if ok:
+                msg += self._payload_bias_from_fit(cal)
             return ok, msg
         return self._submit("apply to admittance", job)
+
+    def _payload_bias_changed(self) -> bool:
+        """The bias is not the one the poses were collected with (plus the fitted offset Apply moved it by)."""
+        b, live = getattr(self, "payload_bias", None), self.core.ft_bias.live
+        if b is None or live is None:
+            return False
+        want = np.asarray(b, float) + np.asarray(getattr(self, "payload_shift", None) or np.zeros(6), float)
+        return bool(np.any(np.abs(want - np.asarray(live, float)) > 1e-3))
+
+    def _payload_bias_from_fit(self, cal) -> str:
+        """The poses were collected with some bias (often a plain zero with the tool on: the weight at that pose is
+        gone from the reading). The fit measured that as a constant offset; moving the bias by it leaves tool weight
+        + contact in the reading, which is what the controller's gravity compensation expects. No Zero needed."""
+        tb = np.asarray(cal.result.info.get("total_bias", np.zeros(6)) if cal.result else np.zeros(6), dtype=float)
+        if tb.shape != (6,) or (np.linalg.norm(tb[:3]) < 0.05 and np.linalg.norm(tb[3:]) < 0.005):
+            return ""
+        done = np.asarray(getattr(self, "payload_shift", None) or np.zeros(6), dtype=float)
+        tb = tb - done                                 # applied before (the same poses evaluated again)
+        if np.linalg.norm(tb[:3]) < 0.05 and np.linalg.norm(tb[3:]) < 0.005:
+            return ""
+        ft = self.core.ft_bias
+        ft.read()
+        if self._payload_bias_changed():
+            return ". F/T bias not moved (it changed since the poses were collected): press Zero, keep tool weight"
+        ok, m = ft.shift([float(v) for v in tb])
+        if not ok:
+            return f". F/T bias not moved ({m}): press Zero, keep tool weight"
+        self.payload_shift = [float(v) for v in done + tb]
+        return (f". F/T bias moved by the fitted offset ({np.linalg.norm(tb[:3]):.2f} N, {np.linalg.norm(tb[3:]):.3f} Nm):"
+                " the reading now shows the tool weight, which admittance removes")
 
     def _payload_saved(self, cal) -> dict:
         """What is kept across restarts: the payload the GUI restores on the controller (gains store), the last
@@ -2646,13 +2717,25 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                              if bias is not None and len(bias) >= 3 else None,
                              "can_apply": bool(cal.apply_node),           # a failed fit asks first
                              # the fit holds for the bias it was collected with: a later zero / clear breaks it
-                             "bias_changed": bool(getattr(self, "payload_bias", None) is not None
-                                                  and self.core.ft_bias.live is not None
-                                                  and any(abs(a - b) > 1e-3 for a, b in
-                                                          zip(self.payload_bias, self.core.ft_bias.live)))}
+                             "bias_changed": self._payload_bias_changed(),
+                             "bias_moved": getattr(self, "payload_shift", None) is not None}
         return out
 
     # ---------------------------------------------------------------- cameras
+    def point_cloud_topics(self):
+        b = self.core.bridge
+        try:
+            topics = b.point_cloud_topics()
+        except Exception as e:
+            return {"ok": False, "msg": str(e), "topics": []}
+        return {"ok": True, "topics": [{"topic": t, "publishers": b.topic_publishers(t)} for t, _ in topics]}
+
+    def point_cloud_packet(self, topic):
+        points, colors, msg = self.core.bridge.point_cloud_snapshot(str(topic))
+        if msg:
+            return None, msg
+        return pack_point_cloud(points, colors), ""
+
     def cmd_camera_status(self):
         b = self.core.bridge
         try:
@@ -2832,7 +2915,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             "joint_state_age": s.joint_state_age,
             "joint_vel_dps": [round(math.degrees(v), 2) for v in s.joint_velocities] if s.joint_velocities else None,
             "tcp": tcp, "tcp_sig": tcp_sig, "tcp_off": tcp_off, "wrench": [round(v, 3) for v in s.wrench] if s.wrench else None,
-            "ft_samples": self._ft_samples(), "ft_guard": c.ft_guard.view(),
+            "ft_samples": self._ft_samples(), "ft_payload": c.ft_payload_view(), "ft_guard": c.ft_guard.view(),
             "gripper_position": s.gripper_position, "gripper_status": s.gripper_status,
             "gripper_controller": s.gripper_controllers.get(c.profile.gripper.get("controller") or ""),
             "freedrive": s.freedrive,
@@ -2863,6 +2946,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             "payload": self.payload_view(),
             "ftmatch": self.ftmatch_view(),
             "ft_bias": self.core.ft_bias.view(),
+            "ft_axes": self.ft_axes_view(),
             "calibration": self.calibration_view(),
             "keepout": self.keepout_view(),
             "workcell": self.workcell_state(),

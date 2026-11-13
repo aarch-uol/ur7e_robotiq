@@ -574,3 +574,13 @@ def test_press_straight_down(s):
     assert tick_until(s, lambda: s.core.program_result is not None, 60)
     assert s.core.program_result[0], s.core.program_result
     assert any("contact" in line for line in s.core.bridge.drain_logs() + [l for _, l in s.logs])
+
+
+def test_the_ft_hard_limit_ends_the_whole_batch(s):
+    """A hard F/T stop in run 1 of a continue-on-failure batch: no run 2 starts (the force may still be high)."""
+    load_program(s, [{"type": "wait", "seconds": 5}])
+    cmd(s, "batch_run", batch={"kind": "repeat", "repeats": 3, "on_fail": "continue"})
+    assert tick_until(s, lambda: s.core.runner.state.name == "RUNNING", 5)
+    s.core._ft_hard_stop("test: 55 N over 40 N")
+    assert tick_until(s, lambda: not s.core.batch.active, 5)
+    assert len(s.core.batch.view()["rows"]) == 1

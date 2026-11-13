@@ -9,6 +9,7 @@ import { OrbitControls } from "/static/vendor/three/examples/jsm/controls/OrbitC
 import { TransformControls } from "/static/vendor/three/examples/jsm/controls/TransformControls.js";
 import { STLLoader } from "/static/vendor/three/examples/jsm/loaders/STLLoader.js";
 import { ColladaLoader } from "/static/vendor/three/examples/jsm/loaders/ColladaLoader.js";
+import { retryAsync } from "/static/load_retry.js";
 
 const D2R = Math.PI / 180;
 const TRAIL_S = 10;                        // seconds of TCP trail
@@ -88,22 +89,32 @@ class MeshCache {
     const url = this.url(uri);
     if (!url) return Promise.resolve(null);
     if (!this.cache.has(url)) {
-      const ext = url.split(".").pop().toLowerCase();
-      this.cache.set(url, new Promise((resolve) => {
-        if (ext === "stl") {
-          this.stl.load(url, (g) => resolve({ kind: "stl", geometry: g }), undefined, () => resolve(null));
-        } else if (ext === "dae") {
-          this.dae.load(url, (d) => {
-            d.scene.rotation.set(0, 0, 0);    // keep the file's own (z-up) axes, as RViz does; unit scale stays
-            resolve({ kind: "dae", scene: d.scene });
-          }, undefined, () => resolve(null));
-        } else if (ext === "obj") {
-          fetch(url).then((r) => (r.ok ? r.text() : Promise.reject())).then((t) => resolve({ kind: "stl", geometry: parseObj(t) }))
-            .catch(() => resolve(null));
-        } else resolve(null);
-      }));
+      const pending = retryAsync(() => this.loadAttempt(url), { attempts: 4, baseMs: 250, maxMs: 2000 })
+        .catch(() => { if (this.cache.get(url) === pending) this.cache.delete(url); return null; });
+      this.cache.set(url, pending);
     }
     return this.cache.get(url);
+  }
+  loadAttempt(url) {
+    let timer;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("mesh timeout")), 8000); });
+    return Promise.race([this.loadOnce(url), timeout]).finally(() => clearTimeout(timer));
+  }
+  loadOnce(url) {
+    const ext = url.split(".").pop().toLowerCase();
+    return new Promise((resolve, reject) => {
+      if (ext === "stl") {
+        this.stl.load(url, (g) => resolve({ kind: "stl", geometry: g }), undefined, reject);
+      } else if (ext === "dae") {
+        this.dae.load(url, (d) => {
+          d.scene.rotation.set(0, 0, 0);    // keep the file's own (z-up) axes, as RViz does; unit scale stays
+          resolve({ kind: "dae", scene: d.scene });
+        }, undefined, reject);
+      } else if (ext === "obj") {
+        fetch(url).then((r) => (r.ok ? r.text() : Promise.reject(new Error(`mesh HTTP ${r.status}`))))
+          .then((t) => resolve({ kind: "stl", geometry: parseObj(t) })).catch(reject);
+      } else reject(new Error("unsupported mesh type"));
+    });
   }
 }
 
@@ -118,6 +129,7 @@ class RobotInstance {
     this.joints = {};                       // name -> {def, motion: Group}
     this.ghost = ghost;
     this.layer = layer;
+    this.meshLoads = [];
     this.material = ghost ? new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.35,
                                                              depthWrite: false }) : null;
     const linkGroup = (name) => {
@@ -161,7 +173,7 @@ class RobotInstance {
       c.rotation.x = Math.PI / 2;           // three.js cylinders run along y, URDF ones along z
       holder.add(c);
     } else if (g.type === "mesh") {
-      meshes.load(g.uri).then((r) => {
+      const load = meshes.load(g.uri).then((r) => {
         if (!r) { if (this.layer === "visual") this.stub(parent, mat); return; }
         let obj;
         if (r.kind === "stl") obj = new THREE.Mesh(r.geometry, mat);
@@ -171,7 +183,9 @@ class RobotInstance {
         }
         obj.scale.multiply(new THREE.Vector3(...g.scale));
         holder.add(obj);
+        return true;
       });
+      this.meshLoads.push(load.then((r) => !!r));
     }
   }
 
@@ -225,6 +239,12 @@ export class View3D {
     el.view3d = this;                        // reachable from the element (diagnostics, tests)
     this.baseLink = baseLink;
     this.onTargetChange = onTargetChange || (() => {});
+    this.cloudEnabled = false;
+    this.cloudTopic = "";
+    this.cloudTopics = null;
+    this.cloudTimer = null;
+    this.cloudBusy = false;
+    this.cloudGeneration = 0;
     this.meshes = new MeshCache();
     this.robot = null;
     this.ghost = null;
@@ -334,6 +354,28 @@ export class View3D {
       l.append(c, " " + label);
       bar.append(l);
     }
+    const cloud = document.createElement("label");
+    cloud.title = "Show a bounded point cloud from a depth sensor";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = false;
+    check.onchange = () => this.setCloudEnabled(check.checked);
+    cloud.append(check, " Cloud");
+    const select = document.createElement("select");
+    select.className = "v3cloud-select";
+    select.hidden = true;
+    select.title = "Point cloud topic";
+    select.onchange = () => this.setCloudTopic(select.value);
+    const status = document.createElement("span");
+    status.className = "v3cloud-status";
+    bar.append(cloud);
+    const row = document.createElement("div");          // topic and status above the chips, not over the left corner
+    row.className = "v3cloudrow";
+    row.append(status, select);
+    this.el.append(row);
+    this.cloudCheck = check;
+    this.cloudSelect = select;
+    this.cloudStatus = status;
     this.el.append(bar);
     this.showEl = bar;
     window.addEventListener("storage", (e) => { if (e.key === "v3-show") this.setShow(View3D.savedShow(), false); });
@@ -349,7 +391,7 @@ export class View3D {
       localStorage.setItem("v3-show", JSON.stringify(this.show));
       window.dispatchEvent(new CustomEvent("v3-show", { detail: this }));
     }
-    if (this.showEl) for (const c of this.showEl.querySelectorAll("input")) c.checked = this.show[c.dataset.k];
+    if (this.showEl) for (const c of this.showEl.querySelectorAll("input[data-k]")) c.checked = this.show[c.dataset.k];  // not Cloud: its own switch
     if (this.robot) {
       if (this.show.collision && !this.colBot) {           // built on first use (it loads the collision meshes)
         this.colBot = new RobotInstance(this.model, this.meshes, true, 0x2fbf71, "collision");
@@ -366,21 +408,34 @@ export class View3D {
   }
 
   async load(model) {
-    if (this.robot) return;
-    this.model = model;
-    this.robot = new RobotInstance(model, this.meshes, false);
-    this.ghost = new RobotInstance(model, this.meshes, true);
-    this.ghost.root.visible = false;
-    // RViz MotionPlanning's orange "goal state": follows the goal marker through IK
-    this.goalBot = new RobotInstance(model, this.meshes, true, 0xf28c28);
-    this.goalBot.root.visible = false;
-    this.scene.add(this.robot.root, this.ghost.root, this.goalBot.root);
-    this.setShow({}, false);
-    this.draw();
+    if (this.robot) return { meshFailed: !!this.meshFailed };
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      const robot = new RobotInstance(model, this.meshes, false);
+      const ghost = new RobotInstance(model, this.meshes, true);
+      const goalBot = new RobotInstance(model, this.meshes, true, 0xf28c28);
+      const loads = [robot, ghost, goalBot].flatMap((r) => r.meshLoads);
+      const results = await Promise.all(loads);
+      this.model = model;
+      this.robot = robot;
+      this.ghost = ghost;
+      this.ghost.root.visible = false;
+      // RViz MotionPlanning's orange "goal state": follows the goal marker through IK
+      this.goalBot = goalBot;
+      this.goalBot.root.visible = false;
+      this.meshFailed = results.some((ok) => !ok);
+      this.scene.add(this.robot.root, this.ghost.root, this.goalBot.root);
+      this.setShow({}, false);
+      this.draw();
+      return { meshFailed: this.meshFailed };
+    })();
+    try { return await this.loading; }
+    finally { this.loading = null; }
   }
 
   // The robot model changed (a part saved in SETUP > Parts): rebuild the three instances, keep what was shown.
   async reload(model) {
+    if (this.loading) await this.loading;
     if (!this.robot) return this.load(model);
     const vis = [this.ghost.root.visible, this.goalBot.root.visible];
     const q = this.robot.values || null;
@@ -391,6 +446,7 @@ export class View3D {
     }
     this.robot = null;
     this.colBot = null;
+    this.meshFailed = false;
     this.meshes.forgetParts();
     await this.load(model);
     [this.ghost.root.visible, this.goalBot.root.visible] = vis;
@@ -448,17 +504,102 @@ export class View3D {
     this.cloud.visible = !!pos || this.cloud.visible;
     this.draw();
   }
-  // where the optical frame is: parent (row-major 4x4, m, in baseLink) times the calibration (mm, deg)
-  setCloudPose(parentRowMajor, xyzMm, rpyDeg) {
+  // where the optical frame is: parent (row-major 4x4, m, in baseLink) times the calibration (mm, deg), times the
+  // optical frame in the picked camera frame (row-major, optional)
+  setCloudPose(parentRowMajor, xyzMm, rpyDeg, tailRowMajor) {
     if (!this.cloud) this.setCloud(null);
     if (!parentRowMajor) { this.cloud.visible = false; this.draw(); return; }
     const P = new THREE.Matrix4().set(...parentRowMajor);
     this.cloud.matrix.copy(this.base()).multiply(P).multiply(poseToMatrix(xyzMm, rpyDeg));
+    if (tailRowMajor) this.cloud.matrix.multiply(new THREE.Matrix4().set(...tailRowMajor));
     this.cloud.matrixWorldNeedsUpdate = true;
     this.cloud.visible = true;
     this.draw();
   }
   clearCloud() { if (this.cloud) { this.setCloud(null); this.cloud.visible = false; this.draw(); } }
+
+  setCloudBase(pos, col, size = 0.004) {
+    this.setCloud(pos, col, size);
+    if (!this.cloud) return;
+    this.cloud.matrix.copy(this.base());
+    this.cloud.matrixWorldNeedsUpdate = true;
+    this.cloud.visible = !!pos;
+    this.draw();
+  }
+
+  async setCloudEnabled(on) {
+    this.cloudEnabled = !!on;
+    this.cloudGeneration++;
+    if (!this.cloudEnabled) {
+      if (this.cloudTimer) { clearTimeout(this.cloudTimer); this.cloudTimer = null; }
+      this.cloudBusy = false;
+      this.cloudSelect.hidden = true;
+      this.cloudStatus.textContent = "";
+      this.clearCloud();
+      return;
+    }
+    this.cloudSelect.hidden = false;
+    this.cloudStatus.textContent = "Loading…";
+    const generation = this.cloudGeneration;
+    try {
+      const r = await fetch("/api/pointcloud/topics");
+      const data = await r.json();
+      if (!this.cloudEnabled || generation !== this.cloudGeneration) return;
+      if (!r.ok || !data.ok) throw new Error(data.msg || "topics unavailable");
+      this.cloudTopics = data.topics || [];
+      this.cloudSelect.replaceChildren(...this.cloudTopics.map((x) => new Option(x.topic, x.topic)));
+      if (!this.cloudTopics.length) {
+        this.cloudTopic = "";
+        this.cloudStatus.textContent = "No point cloud topics";
+        return;
+      }
+      this.cloudTopic = this.cloudTopics.some((x) => x.topic === this.cloudTopic) ? this.cloudTopic : this.cloudTopics[0].topic;
+      this.cloudSelect.value = this.cloudTopic;
+      this.cloudFetch(generation);
+    } catch (e) {
+      if (this.cloudEnabled && generation === this.cloudGeneration) this.cloudStatus.textContent = e.message;
+    }
+  }
+
+  setCloudTopic(topic) {
+    this.cloudTopic = topic;
+    this.clearCloud();
+    if (this.cloudEnabled) this.cloudFetch(this.cloudGeneration);
+  }
+
+  async cloudFetch(generation = this.cloudGeneration) {
+    if (!this.cloudEnabled || !this.cloudTopic || this.cloudBusy || generation !== this.cloudGeneration) return;
+    this.cloudBusy = true;
+    try {
+      const r = await fetch(`/api/pointcloud?topic=${encodeURIComponent(this.cloudTopic)}`);
+      if (!this.cloudEnabled || generation !== this.cloudGeneration) return;
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        this.clearCloud();
+        this.cloudStatus.textContent = e.msg || "Point cloud unavailable";
+      } else {
+        const packet = new Uint8Array(await r.arrayBuffer());
+        if (packet.length < 12 || String.fromCharCode(...packet.slice(0, 4)) !== "PCD1") throw new Error("bad point cloud packet");
+        const view = new DataView(packet.buffer, packet.byteOffset, packet.byteLength);
+        const count = view.getUint32(8, true), posBytes = count * 12, colorBytes = count * 3;
+        if (count > 30000 || packet.length < 12 + posBytes + colorBytes) throw new Error("bad point cloud size");
+        const pos = new Float32Array(packet.buffer, packet.byteOffset + 12, count * 3);
+        const col = new Uint8Array(packet.buffer, packet.byteOffset + 12 + posBytes, colorBytes);
+        this.setCloudBase(pos, col);
+        this.cloudStatus.textContent = `${count.toLocaleString()} points`;
+      }
+    } catch (e) {
+      if (this.cloudEnabled && generation === this.cloudGeneration) {
+        this.clearCloud();
+        this.cloudStatus.textContent = e.message;
+      }
+    } finally {
+      this.cloudBusy = false;
+      if (this.cloudEnabled && generation === this.cloudGeneration) {
+        this.cloudTimer = setTimeout(() => this.cloudFetch(generation), 500);
+      }
+    }
+  }
 
   // tcpOff: {link, xyz_mm, rpy_deg}, the active TCP as a fixed offset from a model link (state.tcp_off). Paths are
   // drawn at link * offset, so a virtual TCP (e.g. a spatula tip, not in the URDF) gets its own line
@@ -770,6 +911,10 @@ export class View3D {
     }
     this.draw();
   }
+  setHighlightMm(ptsMm) {
+    const B = this.base();
+    this.setHighlight(ptsMm ? ptsMm.map(([x, y, z]) => new THREE.Vector3(x / 1000, y / 1000, z / 1000).applyMatrix4(B)) : null);
+  }
   // a path given in the base frame, mm (PROGRAMS: the program's TCP path)
   setPathMm(ptsMm) {
     const B = this.base();
@@ -933,6 +1078,10 @@ export class View3D {
   // markers: [{xyz_mm, rpy_deg, selected}] in baseLink (program pose waypoints)
   setMarkers(markers, line = true) {
     if (!this.markers) { this.markers = new THREE.Group(); this.scene.add(this.markers); }
+    for (const o of this.markers.children) o.traverse((x) => {     // removing does not free the GPU buffers
+      if (x.geometry) x.geometry.dispose();
+      if (x.material) x.material.dispose();
+    });
     this.markers.clear();
     const pts = [];
     for (const mk of markers) {

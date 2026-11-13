@@ -150,8 +150,12 @@ commands are written to the GUI log as `web: REFUSED <command>: <reason>` so a f
 | OPERATE | MoveJ (joints, waypoints), MovePose (any frame, linear), Plan → preview → Execute, Jog (step, or hold-to-jog through Servo), Force (Admittance / Impedance), 3D view (robot, goal gizmo, plan preview, F/T and force arrows, TF Frames overlay (checklist in localStorage, polled at 2 Hz via `tf_frames`), planned TCP path line, 10 s TCP Trail, Top/Front/Side/Iso and Follow TCP camera controls), control mode switch, freedrive, gripper, ATI F/T, Joint monitor (bar per joint across its URDF limits, amber within 10°, red within 3°), live F/T chart (last 20 s, Pause/Clear, torque toggle, commanded-force line) | With **Goal** on, an **orange goal-state arm** follows the goal marker live (as in RViz MotionPlanning): IK in the page from the robot model, seeded from the current joints, within joint limits, retried from other seeds near singular poses; nothing is sent to the robot and nothing is collision-checked (Plan does that). A goal it cannot reach says so and keeps the last pose that worked. Screenshot: `docs/ux/web_operate_goal_state.png`.
 | PROGRAMS | Insert tab with the **jog panel and gripper** in a drawer, closed at first so the commands start at the top (it stays as you leave it; jog, then MoveJ/MoveL (here)); the tree fills the page height; waypoint rename and coordinates; **3D preview** beside the tree: the program's TCP path (loops and relative moves included) and its waypoints (selected one orange, joint targets as a ghost arm); typed waypoints and a Go to list; loop progress next to the run controls; UR-style tree (Loop, Folder, Comment, …); Insert / Command / Teach & more / **Batch** tabs; **Teach by hand** (waypoints, or a path replayed as taught or as MoveL points) and **batch runs** (see below); edits apply when you leave a field; **Undo / Redo** (also Ctrl+Z / Ctrl+Y); unsaved changes are marked `*` and New/Open ask first; Set waypoint here, Move here; run from a selected step, step, pause, stop; The 3D preview's **▶ Play** runs a ghost arm through the whole program from where the robot is (loops included; MoveJ / non-linear MovePose in joint space, linear moves in <= 10 mm steps with IK); nothing moves, no planning, no contact. A **Move until contact** is drawn to where it meets the wall or floor of a vial of known size (a fixture with a radius: taught by touch, a vial profile, Use example vial, or the example vial while assumed), else to its full distance; the step line says which. A fixture the program uses but that is not taught yet is previewed at the profile's `example_fixtures` position (`vial` = scraping.py's target_xyz [525, 16, 40] mm in base_link, what `robot_demo` runs), else under the tool now; the note says which. SETUP > Vial > **Use example vial** saves the example as the real fixture on request. **Step through** under the view: |◀ ◀ slider ▶ ▶| picks one move (loops unrolled); the ghost repeats only that move, it is orange on the path, and the line under it says which step and loop turn it is (e.g. `Move 6 / 79 · step 8.5 · Loop 8 · 2/37 · Move relative [0, 0, -41] mm in vial`). The path is drawn for the **active TCP**: a taught pose puts its own TCP at the target (as the runner does) and the line shows where the active one goes; changing or editing the active TCP redraws it. A pose's TCP can be `active` (whichever TCP is selected when it runs; the Franka baseline example uses it) or a named TCP (TCP dropdown in the waypoint editor). A path that goes below the robot base (z < 0) is flagged in red under the preview. Screenshots: `docs/ux/web_programs_play.png`, `docs/ux/web_programs_step.png`. |
 | AUTOMATION | policy list, readiness with **Fix** buttons (use the TCP, switch mode, apply the trained gains, open SETUP/DIAGNOSTICS), Prepare (shows PREPARING…, Cancel), Run, ■ Stop policy, recording on/off, live feedback (when the runner gives it) |
-| SETUP | TCPs, Parts, Vial Geometry, Flask Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is a reminder to press Zero now after Apply, not a FAIL. A **FAIL** fit can still be saved or used: Save / Use for compliance list the failed checks and ask first; the file then says `accepted_despite_failed_checks: true` and the result shows *FAIL · used anyway*. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), **Drivers & cameras** (start / stop camera drivers and pipelines, live picture, log; see below) |
+| SETUP | TCPs, Parts, Vial Geometry, Flask Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is not a FAIL. **Apply moves the F/T bias by that fitted offset** (once; not while anything uses the reading), so the usual flow (Zero with the tool on → calibrate → Apply → Admittance) needs no second Zero: afterwards the reading shows the tool weight, which the admittance controller removes at every pose. A **FAIL** fit can still be saved or used: Save / Use for compliance list the failed checks and ask first; the file then says `accepted_despite_failed_checks: true` and the result shows *FAIL · used anyway*. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link; every virtual TCP is also a static TF frame, so a policy runner can use one as its `ee_frame`, e.g. `spatula_tip`), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), **Drivers & cameras** (start / stop camera drivers and pipelines, live picture, log; see below) |
 | DIAGNOSTICS | controllers, state, **recording** (rosbag2/MCAP, see below), **run history**, **activity** (see below), log with filter, "problems only" and download |
+
+The OPERATE, PROGRAMS and SETUP 3D views retry slow or temporarily failed model and mesh requests with backoff. If loading still fails, the view keeps a short error, tries again by itself every 5 s, and has a **Retry** button that reloads only that model; the rest of the page and its state stay in place. Camera pictures start once the OPERATE model is in (at most 15 s later): over plain HTTP a browser opens only 6 connections to the GUI, shared by all its tabs, and each live camera holds one.
+
+PROGRAMS also has a collapsible F/T chart with the live force and torque reading, using the same chips and time-window controls as OPERATE. While a GUI program runs, OPERATE's 3D view shows the program path and waypoint markers; its floating Program run window names and highlights the current step and provides Pause / Resume, Stop, and Restart. Restart asks before moving and starts at the first step with the usual server checks.
 
 Still desktop-only: pivot calibration of TCPs, the fixture wizard, the detailed control-stack
 transition view, and the other UR dashboard commands (unlock protective stop, restart safety, popups). Play / pause /
@@ -202,6 +206,17 @@ red button named after it.
     * **−** minimises a window to its title bar, in place. Nothing else moves.
     * F/T sensor › **Chart** opens the chart right under the card (press again to close it). That chart stays
       attached to the card: it cannot be minimised or dragged, and it moves with the card.
+    * The F/T card's bias chip names the zero in use: **Weight kept** (Zero, keep tool weight: the tool weight stays in the
+      reading), **Weight zeroed** (Zero incl. tool weight) or **Biased** (typed values or a set).
+    * F/T sensor › **Reading / − Payload** picks what the card, its chart and the 3D force arrow show. **Reading** is
+      the value as published (after the bias). After a payload-kept Zero, this still includes the tool weight.
+      **− Payload** removes the payload weight the way the admittance controller does. It uses the weight and CoG
+      the controller has loaded (`gravity_compensation.*`, re-read every 3 s), turned with the arm's pose, so at
+      rest it reads about 0 at any pose. Hover over **− Payload** to see the mass removed, or why nothing is removed when
+      nothing is loaded or the controller does not answer. After a plain Zero (weight already in the bias),
+      **− Payload** shows the weight removed twice. Admittance would do the same.
+      The chart keeps both versions of every sample, so switching redraws its whole history and it always matches
+      the card. The choice is kept per browser.
   * **Edit** (from SETUP) puts a bar in the top bar: name, **+ View**, Reset, Done.
     * Drag a window by ⠿ to move it above or below another window. Dropping it on the right or bottom edge of the
       3D view starts a stack there.
@@ -438,8 +453,8 @@ Every F/T sample (about 500 Hz) is checked, on a 5-sample average so one noisy s
   it gives way). Everyone gets a message. It fires once per event and re-arms when the reading is below the soft
   limit (or 80 % of the hard one) for 0.5 s, so you can move away from the contact.
 * In freedrive it only warns: your hands are on the arm.
-* With **Zero now** the reading at rest still holds the tool weight (about 10 N on the UR7e tool): set the limits
-  above it, or use Zero all.
+* With **Zero, keep tool weight** the reading at rest still holds the tool weight (about 10 N on the UR7e tool): set the limits
+  above it, or use Zero incl. tool weight.
 * It is a GUI guard for scraping contacts, not a safety function. The robot's own limits and the e-stop stay the
   safety.
 
@@ -467,16 +482,31 @@ An imported policy needs a `robot_config.yaml` in its folder (or next to the che
 one the policy is listed but refuses to start.
 
 A trained policy observes the F/T as `[fx, fy, fz, tx, ty, tz]` in the simulation's axes. When the sensor is mounted
-turned (on the UR7e: scraping along base +X is now -Y of the sensor), Match simulation finds how the sensor's axes
-map to the policy's, instead of hand-written sign tables (`moveit_gui/ft_match.py`, `web/ftmatch_cmds.py`).
+turned, Match simulation finds how the sensor's axes map to the policy's, instead of hand-written sign tables
+(`moveit_gui/ft_match.py`, `web/ftmatch_cmds.py`).
 
 * Needs control, Position mode (the robot holds still) and a live F/T reading. Nothing is commanded to move.
 * Pick the policy whose sim reference to use and press **Start**. The reference is the manifest's
-  `sim_ft_reference`, else `sim_ft_reference.json` next to its `robot_config` (made by `tools/sim_ft_reference.py`
-  in the policy repo). Without one the card says so and does not start.
-* For base +X, +Y and +Z in turn the 3D view shows an arrow at the spatula tip. Keep hands off the tool for a
-  moment (the no-contact reading), then push the tip along the arrow, about 10 N, and hold 2 s. A push is taken by
-  itself when it is over 5 N and steady for 1 s; **Record** takes it at once. **Again** repeats one push.
+  `sim_ft_reference`, else `sim_ft_reference.json` next to its `robot_config`. Without one the card says so and does
+  not start.
+* Make the reference from the policy's MuJoCo model, where `mujoco` is installed (not in the robot image):
+  `python3 -m moveit_gui.sim_ft_reference <model.xml> --pose <keyframe> -o sim_ft_reference.json`. It holds the
+  model still at the pose and puts 10 N at the tip site along world +X, +Y and +Z, then 1 Nm clockwise seen from
+  above, and saves the change of the model's F/T sensor for each. Defaults: the first keyframe, the first of
+  `spatula_site` / `tcp` / `tool_tip` / `attachment_site`, sensors `ft_force` / `ft_torque`. A model without a torque
+  sensor gets the torque from the sensor body's internal force. For round44: `panda.xml` with
+  `--pose rbf_prim_default_initial_pose`.
+* Choose where you stand: in front of the robot (base +X side), behind it (base -X side), on its left (base +Y
+  side), or on its right (base -Y side). The choice is kept in the match state and in a saved result. The 3D view
+  then shows three arrows at the spatula tip. Keep hands off the tool for a moment (the no-contact reading), then
+  push the tip **toward the robot**, **to your left**, and **down**, about 10 N, and hold 2 s. The card also shows
+  each base direction, such as `base -X`. A push is taken by itself when it is over 5 N and steady for 1 s;
+  **Record** takes it at once. **Again** repeats one push.
+* When the reference has a twist, a fourth step follows: twist the tool **clockwise, looking down from above**,
+  about 1 Nm. It is taken when it is over 0.3 Nm and steady for 1 s. Where you stand does not change it.
+* The three plain pushes still fill the simulation's `+X`, `+Y` and `+Z` entries. If a push is in a negative base
+  direction, its measured wrench change is negated before the fit; for example, base `-X` matches sim `+X` with
+  `-delta`. This keeps the saved JSON and the simulation reference format unchanged.
 * The fit tries all 48 signed permutations M and picks the one with M s/|s| closest to the sim's r/|r| for the
   three pushes. It refuses a push under 5 N or more than 15° off M, and names the push to repeat. It also shows how
   far the best free rotation is from M. M is matched to the simulation, not to physics: MuJoCo reports the
@@ -484,9 +514,10 @@ map to the policy's, instead of hand-written sign tables (`moveit_gui/ft_match.p
 * Torque signs are not assumed to follow the forces (the FR3 needed `ft_obs_scale` [-1,-1,-1, 1,1,1]). A push at
   the tip also twists the sensor, so tx and ty get their sign from the same pushes: M t compared with the sim's
   torque (the pushes whose sim torque on that axis is at least 0.3 Nm). A torque change under 0.3 Nm, or pushes
-  that disagree, are refused with the push to repeat. tz is not measured (a push through the tip hardly twists
-  about z): it keeps the robot config's tz sign relative to its forces when they all share one sign, else it
-  takes the tx / ty sign. The card says which.
+  that disagree, are refused with the push to repeat. tz comes from the twist: M t compared with the sim twist's tz
+  (under 0.3 Nm it asks for the twist again). A reference without a twist cannot measure tz (a push through the tip
+  hardly twists about z): it then keeps the robot config's tz sign relative to its forces when they all share one
+  sign, else it takes the tx / ty sign. The card says which.
 * The result: `ft_obs_axes = M` and `ft_obs_scale = [1, 1, 1, s, s, s_z]` (forces 1: their signs are in M),
   explained in words ("policy fx = sensor fy", "policy tx = -sensor ty"), with each push (force and torque) as the
   policy sees it now, with the match, and in the simulation, and the torque check. A suggested spatula_tip
@@ -507,7 +538,10 @@ the `offset.*` parameters of `/ft/force_torque_sensor_broadcaster`. The broadcas
 adds them to the reading, so the GUI, payload calibration, policies and the admittance controller (through
 TopicSensorBridge) all see the same values at once. Reading = raw sensor − bias.
 
-* **Zero now** averages the reading for 1 s with the arm still and makes the current load read 0. It is refused
+* **Zero, keep tool weight** averages the reading for 1 s with the arm still and removes the sensor drift. With a payload loaded
+  on the admittance controller, its weight stays in the reading (the controller removes it); without one, the
+  current load reads 0. **Zero incl. tool weight** makes the current load read 0, tool weight included: only for
+  use without admittance, which would remove the weight twice. Both are refused
   if the arm moves, or if the reading moves more than 1 N / 0.1 Nm (someone touching the tool).
 * **Clear (raw)** sets the bias to 0: the sensor's own values.
 * **Set these values** sets any six values (limits in the profile, `ft_bias:`). **Save fields as set…** stores a
@@ -523,7 +557,7 @@ TopicSensorBridge) all see the same values at once. Reading = raw sensor − bia
   once if the broadcaster does not answer yet. `scripts/ur7e_gui.sh` keeps the GUI's output in
   `~/ur7e_data/logs/gui_<time>.log` (next to the stack's `launch_<time>.log`). Parameter calls use one client
   per node, kept (a new client per call had to find the service again within 0.5 s every time).
-  With **Zero now** (payload kept) the reading at rest still shows the tool weight (Fz ~10 N on the UR7e tool):
+  With **Zero, keep tool weight** the reading at rest still shows the tool weight (Fz ~10 N on the UR7e tool):
   that is the payload the admittance controller removes, not a lost bias. Opt-in check on the real broadcaster
   (docker, no network): `MOVEIT_GUI_DOCKER_TESTS=1 pytest test/test_ft_bias_restart_docker.py`.
 * The payload calibration holds only for the bias it was collected with: **Apply to admittance** is refused after
@@ -531,6 +565,25 @@ TopicSensorBridge) all see the same values at once. Reading = raw sensor − bia
   set makes Admittance subtract the gripper weight twice.
 
 Screenshots: `docs/ux/web_setup_ft_bias_raw.png`, `docs/ux/web_setup_ft_bias_zeroed.png`.
+
+## F/T reading axes (SETUP › F/T + payload › Reading axes)
+
+For a sensor mounted turned on the flange: pick which sensor axis the published Fx and Fy read (±x, ±y, ±z); Fz
+follows (right-handed), and the torques turn the same way. The buttons set the common turns (±90°, 180° about Z).
+
+* force_torque_sensor_broadcaster does the turn with its own parameters (`interface_names.*`, `multiplier.*` = ±1).
+  The GUI keeps them in `config_dir()/ft_axes.yaml` (no file = the sensor's own axes). The launcher passes it as
+  `UR7E_FT_AXES_PARAMS`, and ur7e_robotiq's drivers.launch.py loads it after `ft_controllers.yaml`. So it applies
+  at a robot stack restart: **Save and restart stack**, or **Save for next start**. The card shows the running
+  axes, and the saved ones while they differ.
+* Everything that reads the wrench topic gets the turned reading: the F/T card and chart, the payload fit,
+  admittance, policies. The robot model (ft_fts_link) is not changed.
+* The zero offset stays in published units (the broadcaster publishes (sensor + offset) × multiplier, so the GUI
+  sets offset = −bias × multiplier). A saved bias remembers its axes and is turned to the running ones before it
+  is restored or used.
+* Run the payload calibration again after a change: its CoG was fitted in the old axes.
+* Redo the F/T match too: a saved match remembers the axes it was made with, and policy runs refuse it (*F/T axes:
+  stale*) while the running axes differ. Changing the reading axes is Admin only.
 
 ## Recording (DIAGNOSTICS › Recording)
 
@@ -691,6 +744,9 @@ The board is one line (*7 × 5 squares of 35 mm …*); *Change the board* opens 
    **End effector** and **Base** pick the frames, as in MoveIt's hand-eye plugin: any robot link or part (default:
    the planning link and the base). Eye-in-hand gives end effector → camera, eye-to-hand base → camera; planned
    poses are converted to the planning link for MoveIt.
+   **Camera frame** (the sensor frame) lists the camera driver's own TF frames (e.g. `camera_link`,
+   `camera_color_optical_frame`); the result, the hand adjustment and the saved pose are given in it. Default: the
+   optical frame of the image. The point cloud is placed correctly either way.
 2. **Live** (on by default) shows the camera about twice a second while the page is open, with the ArUco markers
    outlined (blue), the board corners (green) and its axes; a chip says *board found · N markers, M corners*,
    *not enough* or *no ArUco markers*. It pauses during Collect all. **Look** grabs one frame. Then either
@@ -782,7 +838,9 @@ selecting it shows the live picture, its topics (green = publishing) and the log
   (the new GUI takes them over); closing the GUI or restarting the robot stack stops them.
 - Nothing here moves the robot. The command is `ros2 launch …` / `ros2 run …` without a shell; it is shown under
   the log. The list is `config_dir()/services/<profile>.yaml`, the logs `config_dir()/services/logs/` (newest 5
-  per driver). Calibrated camera colour topics appear first in Camera calibration.
+  per driver). A log past 50 MB is cut to its start and end (a driver that lost its camera can repeat one error
+  thousands of times a second); the driver row then says *its log floods*. Calibrated camera colour topics appear
+  first in Camera calibration.
 - The robot image needs the drivers (`ros-jazzy-realsense2-camera`, `ros-jazzy-usb-cam` in `docker/Dockerfile`)
   and the container needs the USB devices: `-v /dev:/dev --device-cgroup-rule='c 81:* rmw'
   --device-cgroup-rule='c 189:* rmw'` on the launcher's `docker run` (ur7e_gui.sh does this).
@@ -800,6 +858,13 @@ selecting it shows the live picture, its topics (green = publishing) and the log
 
 Only one image topic is subscribed, and only while someone looks at a picture. It is sent as JPEG, by default up
 to 640 px wide at 10 frames/s (a camera window's Med / High setting raises that). If two browsers watch different topics, the last one to open wins.
+
+Every 3D viewer also has an off-by-default **Cloud** control. When enabled, it lists advertised
+`sensor_msgs/msg/PointCloud2` topics; the selected cloud is transformed into the profile base frame with TF,
+downsampled on the server to at most 30,000 points, and sent as a compact binary snapshot at most twice a second.
+Source RGB is used when present; otherwise points are coloured by height. No point-cloud subscription or polling
+continues while the control is off. A missing topic, stale sample, or unavailable TF is shown as a short message.
+Fake mode exposes a synthetic table and vial cloud for trying the control without ROS or a robot.
 
 ## Files
 
@@ -830,3 +895,8 @@ browser without control is named by its typed name (STOP) or as "someone without
   picks or creates a profile. SETUP keeps the robot: Setups, Parts, TCPs; Calibration (Camera, F/T + payload, Vial, Flask);
   Cell (Cameras, Keep-out zones, Gains).
 * The named pose "home" is now "up". Programs that say "home" still work (either name finds the pose saved under the other).
+
+Policy vision checks appear in AUTOMATION before Prepare or Run, and under SETUP › Control › Policies.
+They compare the policy's training and robot configs with live ROS publisher counts; missing publishers warn without blocking a run.
+Known vision config errors that the runner would refuse fail preflight. The ⓘ note explains fixed bands, midpoint conversion, and why publisher presence does not prove fresh or valid data; use **Refresh checks** in Policies after changing configs or starting vision.
+The material vision script bundle must currently be started in a container shell: Drivers & cameras supports ROS launch/run, with no direct Python command type. See [Material vision](MATERIAL_VISION.md). Fixed band policies (round44) need the node started with `fixed_bands_robot_config` and `fixed_bands_only` (see there).

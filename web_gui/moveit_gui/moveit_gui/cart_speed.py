@@ -12,8 +12,9 @@ kinematics from the URDF (program_path.fk):
    arc length s_i is computed at each, and s(t) is a trapezoid: ramp up at the Cartesian acceleration, cruise at
    the speed, ramp down. Times come from s_i; joint velocities are dq/ds * ds/dt; accelerations are left out, so
    the JointTrajectoryController uses cubic splines through positions + velocities. Joint velocity limits (URDF x
-   Speed %) and acceleration limits (profile x Accel %) are checked on the result; if one would be exceeded, the
-   whole move is slowed (speed and acceleration together) and the log says so.
+   Speed %) and acceleration limits (profile x Accel %) are checked on those splines (spline_extrema: between the
+   points too); if one would be exceeded, the whole move is slowed (speed and acceleration together) and the log
+   says so.
 2. If that is not possible (e.g. the TCP point does not move: a pure rotation), or as a safety check after it:
    limit_speed slows the planned trajectory down uniformly until its peak is at or under the speed. That only ever
    makes a trajectory slower, so it never runs faster than asked.
@@ -80,6 +81,43 @@ def _set_secs(d, t: float):
 
 
 PointAt = Callable[[dict], np.ndarray]      # {joint: value} -> TCP point position in the base frame (m)
+SPLINE_SAMPLES = 8                          # samples per segment where the controller's cubic is checked
+
+
+def spline_extrema(t, Q, Qd):
+    """Peak |velocity| and |acceleration| per joint of the cubic Hermite splines through (t, Q, Qd), the
+    JointTrajectoryController's interpolation for positions + velocities: between the points too, not only at them."""
+    t, Q, Qd = np.asarray(t, float), np.asarray(Q, float), np.asarray(Qd, float)
+    h = np.diff(t)[:, None]
+    ok = h[:, 0] > 1e-9
+    if not np.any(ok):
+        return np.zeros(Q.shape[1]), np.zeros(Q.shape[1])
+    h, q0, q1, v0, v1 = h[ok], Q[:-1][ok], Q[1:][ok], Qd[:-1][ok], Qd[1:][ok]
+    # q(u) = a0 + a1 u + a2 u^2 + a3 u^3 on u in [0, h]
+    a2 = (3 * (q1 - q0) / h - 2 * v0 - v1) / h
+    a3 = (2 * (q0 - q1) / h + v0 + v1) / (h * h)
+    vmax = np.maximum(np.abs(v0), np.abs(v1)).max(axis=0)
+    u_star = np.where(np.abs(a3) > 1e-12, -a2 / (3 * np.where(np.abs(a3) > 1e-12, a3, 1.0)), -1.0)
+    inside = (u_star > 0) & (u_star < h)
+    v_star = v0 + 2 * a2 * u_star + 3 * a3 * u_star ** 2          # the velocity's extremum inside a segment
+    vmax = np.maximum(vmax, np.where(inside, np.abs(v_star), 0.0).max(axis=0))
+    amax = np.maximum(np.abs(2 * a2), np.abs(2 * a2 + 6 * a3 * h)).max(axis=0)   # linear: largest at an end
+    return vmax, amax
+
+
+def _spline_positions(t, Q, Qd, n: int = SPLINE_SAMPLES):
+    """Positions on the cubic splines at n - 1 times inside each segment (the points themselves excluded)."""
+    t, Q, Qd = np.asarray(t, float), np.asarray(Q, float), np.asarray(Qd, float)
+    out = []
+    for i in range(len(t) - 1):
+        h = t[i + 1] - t[i]
+        if h <= 1e-9:
+            continue
+        for k in range(1, n):
+            x = k / n
+            h00, h10, h01, h11 = 2 * x**3 - 3 * x**2 + 1, x**3 - 2 * x**2 + x, -2 * x**3 + 3 * x**2, x**3 - x**2
+            out.append((t[i] + x * h, h00 * Q[i] + h10 * h * Qd[i] + h01 * Q[i + 1] + h11 * h * Qd[i + 1]))
+    return out
 
 
 def peak_speed(traj, point_at: PointAt) -> float:
@@ -99,6 +137,19 @@ def peak_speed(traj, point_at: PointAt) -> float:
         if len(qd) == len(names):
             q2 = {n: float(q) + float(v) * h for n, q, v in zip(names, p.positions, qd)}
             peak = max(peak, float(np.linalg.norm(np.asarray(point_at(q2), float) - Pi)) / h)
+    if len(pts) >= 2 and all(len(getattr(p, "velocities", None) or []) == len(names) for p in pts):
+        # between the points, on the controller's cubic splines: a peak there is hidden from both checks above
+        t = [_secs(p.time_from_start) for p in pts]
+        Q = [list(p.positions) for p in pts]
+        Qd = [list(p.velocities) for p in pts]
+        samples = [(t[0], np.asarray(P[0]))]
+        for ts, q in _spline_positions(t, Q, Qd):
+            samples.append((ts, np.asarray(point_at(dict(zip(names, q))), float)))
+        samples.append((t[-1], np.asarray(P[-1])))
+        samples.sort(key=lambda x: x[0])
+        for (ta, pa), (tb, pb) in zip(samples, samples[1:]):
+            if tb - ta > 1e-9:
+                peak = max(peak, float(np.linalg.norm(pb - pa)) / (tb - ta))
     return peak
 
 
@@ -242,9 +293,10 @@ def constant_speed(traj, point_at: PointAt, v: float, a: float, vel_limits: dict
     for _ in range(10):
         t, sdot, T = trapezoid(s, L, v_eff, a_eff)
         Qd = dqds * sdot[:, None]
-        Qdd = np.gradient(Qd, t, axis=0)
-        rv = float(np.max(np.abs(Qd) / vlim))
-        ra = float(np.max(np.abs(Qdd) / alim))
+        Qd[0] = Qd[-1] = 0.0
+        vpk, apk = spline_extrema(t, Q, Qd)          # what the controller's splines do, between the points too
+        rv = float(np.max(vpk / vlim))
+        ra = float(np.max(apk / alim))
         if rv <= 1.0 and ra <= 1.0:
             break
         k = max(rv, math.sqrt(ra), 1.0) * 1.02       # time x k: velocities / k, accelerations / k^2

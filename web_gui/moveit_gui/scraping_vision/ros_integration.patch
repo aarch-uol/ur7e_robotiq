@@ -1,0 +1,231 @@
+--- a/ros_integration.py	2026-11-13 01:15:52.434559990 +0000
++++ b/ros_integration.py	2026-11-13 01:15:52.434974187 +0000
+@@ -19,6 +19,8 @@
+     from tf2_ros import Buffer, TransformListener, TransformBroadcaster
+     from geometry_msgs.msg import PointStamped
+     import tf2_geometry_msgs  # required to register PointStamped with TF2
++    from rclpy.time import Time
++    from std_srvs.srv import Trigger
+ except ImportError:  # pragma: no cover - exercised by the dependency-free tests
+     rclpy = None
+     Node = object
+@@ -29,6 +31,9 @@
+     cv2 = None
+     tf2_ros = None
+     Buffer = TransformListener = TransformBroadcaster = PointStamped = None
++    Time = Trigger = None
++
++import fixed_bands
+ 
+ try:
+     from ament_index_python.packages import get_package_share_directory
+@@ -39,7 +44,7 @@
+ # unavailable. The node imports them before processing its first image.
+ try:
+     from image_data import ImageData
+-    from main import process_single_image
++    from main import process_single_image, process_fixed_bands_image, detect_and_segment_vial
+ except ImportError:  # pragma: no cover - dependency-free unit-test path
+     ImageData = None
+     process_single_image = None
+@@ -92,6 +97,15 @@
+         self.declare_parameter("camera_frame", DEFAULT_CAMERA_FRAME)
+         self.declare_parameter("target_frame", DEFAULT_TARGET_FRAME)
+         self.declare_parameter("yolo_weights", DEFAULT_YOLO_WEIGHTS)
++        # fixed_band_targets for fixed-band policies: the policy's robot_config ("" = off)
++        self.declare_parameter("fixed_bands_robot_config", "")
++        self.declare_parameter("fixed_bands_stride", 2)
++        self.declare_parameter("fixed_bands_latch_frames", 5)
++        self.declare_parameter("fixed_bands_runner_node", "mujoco_policy_runner")
++        # fixed_bands_only: skip clustering, k-means and the midpoint topics (much faster); vial_cache_sec: reuse
++        # the YOLO box and GrabCut mask this long (the vial does not move; 0 = every frame)
++        self.declare_parameter("fixed_bands_only", False)
++        self.declare_parameter("vial_cache_sec", 0.0)
+ 
+         self.color_topic = str(self.get_parameter("color_topic").value)
+         self.depth_topic = str(self.get_parameter("depth_topic").value)
+@@ -208,6 +222,122 @@
+         self.get_logger().info(f'  - {self.midpoints_image_topic}')
+         self.get_logger().info(f'  - {self.world_midpoints_topic}')
+         self.get_logger().info('  - /scraping_vision/glass_mask')
++        self._setup_fixed_bands()
++
++    # ------------------------------------------------------------------
++    # fixed_band_targets
++    # ------------------------------------------------------------------
++
++    def _setup_fixed_bands(self):
++        self.fixed_bands = None
++        self.fixed_bands_only = bool(self.get_parameter("fixed_bands_only").value)
++        self.vial_cache_sec = float(self.get_parameter("vial_cache_sec").value)
++        self._vial = None
++        self._vial_lock = threading.Lock()
++        self._vial_busy = False
++        if self.fixed_bands_only:
++            self.get_logger().info(f'fixed_bands_only: no midpoint topics; vial box reused for {self.vial_cache_sec:.1f} s')
++        path = str(self.get_parameter("fixed_bands_robot_config").value or "").strip()
++        if not path:
++            self.get_logger().info('fixed_band_targets: off (no fixed_bands_robot_config)')
++            return
++        try:
++            cfg = fixed_bands.load_config(Path(path))
++            self.fixed_bands = fixed_bands.FixedBands(
++                cfg, latch_frames=int(self.get_parameter("fixed_bands_latch_frames").value))
++        except fixed_bands.FixedBandError as e:
++            self.get_logger().error(f'fixed_band_targets: off: {e}')
++            return
++        self.fixed_bands_stride = int(self.get_parameter("fixed_bands_stride").value)
++        self.fixed_bands_runner = str(self.get_parameter("fixed_bands_runner_node").value)
++        self._runner_seen = False
++        self.fixed_bands_publisher = self.create_publisher(Float32MultiArray, cfg.topic, 1)
++        self.create_service(Trigger, '~/reset_fixed_bands', self._reset_fixed_bands_srv)
++        self.create_timer(1.0, self._watch_runner)
++        self.get_logger().info(
++            f'  - {cfg.topic} (vial_bottom_z {cfg.vial_bottom_z:.4f} m, edges from {cfg.edges_from}, '
++            f'target z from {cfg.base_frame} <- {cfg.ee_frame})')
++
++    def _cached_vial(self, color_image):
++        """(yolo_rect, grabcut_mask) to reuse, or None to find the vial in this frame. An old one is still used
++        while a background thread finds the vial again, so a frame never waits for YOLO."""
++        with self._vial_lock:
++            v = self._vial
++            if v is None or self.vial_cache_sec <= 0:
++                return None
++            if time.monotonic() - v[2] > self.vial_cache_sec and not self._vial_busy:
++                self._vial_busy = True
++                threading.Thread(target=self._refresh_vial, args=(color_image.copy(),), daemon=True).start()
++            return v[0], v[1]
++
++    def _refresh_vial(self, color_image):
++        try:
++            d = detect_and_segment_vial(ImageData(color_image, None, "vial"))
++            if d.yolo_rect is not None and d.grabcut_mask is not None and np.count_nonzero(d.grabcut_mask):
++                self._keep_vial(d.yolo_rect, d.grabcut_mask)
++            else:
++                self.get_logger().warn('vial not found again: keeping the last vial box')
++                with self._vial_lock:
++                    self._vial = (self._vial[0], self._vial[1], time.monotonic())
++        except Exception as e:
++            self.get_logger().error(f'vial refresh: {e}')
++        finally:
++            with self._vial_lock:
++                self._vial_busy = False
++
++    def _keep_vial(self, rect, mask):
++        with self._vial_lock:
++            self._vial = (rect, mask, time.monotonic())
++
++    def _reset_fixed_bands(self, why):
++        if self.fixed_bands is not None:
++            self.fixed_bands.reset()
++            self.get_logger().info(f'fixed_band_targets: episode start ({why}): measuring the material again')
++
++    def _reset_fixed_bands_srv(self, _req, res):
++        self._reset_fixed_bands('reset_fixed_bands called')
++        res.success = True
++        res.message = 'material total is measured again over the next frames'
++        return res
++
++    def _watch_runner(self):
++        try:
++            names = self.get_node_names()
++        except Exception:
++            return
++        here = self.fixed_bands_runner in names
++        if here and not self._runner_seen:
++            self._reset_fixed_bands(f'{self.fixed_bands_runner} started')
++        self._runner_seen = here
++
++    def _lookup(self, target, source):
++        tf = self.tf_buffer.lookup_transform(target, source, Time(), timeout=Duration(seconds=0.05))
++        q, t = tf.transform.rotation, tf.transform.translation
++        return fixed_bands.quat_matrix(q.x, q.y, q.z, q.w), np.array([t.x, t.y, t.z])
++
++    def publish_fixed_bands(self, image_data, depth_image, camera_frame):
++        fb = self.fixed_bands
++        if fb is None or self.camera_matrix is None or image_data.contourmap is None:
++            return
++        rect = image_data.cropped_rect or image_data.yolo_rect
++        if rect is None:
++            return
++        source = self._resolve_camera_frame(camera_frame)
++        try:
++            R, t = self._lookup(fb.cfg.base_frame, source)
++            _, ee = self._lookup(fb.cfg.base_frame, fb.cfg.ee_frame)
++        except Exception as e:
++            self._warn_tf_failure(f'fixed_band_targets: {e}')
++            return
++        pts, area = fixed_bands.material_points(image_data.contourmap, depth_image, self.camera_matrix,
++                                                rect, self.fixed_bands_stride)
++        out = fb.compute(fixed_bands.to_frame(pts, R, t), area, float(ee[2]))
++        if out is None:
++            return
++        msg = Float32MultiArray()
++        msg.data = [float(v) for v in out]
++        msg.layout.dim = [MultiArrayDimension(label="occupancy_then_target_z", size=len(out), stride=1)]
++        self.fixed_bands_publisher.publish(msg)
+ 
+     # ------------------------------------------------------------------
+     # Callbacks
+@@ -284,13 +414,21 @@
+             image_data = ImageData(color_image, depth_image_float, image_name)
+             self.get_logger().debug(f'Processing frame: {image_name}')
+ 
+-            success, processed_image_data = process_single_image(image_data)
++            if self.fixed_bands_only:
++                vial = self._cached_vial(color_image)
++                success, processed_image_data = process_fixed_bands_image(image_data, vial)
++                if success and vial is None:
++                    self._keep_vial(processed_image_data.yolo_rect, processed_image_data.grabcut_mask)
++            else:
++                success, processed_image_data = process_single_image(image_data)
+ 
+             if success:
+                 if not self.context.ok():
+                     return
+ 
+-                if processed_image_data.final_midpoints is not None:
++                if self.fixed_bands_only:
++                    pass                                   # no midpoints in this mode
++                elif processed_image_data.final_midpoints is not None:
+                     # Publish pixel midpoints + image
+                     self.publish_midpoints(
+                         processed_image_data.final_midpoints,
+@@ -328,6 +466,11 @@
+                     self.publish_world_midpoints([])
+                     self.get_logger().debug('No midpoints detected in this frame')
+ 
++                try:
++                    self.publish_fixed_bands(processed_image_data, depth_image_float, camera_frame)
++                except Exception as e:
++                    self.get_logger().error(f'fixed_band_targets: {e}')
++
+                 # Publish glass mask
+                 if processed_image_data.glass_mask is not None:
+                     self.publish_glass_mask(processed_image_data.glass_mask, camera_frame)
+@@ -335,10 +478,14 @@
+                         self.get_logger().info(
+                             f'Glass coverage: {processed_image_data.glass_percentage:.2f}% of vial area'
+                         )
+-            else:
++            elif not self.fixed_bands_only:
+                 self.publish_midpoints([])
+                 self.publish_world_midpoints([])
+                 self.get_logger().debug('Processing failed for this frame')
++            else:
++                with self._vial_lock:
++                    if not self._vial_busy:                # find the vial again next frame
++                        self._vial = None
+ 
+         except Exception as e:
+             self.get_logger().error(f'Error processing images: {str(e)}')
+@@ -550,7 +697,8 @@
+         print(f'Error running vision node: {str(e)}')
+     finally:
+         cv2.destroyAllWindows()
+-        rclpy.shutdown()
++        if rclpy.ok():
++            rclpy.shutdown()
+ 
+ 
+ if __name__ == '__main__':

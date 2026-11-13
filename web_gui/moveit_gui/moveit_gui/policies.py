@@ -779,7 +779,15 @@ class PolicyLibrary:
             got = self.ft_axes() if self.ft_axes else None
         except Exception:
             return None
-        return got if got and got[1] else None
+        return got if got and got[1] and not got[1].get("stale") else None
+
+    def ft_axes_stale(self) -> Optional[str]:
+        """Why the saved Match result cannot be used now (the reading axes changed since), or None."""
+        try:
+            got = self.ft_axes() if self.ft_axes else None
+        except Exception:
+            return None
+        return (got[1] or {}).get("stale") if got else None
 
     def command_for(self, name: str, recording: Optional[RecordingOptions] = None, duration=None,
                     log=print) -> List[str]:

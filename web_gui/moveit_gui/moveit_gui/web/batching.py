@@ -68,6 +68,7 @@ class BatchCommands:
     def cmd_batch_save(self, batch=None):
         if not self.program_path:
             raise self._err("save the program first: the batch is kept next to it")
+        self._own(self._program_owner())            # next to another person's program: theirs, not yours
         d = self._batch_def(batch)
         p = batch_path(self.program_path)
         save(p, d)

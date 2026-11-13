@@ -388,6 +388,24 @@ def test_http_static_info_and_json_only_posts(http):
         assert e.value.code == 404
 
 
+def test_http_pointcloud_topics_binary_packet_and_short_error(http):
+    base, _, bridge = http
+    with urllib.request.urlopen(base + "/api/pointcloud/topics", timeout=5) as r:
+        topics = json.loads(r.read())
+    assert topics["ok"] and any(x["topic"] == "/zed/zed_node/point_cloud/cloud_registered" for x in topics["topics"])
+
+    with urllib.request.urlopen(base + "/api/pointcloud?topic=/zed/zed_node/point_cloud/cloud_registered", timeout=5) as r:
+        packet = r.read()
+        assert r.headers["Content-Type"] == "application/octet-stream"
+        assert r.headers["X-Pointcloud-Count"]
+    assert packet[:4] == b"PCD1" and len(packet) < 30000 * 15
+
+    bridge.fake_point_cloud_age = 3.0
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(base + "/api/pointcloud?topic=/zed/zed_node/point_cloud/cloud_registered", timeout=5)
+    assert error.value.code == 409 and json.loads(error.value.read())["msg"] == "point cloud is stale"
+
+
 def test_http_events_stream_state(http):
     base, _, _ = http
     with urllib.request.urlopen(base + "/api/events", timeout=5) as r:
@@ -532,3 +550,28 @@ def test_http_events_stream_live_ft_and_joints_at_30_hz(http):
                     live = json.loads(data[len("data: "):])
     assert counts["live"] >= 2.5 * counts["state"] and counts["live"] >= 30, counts
     assert len(live["wrench"]) == 6 and len(live["joints_deg"]) == 6 and "ft_samples" in live
+
+
+def test_policy_vision_warnings_are_shared_and_do_not_block(env):
+    import yaml
+    from moveit_gui.policies import PolicyManifest
+    s, bridge, _, root = env
+    training, robot = root / 'training.yaml', root / 'robot.yaml'
+    training.write_text('observation:\n  cluster_mode: fixed_band_targets\n  cluster_position_components: [z]\n')
+    robot.write_text('band_sorting:\n  enabled: false\n')
+    m = PolicyManifest(name='bands', command=['true'], required_mode='position',
+                       files={'training_config': str(training), 'robot_config': str(robot)})
+    s.core.policies.library.manifests[m.name] = m
+    req = [r for r in s.core.policies.requirements('bands') if r.label == 'Policy vision']
+    assert len(req) == 1 and req[0].state == 'warn'
+    assert not any('fixed band targets' in p for p in s.core.policies.preflight('bands'))
+    listing = s.cmd_policy_list()['policies'][0]
+    assert listing['vision_issues'] == [{'detail': req[0].detail, 'blocking': False}]
+    bridge.fake_published.add('/scraping_vision/fixed_band_targets')
+    assert not s.cmd_policy_list()['policies'][0]['vision_issues']
+    assert not [r for r in s.core.policies.requirements('bands') if r.label == 'Policy vision']
+    robot.write_text(yaml.safe_dump({'band_sorting': {'enabled': True, 'vial_bottom_z': None}}))
+    req = [r for r in s.core.policies.requirements('bands') if r.label == 'Policy vision']
+    assert len(req) == 1 and req[0].state == 'fail'
+    assert any('runner would refuse' in p for p in s.core.policies.preflight('bands'))
+    assert any('runner would refuse' in p for p in s.core.policies.program_problems(m))

@@ -432,3 +432,34 @@ def test_retime_linear_falls_back_to_the_uniform_slowdown(planar):
     assert any("constant 20.0 mm/s" in x for x in lines)
     assert not any("slowed" in x for x in lines)
     assert cart_speed.peak_speed(traj, at2) <= 0.02 * 1.02
+
+
+def test_the_joint_limits_are_kept_between_the_points_of_a_short_move():
+    """Two points, 0.5 mm of TCP travel but 0.1 rad of joint motion (a point 5 mm from the axis): both ends are at
+    rest, so only the controller's cubic between them shows the joint speed. The retimed move keeps the limits."""
+    traj = SimpleNamespace(joint_names=["j1"], points=[
+        SimpleNamespace(positions=[0.0], velocities=[], accelerations=[], time_from_start=_dur(0.0)),
+        SimpleNamespace(positions=[0.1], velocities=[], accelerations=[], time_from_start=_dur(1.0))])
+    point_at = lambda q: np.array([0.005 * math.cos(q["j1"]), 0.005 * math.sin(q["j1"]), 0.0])   # noqa: E731
+    info = cart_speed.constant_speed(traj, point_at, 0.010, 0.5, {"j1": 1.0}, {"j1": 5.0})
+    t = [_secs(p.time_from_start) for p in traj.points]
+    Q = [p.positions for p in traj.points]
+    Qd = [p.velocities for p in traj.points]
+    vpk, apk = cart_speed.spline_extrema(t, Q, Qd)
+    assert vpk[0] <= 1.0 + 1e-6 and apk[0] <= 5.0 + 1e-6
+    assert info["slowed"] > 1.0
+    # dense check of the same spline: the closed form found the real peaks
+    ts = np.linspace(t[0], t[-1], 2001)
+    from scipy.interpolate import CubicHermiteSpline
+    sp = CubicHermiteSpline(t, np.asarray(Q)[:, 0], np.asarray(Qd)[:, 0])
+    assert np.max(np.abs(sp(ts, 1))) == pytest.approx(vpk[0], rel=1e-3)
+    assert np.max(np.abs(sp(ts, 2))) == pytest.approx(apk[0], rel=1e-3)
+
+
+def test_peak_speed_sees_a_tcp_peak_between_the_points():
+    traj = SimpleNamespace(joint_names=["j1"], points=[
+        SimpleNamespace(positions=[0.0], velocities=[0.0], accelerations=[], time_from_start=_dur(0.0)),
+        SimpleNamespace(positions=[0.1], velocities=[0.0], accelerations=[], time_from_start=_dur(0.1))])
+    point_at = lambda q: np.array([0.5 * math.cos(q["j1"]), 0.5 * math.sin(q["j1"]), 0.0])   # noqa: E731
+    # mean 0.5 m/s; a cubic from rest to rest peaks at 1.5x the mean in the middle
+    assert cart_speed.peak_speed(traj, point_at) == pytest.approx(0.75, rel=0.03)

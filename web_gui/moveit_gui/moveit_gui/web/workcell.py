@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .. import bases as B
+from .. import ft_axes as FA
 from .. import handeye as he
 from .. import parts as P
 from .. import robots as R
@@ -34,6 +35,22 @@ RESTART_STACK, RESTART_GUI = 75, 76
 PARTS_VERIFY_S = 10.0
 SETUP_CHECK_S = 5.0          # how often the state compares the files in use with the loaded setup
 
+
+
+def tcp_frames(tcps: dict, model: dict, other_frames=()) -> list:
+    """Static TF [(parent, name, T)] for the virtual TCPs, so nodes outside the GUI (a policy runner's ee_frame,
+    e.g. spatula_tip) can look them up. Only TCPs whose parent is a model link, a part frame or another published
+    TCP, and whose name is no link or part frame already. TF only: MoveIt's geometry does not change."""
+    links = set(model.get("links", {}))
+    taken = links | set(other_frames)
+    virt = {n: t for n, t in tcps.items() if t.type == "virtual" and t.T_parent_tcp is not None and n not in taken}
+    out, done = [], set()
+    for _ in range(len(virt)):                      # parents first (a TCP on a TCP)
+        for n, t in virt.items():
+            if n not in done and (t.parent in taken or t.parent in done):
+                out.append((t.parent, n, np.asarray(t.T_parent_tcp, float)))
+                done.add(n)
+    return out
 
 class WorkcellCommands:
     # ------------------------------------------------------------------ init / tick
@@ -61,7 +78,7 @@ class WorkcellCommands:
         self._drivers_init()
         self.he: dict = {"topic": "", "info_topic": "", "mount": "eye_in_hand", "K": None, "D": None,
                          "frame": "", "samples": [], "result": None, "poses": [], "last": None,
-                         "ee_link": "", "base_link": "", "method": "park",
+                         "ee_link": "", "base_link": "", "method": "park", "sensor_frame": "",
                          "progress": {"running": False, "done": 0, "total": 0, "error": ""}}
 
     def _base_model(self) -> dict:
@@ -128,6 +145,7 @@ class WorkcellCommands:
             self._tcp_checked = self.model_rev
             self._tcp_check(m)
         frames, objects = P.live_plan(self.parts, m)
+        frames = frames + tcp_frames(self.core.store.tcps, m, {child for _, child, _ in frames})
         sig = repr([(a, b, np.round(T, 6).tolist()) for a, b, T in frames] +
                    [(o["id"], o["link"],
                      [(np.round(x["T_link_obj"], 6).tolist(), x["geom"]) for x in o.get("geoms", [])],
@@ -606,6 +624,50 @@ class WorkcellCommands:
         return self._ok(f"base '{B.BASES[base][0]}': restarting the robot stack and the GUI (about a minute)",
                         restart="stack")
 
+    # ------------------------------------------------------------------ F/T reading axes (ft_axes.py)
+    def ft_axes_view(self) -> dict:
+        b = self.core.ft_bias
+        if not b.available:
+            return {"available": False, "why": "no F/T broadcaster in this profile"}
+        run = b.axes if b.live is not None else None
+        nxt = FA.read_next(config_dir(), b.node)
+        return {"available": True, "node": b.node, "running": FA.label(run), "next": FA.label(nxt),
+                "running_name": FA.rotation_deg(run) if run else None, "next_name": FA.rotation_deg(nxt),
+                "pending": run is not None and list(run) != list(nxt), "choices": FA.CHOICES,
+                "why": "" if run is not None else (b.error or "the F/T broadcaster was not read yet")}
+
+    def cmd_ft_axes_get(self):
+        return self._ok(ft_axes=self.ft_axes_view())
+    cmd_ft_axes_get.read_only = True
+
+    def cmd_ft_axes_save(self, x, y, restart=False, confirm=False):
+        """Keep the reading axes for the next stack start; with restart, restart the robot stack now."""
+        b = self.core.ft_bias
+        if not b.available:
+            raise FA.FtAxesError("no F/T broadcaster in this profile")
+        m = FA.mapping(x, y)
+        if restart:
+            why = self._restart_refusal()
+            if why:
+                raise FA.FtAxesError(why)
+            if self.core.mode not in ("unknown",) and not self.core.modes.mode_supports_moveit(self.core.mode):
+                raise FA.FtAxesError(f"change to Position first (now '{self.core.mode}')")
+            if self.on_restart is None:
+                raise FA.FtAxesError("this GUI was not started by the launcher (ur7e_gui.sh): the axes are used at "
+                                     "the next stack start")
+            if not confirm:
+                raise FA.FtAxesError("confirm the restart of the robot stack")
+        FA.write_next(config_dir(), m, b.node)
+        lb = FA.label(m)
+        txt = f"X reads sensor {lb['x']}, Y {lb['y']}, Z {lb['z']}"
+        self.core.bridge.log(f"F/T reading axes set: {txt} (next stack start)")
+        if restart:
+            self._restart(RESTART_STACK, f"F/T reading axes set: {txt}")
+            return self._ok("F/T reading axes saved: restarting the robot stack and the GUI (about a minute)",
+                            restart="stack", ft_axes=self.ft_axes_view())
+        return self._ok("F/T reading axes saved: used after the next robot stack restart",
+                        ft_axes=self.ft_axes_view())
+
     # ------------------------------------------------------------------ robot: arm, real / fake, gripper, F/T, cameras
     def robot_view(self) -> dict:
         return R.view(config_dir(), self.core.fake)
@@ -1052,8 +1114,9 @@ class WorkcellCommands:
                      if o["image"] and info and "depth" not in o["topic"]]
         cams = mine + [c for c in cams if all(m["topic"] != c["topic"] for m in mine)]
         res = None
+        T_so = self._he_T_sensor_optical()
         if r:
-            xyz, rpy = tf.T_to_mm_deg(r["X"])
+            xyz, rpy = tf.T_to_mm_deg(r["X"] @ tf.inv(T_so))         # shown and edited in the picked camera frame
             res = {k: v for k, v in r.items() if k not in ("X", "T_board")}
             res.update(xyz_mm=[round(v, 2) for v in xyz], rpy_deg=[round(v, 3) for v in rpy])
         return {"board": self.cams.board, "cameras": cams, "saved": self.cams.view(), "topic": h["topic"],
@@ -1065,7 +1128,52 @@ class WorkcellCommands:
                 "flange": self._he_ee(), "base": self._he_base(), "links": self._he_links(),
                 "default_ee": self.core.profile.planning_link, "default_base": self.core.profile.base_link,
                 "method": h["method"], "methods": list(he.METHODS),
+                "sensor": self._he_sensor(), "sensor_frames": self._he_sensor_frames(),
+                "T_sensor_optical": [round(float(v), 7) for v in T_so.reshape(-1)],
                 "min_samples": he.MIN_SAMPLES, "good_samples": he.GOOD_SAMPLES}
+
+    def _he_sensor(self) -> str:
+        return self.he["sensor_frame"] or self.he["frame"]
+
+    def _he_sensor_frames(self) -> list:
+        """The camera driver's own TF tree (e.g. d405_link > d405_color_frame > d405_color_optical_frame): the frames
+        the result can be given in, like MoveIt's sensor frame. Stops at the robot (a camera part hangs on it)."""
+        opt = self.he["frame"]
+        if not opt:
+            return []
+        par = self.core.bridge.tf_parents() if hasattr(self.core.bridge, "tf_parents") else {}
+        stop = set(self._robot_links()) | {n for n, q in self.parts.parts.items() if not (q.meta or {}).get("camera")}
+        root, hops = opt, 0
+        while root in par and par[root] not in stop and hops < 10:
+            root, hops = par[root], hops + 1
+        kids: Dict[str, list] = {}
+        for c, p_ in par.items():
+            kids.setdefault(p_, []).append(c)
+        out, todo = [], [root]
+        while todo and len(out) < 50:
+            f = todo.pop()
+            out.append(f)
+            todo += kids.get(f, [])
+        return sorted(set(out) | {opt})
+
+    def _he_T_sensor_optical(self) -> np.ndarray:
+        s, opt = self._he_sensor(), self.he["frame"]
+        if not opt or s == opt:
+            return np.eye(4)
+        T = self.core.bridge.lookup_transform(s, opt)
+        return T if T is not None else np.eye(4)
+
+    def cmd_handeye_sensor(self, frame=""):
+        """The camera frame the result is given, edited and saved in (default: the optical frame of the image)."""
+        self._he_require()
+        frame = str(frame or "").strip()
+        if frame and frame != self.he["frame"]:
+            if frame not in self._he_sensor_frames():
+                raise he.HandEyeError(f"{frame} is not in the camera's TF tree")
+            if self.core.bridge.lookup_transform(frame, self.he["frame"]) is None:
+                raise he.HandEyeError(f"no TF {frame} -> {self.he['frame']}")
+        self.he["sensor_frame"] = "" if frame == self.he["frame"] else frame
+        return self._ok(f"results in {self._he_sensor()}", he=self.he_view())
 
     def _he_ee(self) -> str:
         return self.he["ee_link"] or self.core.profile.planning_link
@@ -1116,6 +1224,8 @@ class WorkcellCommands:
                        size=(int(info["width"]), int(info["height"])),
                        ee_link="" if ee == p.planning_link else ee, base_link="" if base == p.base_link else base,
                        frame=info["frame_id"], samples=[], result=None, poses=[], last=None)
+        if self.he["sensor_frame"] and self.he["sensor_frame"] not in self._he_sensor_frames():
+            self.he["sensor_frame"] = ""
         self.core.bridge.log(f"hand-eye: {mount} with {topic} ({info['width']}x{info['height']}, frame "
                              f"{info['frame_id']}), {base} -> {ee}")
         return self._ok(f"calibrating {topic} ({mount.replace('_', '-')})", he=self.he_view())
@@ -1381,7 +1491,7 @@ class WorkcellCommands:
                 raise he.HandEyeError("the adjusted pose is x, y, z in mm and roll, pitch, yaw in deg") from None
             if len(xyz) != 3 or len(rpy) != 3 or not all(np.isfinite(xyz + rpy)):
                 raise he.HandEyeError("the adjusted pose is x, y, z in mm and roll, pitch, yaw in deg")
-            X = tf.mm_deg_to_T(xyz, rpy)
+            X = tf.mm_deg_to_T(xyz, rpy) @ self._he_T_sensor_optical()          # typed in the camera frame
             dmm = float(np.linalg.norm(X[:3, 3] - r["X"][:3, 3]) * 1000)
             ddeg = float(np.degrees(tf.rotation_angle(r["X"][:3, :3].T @ X[:3, :3])))
             if dmm > 0.05 or ddeg > 0.005:
@@ -1393,7 +1503,9 @@ class WorkcellCommands:
                            self._he_base(), r, self.he["samples"], self.he["K"])
         if r.get("loaded") and not self.he["samples"] and old:     # re-saved after a check: keep its samples
             e.update(sample_data=old.get("sample_data", []), samples=old.get("samples", 0))
-            self.cams._write()
+        e["sensor_frame"] = self._he_sensor()
+        e["T_parent_sensor"] = he._T(r["X"] @ tf.inv(self._he_T_sensor_optical()))
+        self.cams._write()
         msg = f"camera {name} saved ({e['verdict']}" + (f", adjusted by hand {r['edited']['mm']} mm / "
                                                          f"{r['edited']['deg']} deg" if r.get("edited") else "") + ")"
         if as_part:
@@ -1410,6 +1522,7 @@ class WorkcellCommands:
         base = e.get("base_link") or (e["parent"] if e["mount"] == "eye_to_hand" else p.base_link)
         self.cmd_handeye_start(e["topic"], e.get("info_topic", ""), e["mount"], ee_link=ee, base_link=base)
         self.he["method"] = e.get("method", "park")
+        self.he["sensor_frame"] = e.get("sensor_frame", "") if e.get("sensor_frame") in self._he_sensor_frames() else ""
         self.he["result"] = {"X": self.cams.T_parent_optical(str(name)), "mount": e["mount"], "method": self.he["method"],
                              "verdict": e["verdict"], "rms_mm": e["rms_mm"], "rms_deg": e["rms_deg"],
                              "per_sample": [], "methods": e.get("methods", {}), "orientation_spread_deg": "—",

@@ -191,7 +191,7 @@ class PayloadCalibration:
         if np.linalg.norm(tb[:3]) > 0.75 or np.linalg.norm(tb[3:]) > 0.05:
             quality.setdefault("warnings", []).append(
                 f"the reading carries a constant bias of {np.linalg.norm(tb[:3]):.2f} N / "
-                f"{np.linalg.norm(tb[3:]):.3f} Nm (fitted out): after Apply, press Zero now once")
+                f"{np.linalg.norm(tb[3:]):.3f} Nm (fitted out; Apply moves the F/T bias by it, no Zero needed)")
         self.result = PayloadResult(float(mass), [float(v) for v in cog], quality, info, got)
         return self.result
 

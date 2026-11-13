@@ -431,6 +431,8 @@ export function workcell(ctx) {
       h("option", { value: "eye_to_hand" }, "fixed in the cell (eye-to-hand)"));
     const eeSel = h("select", { id: "he-ee", title: "The link the camera is fixed to (eye-in-hand), or the link that holds the board (eye-to-hand)" });
     const baseSel = h("select", { id: "he-base", title: "The fixed frame: the robot base, or any link that does not move with the arm" });
+    const sensorSel = h("select", { id: "he-sensor", title: "The camera frame the result is given, adjusted and saved in (like MoveIt's sensor frame); the optical frame by default",
+      onchange: () => cmd("handeye_sensor", { frame: sensorSel.value }).then((r) => r.ok && fill(r.he)) });
     const solverSel = h("select", { id: "he-solver", title: "The OpenCV solver whose result is used; the others are shown as a cross-check",
       onchange: () => cmd("handeye_solve", { method: solverSel.value }).then((r) => r.ok && fill(r.he)) },
       ...["park", "tsai", "horaud", "andreff", "daniilidis"].map((m) => h("option", { value: m }, m[0].toUpperCase() + m.slice(1))));
@@ -444,7 +446,8 @@ export function workcell(ctx) {
           h("span", { class: "k" }, "Camera"), h("div", { class: "row" }, camSel, h("input", { type: "text", id: "he-topic", placeholder: "or an image topic", style: "flex:1" })),
           h("span", { class: "k" }, "Mounted"), mount,
           h("span", { class: "k" }, "End effector"), eeSel,
-          h("span", { class: "k" }, "Base"), baseSel),
+          h("span", { class: "k" }, "Base"), baseSel,
+          h("span", { class: "k" }, "Camera frame"), sensorSel),
         h("div", { class: "row" }, lease(stepBtn(btn("Start", "", () => start(), "Read the camera's intrinsics and begin (clears the samples)"), 1)),
           h("span", { class: "muted small grow", id: "he-intr" }))),
       h("div", { class: "card" }, h("div", { class: "section" }, "2 · Board"),
@@ -570,7 +573,7 @@ export function workcell(ctx) {
       const v = ctx.view3d(), p = pose();
       if (!v) return;
       if (!p || !C.parentT) { v.setCloudPose(null); return; }
-      v.setCloudPose(C.parentT, p.xyz, p.rpy);
+      v.setCloudPose(C.parentT, p.xyz, p.rpy, C.data?.T_sensor_optical);
     }
     function fillEdit(force) {
       const r = C.data?.result;
@@ -627,6 +630,12 @@ export function workcell(ctx) {
       eeSel.onchange = () => (eeSel.dataset.touched = "1"); baseSel.onchange = () => (baseSel.dataset.touched = "1");
       if (d.links && d.links.length) { opts(eeSel, d.flange, d.default_ee); opts(baseSel, d.base, d.default_base); }
       if (document.activeElement !== solverSel) solverSel.value = d.method || "park";
+      const sf = d.sensor_frames || [];
+      if (document.activeElement !== sensorSel) {
+        sensorSel.replaceChildren(...sf.map((f) => h("option", { value: f }, f + (f === d.frame ? " (optical)" : ""))));
+        sensorSel.value = d.sensor || "";
+      }
+      sensorSel.disabled = sf.length < 2;
       const b = d.board;
       [["he-bx", b.squares_x], ["he-by", b.squares_y], ["he-bs", b.square_mm], ["he-bm", b.marker_mm], ["he-bd", b.dict]].forEach(([id, v]) => {
         if (document.activeElement?.id !== id) $("#" + id).value = v; });
@@ -638,7 +647,7 @@ export function workcell(ctx) {
       $("#he-intr").textContent = i ? `Camera ready · fx ${i.fx.toFixed(1)} fy ${i.fy.toFixed(1)} · cx ${i.cx.toFixed(1)} cy ${i.cy.toFixed(1)}` +
         (i.D.some((x) => Math.abs(x) > 1e-9) ? " · distortion " + i.D.map((x) => x.toFixed(3)).join(" ") : " · no distortion") : "Not started";
       status(d.last);
-      const rk = d.result ? JSON.stringify([d.result.xyz_mm, d.result.rpy_deg]) : "";
+      const rk = d.result ? JSON.stringify([d.result.xyz_mm, d.result.rpy_deg, d.sensor]) : "";
       if (rk !== C.resKey) { C.resKey = rk; C.edit = null; fillEdit(true); place(); editNote(); }
       cloudLoop();
       const n = d.samples.length, good = d.good_samples || 12;
@@ -655,7 +664,7 @@ export function workcell(ctx) {
         h("div", { class: "row" }, chip(r.verdict.toUpperCase(), r.verdict === "good" ? "ok" : r.verdict === "usable" ? "warn" : "err"),
           h("span", { class: "small" }, `the ${r.n} samples put the board within ${r.rms_mm} mm / ${r.rms_deg}° (rms)`)),
         h("div", { class: "grid small", style: "grid-template-columns:auto 1fr" },
-          h("span", { class: "k" }, r.mount === "eye_in_hand" ? `${d.flange} → camera` : `${d.base} → camera`),
+          h("span", { class: "k" }, `${r.mount === "eye_in_hand" ? d.flange : d.base} → ${d.sensor || "camera"}`),
           h("span", { class: "mono" }, `${r.xyz_mm.join(", ")} mm`), h("span", { class: "k" }, "R P Y"), h("span", { class: "mono" }, `${r.rpy_deg.join(", ")} °`),
           h("span", { class: "k" }, `vs ${r.method || "park"}`), h("span", { class: "mono" }, Object.entries(r.methods).map(([k, v]) => `${k} ${v.mm} mm / ${v.deg}°`).join(" · ")),
           h("span", { class: "k" }, "orientation spread"), h("span", {}, `${r.orientation_spread_deg}°`)),

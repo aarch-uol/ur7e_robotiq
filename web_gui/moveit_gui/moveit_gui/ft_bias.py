@@ -7,6 +7,10 @@ TopicSensorBridge hands to the admittance controller, so one change applies ever
 
     published = raw - bias            (bias = -offset)
 
+With turned reading axes (ft_axes.py: the broadcaster publishes (sensor + offset) * multiplier, multiplier ±1, each
+axis reading one sensor axis) the bias stays in published units: offset = -bias * multiplier. A saved bias keeps
+the axes it was made in and is turned to the running ones before it is compared or applied again.
+
 * Zero now: averages the published wrench for `zero_s` with the arm still, then bias += mean, so the current
   load reads 0. Refused if the reading moves more than `max_spread_*` (someone touching the tool, vibration).
   With a payload loaded on the admittance controller (gravity_compensation.CoG, from the payload calibration),
@@ -42,6 +46,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+from . import ft_axes as FA
 
 PARAMS = ["offset.force.x", "offset.force.y", "offset.force.z",
           "offset.torque.x", "offset.torque.y", "offset.torque.z"]
@@ -93,6 +99,7 @@ class FtBias:
         self.bridge, self.log, self.refusal = bridge, log, refusal
         self.settings_path = settings_path
         self.live: Optional[List[float]] = None          # bias on the broadcaster, last read
+        self.axes: FA.Mapping = list(FA.IDENTITY)       # the broadcaster's reading axes, last read
         self.error = ""
         self.read_at = 0.0
         self.busy = ""                                   # "zeroing" while sampling
@@ -117,7 +124,7 @@ class FtBias:
     def read(self) -> Tuple[bool, str]:
         if not self.available:
             return False, "no F/T broadcaster in this profile"
-        got = self.bridge.get_node_parameters(self.node, PARAMS)
+        got = self.bridge.get_node_parameters(self.node, PARAMS + FA.param_names())
         if got is None:
             self.live, self.error = None, f"{self.node} is not running (its parameter service did not answer)"
             return False, self._unreadable(self.error)
@@ -126,7 +133,8 @@ class FtBias:
             self.error = (f"{self.node} has no offset parameters: force_torque_sensor_broadcaster older than "
                           "ros2_controllers 4.x cannot take a software bias")
             return False, self._unreadable(self.error)
-        self.live = [-float(got[p]) + 0.0 for p in PARAMS]
+        self.axes = FA.from_params(got) or list(FA.IDENTITY)
+        self.live = [-float(got[p]) * s + 0.0 for p, (s, _) in zip(PARAMS, self.axes)]
         self.read_at, self.error = time.time(), ""
         if not self._seen or self._unread:              # GUI start, or the broadcaster is back: say what it has
             self._seen, self._unread = True, ""
@@ -192,14 +200,16 @@ class FtBias:
 
     # ------------------------------------------------------------------ apply
     def _send(self, bias: List[float], how: str) -> Tuple[bool, str]:
-        ok, msg = self.bridge.set_node_parameters(self.node, {p: float(-b) + 0.0 for p, b in zip(PARAMS, bias)})
+        ok, msg = self.bridge.set_node_parameters(
+            self.node, {p: float(-b) * sgn + 0.0 for p, b, (sgn, _) in zip(PARAMS, bias, self.axes)})
         if not ok:
             self.read()
             return False, f"F/T bias not set: {msg}"
         self.read()
         if not _same(self.live, bias):
             return False, f"F/T bias read back as {_fmt(self.live) if self.live else 'nothing'}, not {_fmt(bias)}"
-        self.last = {"bias": _r(bias), "at": time.strftime("%Y-%m-%d %H:%M:%S"), "how": how}
+        self.last = {"bias": _r(bias), "at": time.strftime("%Y-%m-%d %H:%M:%S"), "how": how,
+                     "axes": FA.encode(self.axes)}
         self._save()
         raw = all(abs(x) < EPS for x in bias)
         text = "F/T bias cleared: the reading is the raw sensor value" if raw else f"F/T bias set ({how}): {_fmt(bias)}"
@@ -219,13 +229,16 @@ class FtBias:
             return False, why
         self._blocked = ""
         last = dict(self.last)
+        turned = (FA.decode(last.get("axes")) or FA.IDENTITY) != self.axes
+        last["bias"] = self.saved_bias(last)
         ok, msg = self._send(list(last["bias"]), last.get("how", "restored"))
         if ok:
             self.last = {**self.last, "at": last.get("at", self.last["at"]),
                          "restored": time.strftime("%Y-%m-%d %H:%M:%S")}
             self._save()
             self.log(f"F/T bias restored after the F/T broadcaster restarted (set {last.get('at')}, "
-                     f"{last.get('how')}): {_fmt(last['bias'])}")
+                     f"{last.get('how')}): {_fmt(last['bias'])}"
+                     + (" (turned to the new reading axes)" if turned else ""))
         return ok, msg
 
     def _reading_in_use(self) -> Optional[str]:
@@ -302,12 +315,28 @@ class FtBias:
         ok, msg = self._send(new, "zeroed, payload kept" if exp else "zeroed")
         return ok, (msg + f". {note}" if ok and exp else msg)
 
+    def shift(self, by: List[float], how: str = "zeroed, payload kept") -> Tuple[bool, str]:
+        """Move the bias by a constant: the payload fit's constant offset (published = weight + offset). After it
+        the reading is tool weight + contact, as a Zero now with the payload loaded would leave it, at any pose."""
+        why = self.why_not()
+        if why:
+            return False, why
+        ok, msg = self.read()
+        if not ok:
+            return False, msg
+        try:
+            new = self.check([a + float(b) for a, b in zip(self.live, by)])
+        except FtBiasError as e:
+            return False, f"F/T bias not moved: {e}"
+        return self._send(new, how)
+
     # ---------------------------------------------------------------- presets
     def save_preset(self, name: str, bias) -> Tuple[bool, str]:
         name = (name or "").strip()
         if not name or len(name) > 40:
             raise FtBiasError("a set needs a name of 1 to 40 characters")
-        self.presets[name] = {"bias": _r(self.check(bias)), "at": time.strftime("%Y-%m-%d %H:%M")}
+        self.presets[name] = {"bias": _r(self.check(bias)), "at": time.strftime("%Y-%m-%d %H:%M"),
+                              "axes": FA.encode(self.axes)}
         self._save()
         return True, f"F/T bias set '{name}' saved (not applied)"
 
@@ -342,22 +371,31 @@ class FtBias:
             return f"the F/T bias cannot be read ({msg})"
         if self.lost():
             return ("the F/T bias was lost (the robot stack restarted, the sensor's own offset is back): "
-                    "SETUP > F/T + Payload: re-apply it or press Zero now")
+                    "SETUP > F/T + Payload: re-apply it or press Zero, keep tool weight")
         if all(abs(x) < EPS for x in (self.live or [])):
-            return "the F/T bias is not set (raw sensor, its offset reads as a push): SETUP > F/T + Payload: Zero now"
+            return "the F/T bias is not set (raw sensor, its offset reads as a push): SETUP > F/T + Payload: Zero, keep tool weight"
         if self.last and self.last.get("how") == "zeroed":
-            return ("the last F/T zero removed the tool weight too (Zero all, or a zero before the payload was "
-                    "applied): the controller would subtract it twice. SETUP > F/T + Payload: Zero now")
+            return ("the last F/T zero removed the tool weight too (Zero incl. tool weight, or a zero before the payload was "
+                    "applied): the controller would subtract it twice. SETUP > F/T + Payload: Zero, keep tool weight")
         return None
+
+    def saved_bias(self, rec: Optional[dict]) -> Optional[List[float]]:
+        """A saved bias (last or a set) in the running reading axes."""
+        if not rec:
+            return None
+        return _r(FA.convert(rec["bias"], FA.decode(rec.get("axes")), self.axes))
 
     def lost(self) -> bool:
         """The last bias this GUI applied is no longer on the broadcaster (it restarted with its YAML)."""
-        return bool(self.last and self.live is not None and not _same(self.live, self.last["bias"]))
+        return bool(self.last and self.live is not None and not _same(self.live, self.saved_bias(self.last)))
 
     def view(self) -> dict:
         raw = self.live is not None and all(abs(x) < EPS for x in self.live)
         return {"available": self.available, "node": self.node, "bias": _r(self.live) if self.live else None,
-                "raw": raw, "error": self.error, "busy": self.busy, "last": self.last,
-                "lost": self.lost(), "presets": self.presets, "why_not": self.why_not(),
+                "raw": raw, "error": self.error, "busy": self.busy,
+                "last": self.last and {**self.last, "bias": self.saved_bias(self.last)},
+                "lost": self.lost(), "why_not": self.why_not(),
+                "presets": {k: {**v, "bias": self.saved_bias(v)} for k, v in self.presets.items()},
+                "axes": FA.label(self.axes),
                 "auto_restore": bool(self.cfg.get("auto_restore", True)), "restore_waits": self._blocked,
                 "limits": [self.cfg["max_force_n"], self.cfg["max_torque_nm"]]}

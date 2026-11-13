@@ -135,7 +135,7 @@ next start.
    tip…** on the tool part and make that TCP active in the top bar. Parts work at once; **Restart robot stack**
    (banner) also writes them into the robot model. Or **TCPs**: add the tool tip as a plain virtual TCP (e.g.
    `spatula_tip` = `robotiq_tcp` + 150 mm in Z).
-2. **F/T + Payload**: with the tool on and nothing touching it, press **Zero now** (F/T bias), collect the
+2. **F/T + Payload**: with the tool on and nothing touching it, press **Zero, keep tool weight** (F/T bias), collect the
    calibration poses (one at a time, or Collect all poses), Evaluate, then **Apply to admittance**. The
    **Saved** block shows what is kept: the payload restored before every switch to Admittance, and the bias
    restored after a stack restart.

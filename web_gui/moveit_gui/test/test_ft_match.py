@@ -34,6 +34,18 @@ def test_48_signed_permutations():
     assert sum(1 for m in P if np.linalg.det(m) > 0) == 24
 
 
+def test_standing_sides_give_the_plain_push_directions():
+    expected = {
+        "front": {"+X": ("toward", -1, "-X"), "+Y": ("left", -1, "-Y"), "+Z": ("down", -1, "-Z")},
+        "behind": {"+X": ("toward", 1, "+X"), "+Y": ("left", 1, "+Y"), "+Z": ("down", -1, "-Z")},
+        "left": {"+X": ("left", 1, "+X"), "+Y": ("toward", -1, "-Y"), "+Z": ("down", -1, "-Z")},
+        "right": {"+X": ("left", -1, "-X"), "+Y": ("toward", 1, "+Y"), "+Z": ("down", -1, "-Z")},
+    }
+    for side, axes in expected.items():
+        got = FM.standing_pushes(side)["pushes"]
+        assert {ax: (p["key"], p["sign"], p["base"]) for ax, p in got.items()} == axes
+
+
 def test_fit_picks_the_ur_matrix():
     r = FM.fit(UR_SENSOR, SIM)
     assert r["ok"], r["problems"]
@@ -47,6 +59,15 @@ def test_fit_picks_the_ur_matrix():
     assert 0 <= r["rotation_deg"] < 6
     # torques use the same M
     assert FM.apply_axes(M, [1, 2, 3, 4, 5, 6]) == [2, -1, -3, 5, -4, -6]
+
+
+def test_negative_pushes_fit_like_the_equivalent_positive_pushes():
+    positive = FM.fit(UR_SENSOR, SIM)
+    negative = {ax: [-x for x in w] for ax, w in UR_SENSOR.items()}
+    signs = {ax: -1 for ax in FM.AXES}
+    labels = {ax: FM.standing_pushes("front")["pushes"][ax]["label"] for ax in FM.AXES}
+    result = FM.fit(negative, SIM, push_signs=signs, push_labels=labels)
+    assert result["ok"] and result["M"] == positive["M"] and result["scale"] == positive["scale"]
 
 
 def test_fit_with_physical_signs_is_a_rotation():
@@ -199,7 +220,7 @@ RESULT = {"ft_obs_axes": [[0, 1, 0], [-1, 0, 0], [0, 0, -1]], "ft_obs_scale": [1
                                             "servo_admittance"]])
 def test_policy_run_gets_the_effective_robot_config(tmp_path, command):
     lib, rc = _lib(tmp_path, command)
-    lib.ft_axes = lambda: ("Ayesha", RESULT)
+    lib.ft_axes = lambda: ("ProfileA", RESULT)
     logs, notes = [], []
     lib.notify = notes.append
     cmd = lib.command_for("p", log=logs.append)
@@ -207,7 +228,7 @@ def test_policy_run_gets_the_effective_robot_config(tmp_path, command):
     assert eff != str(rc) and eff.startswith(str(tmp_path / "runs"))
     obs = yaml.safe_load(open(eff))["observations"]
     assert obs["ft_obs_axes"] == RESULT["ft_obs_axes"] and obs["ft_obs_scale"] == [1.0] * 6
-    assert "profile 'Ayesha'" in logs[0] and notes == logs
+    assert "profile 'ProfileA'" in logs[0] and notes == logs
 
 
 @pytest.mark.parametrize("command", [None, ["runner", "--robot-config", "{robot_config}", "--robot-controller",
@@ -216,7 +237,7 @@ def test_policy_run_without_a_result_uses_the_manifest_file_and_warns(tmp_path, 
     from types import SimpleNamespace
     from moveit_gui.policy_executor import WARN, PolicyExecutor
     lib, rc = _lib(tmp_path, command)
-    lib.ft_axes = lambda: ("Bob", None)
+    lib.ft_axes = lambda: ("ProfileB", None)
     logs = []
     cmd = lib.command_for("p", log=logs.append)
     assert cmd[cmd.index("--robot-config") + 1] == str(rc) and "no Match simulation" in logs[0]
@@ -227,9 +248,9 @@ def test_policy_run_without_a_result_uses_the_manifest_file_and_warns(tmp_path, 
     req = {r.label: r for r in ex._static_requirements(lib.manifests["p"])}
     assert req["F/T axes"].state == WARN
     assert not any("F/T axes" in p for p in ex.program_problems(lib.manifests["p"]))   # a warning, not a blocker
-    lib.ft_axes = lambda: ("Bob", RESULT)
+    lib.ft_axes = lambda: ("ProfileB", RESULT)
     req = {r.label: r for r in ex._static_requirements(lib.manifests["p"])}
-    assert req["F/T axes"].state == "ok" and "Bob" in req["F/T axes"].detail
+    assert req["F/T axes"].state == "ok" and "ProfileB" in req["F/T axes"].detail
 
 
 def test_push_capture_waits_for_the_hand_to_let_go():

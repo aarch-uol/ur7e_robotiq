@@ -1,0 +1,82 @@
+--- a/main.py	2026-11-13 01:15:52.434545503 +0000
++++ b/main.py	2026-11-13 01:15:52.434960381 +0000
+@@ -26,30 +26,15 @@
+     Returns:
+         float: Calculated threshold value, None if no valid depth values found
+     """
+-    depth_image_with_thresh = np.copy(depth_image)
+-    
+-    # Find closest and furthest depth points
+-    closest = np.inf
+-    furthest = -np.inf
+-    
+-    for i in range(depth_image.shape[0]):
+-        for j in range(depth_image.shape[1]):
+-            if depth_image[i, j] > 0:
+-                if depth_image[i, j] < closest:
+-                    closest = depth_image[i, j]
+-                if depth_image[i, j] > furthest:
+-                    furthest = depth_image[i, j]
+-    
+-    # Check if valid depth values were found
+-    if closest == np.inf or furthest == -np.inf:
++    valid = depth_image[depth_image > 0]
++    if valid.size == 0:
+         print("No valid depth values found in the image.")
+         return None
+-    
+-    # Calculate threshold and apply
++    closest = valid.min()
++    furthest = valid.max()
++
++    # Calculate threshold (the caller applies it)
+     threshold = closest + threshold_ratio * (furthest - closest)
+-    #threshold = closest + 70
+-    depth_image_with_thresh[depth_image > threshold] = 0
+-    
+     return threshold
+ 
+ 
+@@ -342,6 +327,19 @@
+ 
+ 
+ 
++def crop_rect(yolo_rect, shape, crop_percent=0.3, offset=-3):
++    """The evaluation crop of a YOLO rect (x, y, w, h): crop_percent off each side, the top 25% off."""
++    x, y, width, height = yolo_rect
++    crop_pixels = int(width * crop_percent)
++    vertical_crop_pixels = int(height * 0.25)
++    image_height, image_width = shape[:2]
++    x0 = max(0, min(x + crop_pixels + offset, image_width))
++    x1 = max(0, min(x + width - crop_pixels + offset, image_width))
++    y0 = max(0, min(y + vertical_crop_pixels, image_height))
++    y1 = max(0, min(y + height, image_height))
++    return (x0, y0, x1 - x0, y1 - y0)
++
++
+ def crop_and_mask_results(image_data, crop_percent, offset=-3):
+     """
+     Crop the YOLO rectangle horizontally and apply as mask to coordinates and spatula results.
+@@ -439,3 +437,22 @@
+     image_data = spatula_grouping.find_crystal_midpoints(image_data)
+     
+     return True, image_data
++
++
++def process_fixed_bands_image(image_data, vial=None):
++    """Only what the fixed-band targets need: vial mask, material map and crop (no clustering, no k-means).
++
++    vial: (yolo_rect, grabcut_mask) from an earlier frame, to skip YOLO and GrabCut (the vial does not move).
++    """
++    if vial is not None:
++        image_data.yolo_rect, image_data.grabcut_mask = vial
++    else:
++        image_data = detect_and_segment_vial(image_data)
++    if image_data.grabcut_mask is None or np.count_nonzero(image_data.grabcut_mask) == 0:
++        print("GrabCut mask unavailable or empty. Skipping frame.")
++        return False, image_data
++    image_data = process_depth_data(image_data)
++    image_data = create_binary_map(image_data)
++    image_data.cropped_rect = crop_rect(image_data.yolo_rect, image_data.contourmap.shape, 0.3, offset=-3)
++    image_data.final_midpoints = None
++    return True, image_data

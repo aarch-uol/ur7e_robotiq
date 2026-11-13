@@ -19,6 +19,7 @@ import yaml
 
 from .policies import PolicyLibrary, PolicyManifest, RecordingOptions, split_range_notes
 from .policy_action import RunPolicyFeedback, RunPolicyGoal, RunPolicyResult
+from .policy_vision import vision_issues
 
 OK, FAIL, RUNNER = "ok", "fail", "runner"          # RUNNER = only the runner can check it, at its start
 WARN = "warn"                                      # shown, never blocks a run
@@ -145,9 +146,13 @@ class PolicyExecutor:
         if m.required_mode not in self.modes.profile.modes:
             out.append(Requirement("Control mode", FAIL, f"'{m.required_mode}' is not a mode of this robot"))
         out += deployment_requirements(m, self.bridge)
+        out += [Requirement("Policy vision", FAIL, i.detail) for i in vision_issues(m) if i.blocking]
         if "robot_config" in files:
             got = self.library.ft_axes_in_use()
-            if got:
+            stale = self.library.ft_axes_stale()
+            if stale:
+                out.append(Requirement("F/T axes", FAIL, stale))
+            elif got:
                 owner, res = got
                 out.append(Requirement("F/T axes", OK, f"Match simulation of {owner or 'the settings in use'} "
                                                        f"({res.get('at', '')})"))
@@ -182,6 +187,8 @@ class PolicyExecutor:
             ok, detail = self.gains_check(m.required_mode, m.controller_gains)
             out.append(Requirement("Controller gains", OK if ok else FAIL,
                                    detail if ok is not None else f"could not read them: {detail}"))
+        out += [Requirement("Policy vision", WARN, i.detail)
+                for i in vision_issues(m, lambda topic: self.bridge.topic_publishers(topic)) if not i.blocking]
         if self.range_check is not None:
             try:
                 warnings = self.range_check(m)

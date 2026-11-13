@@ -1014,6 +1014,9 @@ class ProgramRunner:
         return False
 
     # ------------------------------------------------------------ replay
+    def _replay_halted(self) -> bool:
+        return self._stop.is_set() or self._state == RunState.PAUSED
+
     def _replay(self, p: dict, vel: float, acc: float) -> bool:
         """A taught joint trajectory (replay.py): MoveJ to its first point, then one trajectory with the recorded
         timing / speed, slowed down if it would exceed the joint limits. After a pause: from where it stopped."""
@@ -1051,6 +1054,8 @@ class ProgramRunner:
         if dev > rp.START_TOL_RAD:
             self.on_log(f"replay: MoveJ to {'its start' if k0 == 0 else f'point {k0 + 1}'} "
                         f"({math.degrees(dev):.1f}° away)")
+            if self._replay_halted():               # STOP / pause while the replay was being checked
+                return False
             if not self.bridge.move_joints([float(x) for x in Q[k0]], vel, acc):
                 return False
             if self._stop.is_set() or self._state == RunState.PAUSED:
@@ -1068,6 +1073,8 @@ class ProgramRunner:
         VV[0] = 0.0                                 # from rest (a resumed replay too)
         self.on_log(f"replay: {len(tt)} points, {tt[-1]:.1f} s")
         memo.update(replay_t=t_run, replay_k0=k0)
+        if self._replay_halted():
+            return False
         t_start = time.monotonic()
         ok = self.bridge.execute_joint_path(names, [float(x) for x in tt], Q[k0:].tolist(), VV.tolist())
         memo["replay_elapsed"] = time.monotonic() - t_start

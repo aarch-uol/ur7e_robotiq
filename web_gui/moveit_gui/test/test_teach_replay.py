@@ -226,3 +226,33 @@ def test_old_taught_paths_load_and_run_as_before(s):
     folder = s.program.steps[r["selected"][0]]
     assert folder.type == "folder" and all(c.type == "move_pose" for c in folder.children)
     assert Program.from_dict(yaml.safe_load(s._program_yaml()), s.core.profile).steps[0].type == "folder"
+
+
+def test_stop_while_the_replay_is_checked_sends_nothing(s):
+    """STOP pressed during the (slow) check of a long replay: neither the MoveJ to its start nor the replay is sent."""
+    import threading
+    pts = [[0.0] + [0.0] * 6, [1.0, 0.3] + [0.0] * 5]
+    d = {"version": 2, "name": "t", "steps": [{"type": "replay", "points": pts}]}
+    cmd(s, "program_set_yaml", text=yaml.safe_dump(d))
+    for start in ([0.2] * 6, [0.0] * 6):                    # far from the start (MoveJ first), and at it
+        s.core.bridge.set_fake_joints(start)
+        hooks = s.core.runner.hooks
+        real, checking, release = hooks.replay_check, threading.Event(), threading.Event()
+
+        def slow_check(names, Q, real=real):
+            checking.set()
+            release.wait(10)
+            return real(names, Q)
+
+        hooks.replay_check = slow_check
+        try:
+            s.core.bridge.calls.clear()
+            cmd(s, "program_run")
+            assert checking.wait(10)
+            s.core.stop_all("test")
+            release.set()
+            assert tick_until(s, lambda: s.core.program_result is not None, 10)
+        finally:
+            hooks.replay_check = real
+        assert not s.core.program_result[0]
+        assert not any(c[0] in ("movej", "execute_joint_path") for c in s.core.bridge.calls)

@@ -6,10 +6,11 @@ import { jointMonitor, ftChart } from "/static/monitors.js";
 import { workcell } from "/static/workcell.js";
 import { flaskPage } from "/static/flask.js";
 import { drivers, driversBadge } from "/static/drivers.js";
-import { workspace } from "/static/views.js";
+import { workspace, holdCameraStreams } from "/static/views.js";
 import { extraViews } from "/static/panels.js";
 import { icon } from "/static/icons.js";
 import { ask, askText, tell, dismiss } from "/static/dialog.js";
+import { retryAsync } from "/static/load_retry.js";
 // short joint names for compact readouts: "shoulder_pan_joint" -> "Shoulder pan"
 const jshort = (n) => { const x = n.replace(/^.*?(shoulder|elbow|wrist)/, "$1").replace(/_joint$/, "").replace(/_/g, " ");
   return x.charAt(0).toUpperCase() + x.slice(1); };
@@ -70,6 +71,49 @@ const num = (value, step = "0.1") => h("input", { type: "number", step, value })
 const AXES = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"];
 const PROBLEM = /FAILED|refused|error|cannot|STOP|lost|fault/i;
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+// set before any camera tile is built: camera streams wait for the OPERATE model (views.js holdCameraStreams)
+const MODEL_READY = (() => { let done; const p = new Promise((r) => (done = r)); p.done = () => done(); return p; })();
+holdCameraStreams(MODEL_READY);
+async function fetchRobotModel() {
+  return retryAsync(async () => {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const x = await fetch("/api/robot_model", { cache: "no-store", signal: ctl.signal });
+      let r;
+      try { r = await x.json(); } catch (e) { throw new Error(`model HTTP ${x.status}`); }
+      if (!x.ok || !r.ok) throw new Error(r.msg || `model HTTP ${x.status}`);
+      return r;
+    } finally { clearTimeout(timer); }
+  }, { attempts: 6, baseMs: 300, maxMs: 3000 });
+}
+function viewerMessage(el, text, retry) {
+  if (!el) return;
+  el.className = "muted v3msg" + (retry ? " error" : "");
+  el.replaceChildren(text);
+  if (retry) el.append(" ", h("button", { class: "btn quiet", onclick: retry }, "Retry"));
+}
+async function loadViewerModel(view, msg, ready) {
+  const id = (view.modelLoadId || 0) + 1;
+  view.modelLoadId = id;
+  viewerMessage(msg, "Loading the robot model…");
+  try {
+    const model = await fetchRobotModel();
+    if (view.modelLoadId !== id) return;
+    const result = view.robot ? await view.reload(model) : await view.load(model);
+    if (view.modelLoadId !== id) return;
+    if (ready) ready();
+    if (result && result.meshFailed)
+      viewerMessage(msg, "Some robot meshes did not load.", () => loadViewerModel(view, msg, ready));
+    else msg?.remove();
+  } catch (e) {
+    if (view.modelLoadId !== id) return;
+    viewerMessage(msg, "Robot model unavailable: " + (e.message || "no answer") + ". Trying again…",
+      () => loadViewerModel(view, msg, ready));
+    // keep trying by itself (the robot stack may still be starting); Retry does it at once
+    setTimeout(() => { if (view.modelLoadId === id && !view.robot) loadViewerModel(view, msg, ready); }, 5000);
+  }
+}
 
 // ------------------------------------------------------------------ session
 // The lease token is a secret the server hands out on "Take control". A reload keeps control (pagehide stores it,
@@ -561,6 +605,8 @@ function frameSelect(id) {
 
 // ================================================================== OPERATE
 pages.OPERATE = {
+  programRunData: null, programRunKey: "", programRunFetch: null, programRunVisible: true, programRunPanelEl: null,
+  programRunEls: null,
   build(el) {
     // Manual: one card, four tabs, one footer (Speed · Acceleration · Plan · Move) shared by Joints and Pose
     const jrows = INFO.joint_names.map((n, i) =>
@@ -635,6 +681,7 @@ pages.OPERATE = {
     // pose is a small box in its corner. It is the first tile of OPERATE > Views (views.js).
     const v3box = h("div", { class: "v3box" },
       h("div", { class: "view3d", id: "v3" }, h("div", { class: "muted v3msg", id: "v3-msg" }, "Loading the robot model…")),
+      this.programRunPanel(),
       this.viewBar(),
       h("div", { class: "v3ovl v3ik hidden", id: "v3-goal-ik" }, ""),
       this.poseCard());
@@ -710,15 +757,29 @@ pages.OPERATE = {
     const ftCell = (i) => h("div", { class: "ftc" }, h("span", { class: "n" }, AXES[i]),
       h("span", { class: "v", id: `op-ft${i}` }, "—"), h("div", { class: "cbar" }, h("div", { id: `op-ftb${i}` })));
     this.ftc = ftChart();
+    // what the card and chart show: the reading as published, or with the payload weight taken out the way the
+    // admittance controller does (its own CoG and weight, turned with the arm). Kept per browser.
+    this.ftMode = localStorage.getItem("op-ft-view") === "comp" ? "comp" : "raw";
+    const ftSeg = h("span", { class: "tseg ftvseg" }, [["raw", "Reading", "The F/T reading as published (after the bias)"],
+      ["comp", "− Payload", "The reading with the payload weight removed, as the admittance controller sees it "
+        + "(the weight and CoG it has loaded, turned with the arm's pose)"]].map(([k, label, tip]) =>
+      h("button", { type: "button", class: k === this.ftMode ? "on" : "", title: tip, "data-k": k, onclick: (e) => {
+        this.ftMode = k; localStorage.setItem("op-ft-view", k);
+        this.ftc.setPayloadRemoved(k === "comp");
+        for (const b of e.currentTarget.parentNode.children) b.classList.toggle("on", b === e.currentTarget);
+        this.ftPayChip();
+      } }, label)));
     const ft = h("div", { class: "card" },
       h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: `Frame: ${INFO.ft_frame || "sensor frame"}` }, "F/T sensor"),
         h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software offset is set (SETUP › Force sensor)" }, "Biased"),
         h("span", { class: "chip hidden", id: "op-ft-lim", title: "Force limit (SETUP › Force sensor)" }, ""),
+        ftSeg,
         h("button", { class: "btn quiet ibtn", type: "button", id: "op-ft-show", title: "Show the F/T chart under this card",
           html: icon("chart") + "<span>Chart</span>", onclick: () => this.vg.toggleChart() })),
       h("div", { class: "ft3" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(ftCell),
         h("span", { class: "u" }, "Nm"), [3, 4, 5].map(ftCell)));
     this.ftc.el.classList.remove("card");
+    this.ftc.setPayloadRemoved(this.ftMode === "comp");
 
     this.jm = jointMonitor(INFO.joint_names, INFO.joint_limits_deg);
     // Joints: bars with limits, a list, or one line of angles (pick in the card's corner; kept per browser)
@@ -743,10 +804,66 @@ pages.OPERATE = {
     this.mode = "j";
     this.planId = -1;
     import("/static/view3d.js").then((m) => this.initView(m)).catch((e) => {
+      MODEL_READY.done();
       const m = $("#v3-msg");
       if (m) m.textContent = "3D view unavailable in this browser: " + e.message;
       else console.warn("3D view unavailable:", e);
     });
+  },
+  programRunPanel() {
+    this.programRunVisible = localStorage.getItem("op-program-run-visible") !== "0";
+    const pause = btn("Pause", "", () => (S.runner.state === "PAUSED" ? pcmd("program_resume") : pcmd("program_pause")));
+    const stop = btn("■ Stop", "stopo", () => pcmd("program_stop"));
+    const restart = btn("Restart", "quiet", async () => {
+      if (!(await ask("Restart program from the first step?\n\nThe arm moves.", { ok: "Restart", danger: true }))) return;
+      return pcmd("program_restart");
+    });
+    pause.id = "op-program-run-pause"; stop.id = "op-program-run-stop"; restart.id = "op-program-run-restart";
+    [pause, stop, restart].forEach((b) => (b.dataset.lease = "1"));
+    const hide = h("button", { class: "op-program-run-hide", type: "button", title: "Hide program controls",
+      onclick: () => this.programRunSetVisible(false) }, "×");
+    const head = h("div", { class: "row op-program-run-head", title: "Drag to move" },
+      h("span", { class: "ctitle" }, "Program run"), h("span", { class: "grow", id: "op-program-run-name" }, ""), hide);
+    head.addEventListener("pointerdown", (e) => this.programRunDragStart(e));
+    const panel = h("div", { class: "op-program-run", id: "op-program-run-view" }, head,
+      h("div", { class: "row" }, h("span", { class: "chip", id: "op-program-run-state" }, "Idle"),
+        h("span", { class: "grow" }), h("button", { class: "tchip", type: "button", id: "op-program-run-show2",
+          onclick: () => navTo("PROGRAMS") }, "Open")),
+      h("div", { class: "mono small", id: "op-program-run-step" }, "No program run"),
+      h("div", { class: "row op-program-run-actions" }, pause, stop, restart));
+    this.programRunPanelEl = panel;
+    this.programRunEls = { pause, stop, restart, name: $("#op-program-run-name", panel), state: $("#op-program-run-state", panel), step: $("#op-program-run-step", panel) };
+    panel.hidden = !this.programRunVisible;
+    let pos = null;
+    try { pos = JSON.parse(localStorage.getItem("op-program-run-pos") || "null"); } catch (e) { /* ignore bad browser state */ }
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) { panel.style.left = pos.left + "px"; panel.style.top = pos.top + "px"; }
+    return panel;
+  },
+  programRunSetVisible(on) {
+    this.programRunVisible = !!on;
+    localStorage.setItem("op-program-run-visible", this.programRunVisible ? "1" : "0");
+    if (this.programRunPanelEl) this.programRunPanelEl.hidden = !this.programRunVisible;
+    const show = $("#op-program-run-show");
+    if (show) show.hidden = this.programRunVisible;
+  },
+  programRunDragStart(e) {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    const panel = this.programRunPanelEl, host = panel && panel.parentElement;
+    if (!panel || !host) return;
+    e.preventDefault();
+    const a = panel.getBoundingClientRect(), b = host.getBoundingClientRect();
+    const origin = { x: e.clientX, y: e.clientY, left: a.left - b.left, top: a.top - b.top };
+    const move = (ev) => {
+      const maxL = Math.max(0, host.clientWidth - panel.offsetWidth), maxT = Math.max(0, host.clientHeight - panel.offsetHeight);
+      const left = Math.max(0, Math.min(maxL, origin.left + ev.clientX - origin.x));
+      const top = Math.max(0, Math.min(maxT, origin.top + ev.clientY - origin.y));
+      panel.style.left = left + "px"; panel.style.top = top + "px"; panel.style.right = "auto";
+    };
+    const done = () => {
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", done);
+      localStorage.setItem("op-program-run-pos", JSON.stringify({ left: parseFloat(panel.style.left), top: parseFloat(panel.style.top) }));
+    };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", done, { once: true });
   },
   // ---- camera presets, trail, follow, TF frames overlay (drawing is in view3d.js)
   viewBar() {
@@ -763,6 +880,9 @@ pages.OPERATE = {
           h("button", { class: "tchip", type: "button", title: "Show TF frames in the 3D view",
             onclick: () => { pop.classList.toggle("hidden"); this.framesRender(); this.framesPoll(true); } }, "Frames ▾"), pop),
         tog("v3-trail", "Trail", "Fading line of the last 10 s of TCP motion", true, (e) => this.view && this.view.setTrail(e.target.checked)),
+        h("button", { class: "tchip", type: "button", id: "op-program-run-show", hidden: this.programRunVisible,
+          title: "Show program run controls",
+          onclick: () => this.programRunSetVisible(true) }, "Program"),
         tog("v3-zones", "Zones", "Keep-out zones (MoveIt collision boxes, SETUP › Keep-out zones). Disabled ones dashed grey",
           localStorage.getItem("v3-zones") !== "0",
           (e) => { localStorage.setItem("v3-zones", e.target.checked ? "1" : "0"); if (S && this.view) this.view.setZones(S.keepout.boxes, e.target.checked); }),
@@ -846,15 +966,12 @@ pages.OPERATE = {
   async initView(m) {
     this.v3mod = m;
     this.view = new m.View3D($("#v3"), { baseLink: INFO.base_link, onTargetChange: (p) => this.goalToFields(p) });
+    this.modelMsg = $("#v3-msg");
     this.framesPoll(true);
     clearInterval(this.framesTimer);
     this.framesTimer = setInterval(() => (document.body.contains($("#v3-fpop")) ? this.framesPoll() : clearInterval(this.framesTimer)), 500);
-    for (let i = 0; i < 20; i++) {                           // the URDF arrives once robot_state_publisher runs
-      const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => ({ ok: false, msg: "no answer" }));
-      if (r.ok) { await this.view.load(r); $("#v3-msg").remove(); if (S) this.update(S); return; }
-      $("#v3-msg").textContent = "Robot model: " + r.msg;
-      await new Promise((res) => setTimeout(res, 3000));
-    }
+    this.modelLoad = loadViewerModel(this.view, this.modelMsg, () => { if (S) this.update(S); });
+    this.modelLoad.finally(MODEL_READY.done);
   },
   // ---- goal <-> Cartesian fields (both in the base frame)
   showGoal(on) {
@@ -1133,9 +1250,79 @@ pages.OPERATE = {
       if (this.jm.unknownCount() && n > 1) this.retryLimits(n - 1);
     }, 5000);
   },
+  programRunClear() {
+    if (this.view) {
+      this.view.setPathMm(null);
+      this.view.setMarkers([]);
+      if (this.view.setHighlightMm) this.view.setHighlightMm(null);
+    }
+    this.programRunData = null;
+    this.programRunKey = "";
+    this.programRunSig = "";
+  },
+  async programRunLoad(s, key) {
+    if (this.programRunFetch) return;
+    this.programRunFetch = (async () => {
+      const cached = pages.PROGRAMS && pages.PROGRAMS.prevData && pages.PROGRAMS.prog &&
+        pages.PROGRAMS.prog.name === s.runner.program ? { ok: true, program: pages.PROGRAMS.prog, preview: pages.PROGRAMS.prevData } : null;
+      let p, r;
+      if (cached) { p = cached; r = cached.preview; }
+      else [p, r] = await Promise.all([cmd("program_get"), cmd("program_preview_path")]);
+      if (!p || !p.ok || !r || !r.ok || !S || S.runner.state === "IDLE") return;
+      if (p.program && p.program.name && p.program.name !== S.runner.program) return;   // another program is open
+      const currentKey = `${S.runner.program || ""}|${pages.PROGRAMS?.prog?.rev ?? ""}`;
+      if (currentKey !== key) return;
+      this.programRunData = { program: p.program, preview: r };
+      this.programRunKey = key;
+      this.programRunPaint(S);
+    })().catch((e) => console.warn("program preview unavailable:", e)).finally(() => { this.programRunFetch = null; });
+    await this.programRunFetch;
+  },
+  programRunPaint(s) {
+    const d = this.programRunData, v = this.view;
+    if (!d || !v || !d.preview || !d.preview.points) return;
+    const sig = `${this.programRunKey}|${JSON.stringify(s.runner.path || null)}`;
+    if (this.programRunSig === sig) return;              // state polls: only a new step changes the picture
+    this.programRunSig = sig;
+    v.setPathMm(d.preview.points);
+    const seen = new Set(), marks = [];
+    for (const row of d.program.rows || []) {
+      const w = row.waypoint;
+      if (!w || !w.base_xyz_mm || seen.has(w.name)) continue;
+      seen.add(w.name);
+      marks.push({ xyz_mm: w.base_xyz_mm, rpy_deg: w.base_rpy_deg, selected: pathEq(row.path, s.runner.path) });
+    }
+    v.setMarkers(marks, false);
+    const label = s.runner.path ? s.runner.path.map((x) => x + 1).join(".") : "";
+    const hits = label && d.preview.steps ? d.preview.steps.map((x, i) => x === label ? i : -1).filter((i) => i >= 0) : [];
+    if (v.setHighlightMm) v.setHighlightMm(hits.length ? d.preview.points.slice(Math.max(0, hits[0] - 1), hits[hits.length - 1] + 1) : null);
+  },
+  programRunUpdate(s) {
+    const e = this.programRunEls, r = s.runner;
+    if (!e || !r) return;
+    const on = r.state !== "IDLE";
+    e.name.textContent = r.program || "";
+    e.state.textContent = on ? r.state.toLowerCase() : "Idle";
+    e.state.className = "chip" + (r.state === "RUNNING" ? " ok" : r.state === "PAUSED" ? " warn" : "");
+    const row = this.programRunData && r.path && (this.programRunData.program.rows || []).find((x) => pathEq(x.path, r.path));
+    const step = r.path ? `Step ${r.path.map((x) => x + 1).join(".")}${row ? ` · ${row.title}` : ""}` : "";
+    const loops = (r.loops || []).map(([lab, i, n]) => `Loop ${lab} · ${i}/${n}`).join(" › ");
+    e.step.textContent = on ? step + (loops ? ` · ${loops}` : "") : "No program run";
+    e.pause.hidden = !on;
+    e.stop.hidden = !on;
+    e.restart.hidden = !on || !this.programRunData;
+    e.pause.textContent = r.state === "PAUSED" ? "Resume" : "Pause";
+    gate(e.pause, on && r.state !== "STOPPING");
+    gate(e.stop, on);
+    gate(e.restart, on && !!this.programRunData);
+    if (!on) { if (this.programRunData) this.programRunClear(); return; }
+    const key = `${r.program || ""}|${pages.PROGRAMS?.prog?.rev ?? ""}`;
+    if (this.programRunData && this.programRunKey === key) this.programRunPaint(s);
+    else this.programRunLoad(s, key);
+  },
   update(s) {
     if (this.jm) this.jm.update(s);
-    if (this.ftc) this.ftc.push(s);
+    if (this.ftc) this.ftc.push(s);                         // the chart keeps both and draws per ftMode
     if (this.xv) for (const x of Object.values(this.xv)) x.update(s);
     if (this.vg) this.vg.update(s);
     // Untouched fields follow the arm, so a MoveJ never sends a joint back to a stale value.
@@ -1157,7 +1344,7 @@ pages.OPERATE = {
       const q = {};
       (s.joints_deg || []).forEach((v, i) => (q[INFO.joint_names[i]] = v * Math.PI / 180));
       this.view.setJoints({ ...q, ...this.extraJoints(s) }, s.tcp_off);
-      this.view.setMeasuredForce(s.wrench, INFO.ft_frame);
+      this.view.setMeasuredForce(this.ftAdj(s).wrench, INFO.ft_frame);
       this.view.pushTcp(s.tcp);
       if (this.frameList.length) this.framesApply();
       this.view.setZones(s.keepout.boxes, $("#v3-zones").checked);
@@ -1165,6 +1352,7 @@ pages.OPERATE = {
       this.refreshPlan(s);
       this.wpGhost(s);
     }
+    this.programRunUpdate(s);
     (s.joints_deg || []).forEach((v, i) => ($(`#op-jc${i}`).textContent = v.toFixed(1) + "°"));
     $("#op-tcpname").textContent = `TCP ${s.calibration.active_tcp} in ${INFO.base_link}`;
     const jd = s.joints_deg || [];
@@ -1237,8 +1425,19 @@ pages.OPERATE = {
         $("#op-grip-err").textContent = fault ? `Fault: ${gs.fault} (${gs.severity})` : ctrlBad ? `controller ${s.gripper_controller}` : "";
       }
     }
-    const w = s.wrench;
-    $("#op-ft-bias").classList.toggle("hidden", !(s.ft_bias && s.ft_bias.bias && !s.ft_bias.raw));
+    const w = this.ftAdj(s).wrench;
+    this.ftPayChip();
+    const fb = s.ft_bias, chip = $("#op-ft-bias");
+    chip.classList.toggle("hidden", !(fb && fb.bias && !fb.raw));
+    if (fb && fb.bias && !fb.raw) {          // say which Zero is on: "Biased" alone read as "should be 0"
+      const how = fb.last && !fb.lost ? fb.last.how : "";
+      const kept = how === "zeroed, payload kept";
+      chip.textContent = kept ? "Weight kept" : how === "zeroed" ? "Weight zeroed" : "Biased";
+      chip.title = (kept ? "Sensor drift removed; the tool weight stays in the reading (Fz ≈ tool weight at rest). "
+        + "Admittance removes it; − Payload shows it removed."
+        : how === "zeroed" ? "The tool weight was zeroed too. Admittance with a loaded payload would remove it twice."
+        : "A software offset is set.") + (fb.last ? ` Set ${fb.last.at}.` : "") + " SETUP › F/T + payload";
+    }
     const G = s.ft_guard, lim = $("#op-ft-lim");
     lim.classList.toggle("hidden", !(G && G.enabled));
     if (G && G.enabled) {
@@ -1251,6 +1450,22 @@ pages.OPERATE = {
       }
     }
     this.ftReadout(w);
+  },
+  // the card's reading with the payload weight removed ("− Payload"); as is in "Reading" or without a payload.
+  // The chart keeps both itself (ftChart.setPayloadRemoved).
+  ftAdj(o) {
+    if (o.ft_payload !== undefined) this.ftPay = o.ft_payload;
+    const P = this.ftPay;
+    if (this.ftMode !== "comp" || !P || !P.w) return o;
+    return { ...o, wrench: o.wrench && o.wrench.map((x, i) => x - P.w[i]) };
+  },
+  // the "− Payload" button's tooltip says what is removed, or why nothing is
+  ftPayChip() {
+    const b = document.querySelector('.ftvseg [data-k="comp"]'), P = this.ftPay;
+    if (!b) return;
+    const base = "The reading with the payload weight removed, as the admittance controller sees it";
+    b.title = P && P.w ? `${base}: ${P.kg.toFixed(2)} kg (SETUP › F/T + Payload)`
+      : `${base}. Nothing removed now: ${P ? P.why : "no payload calibration in this profile"}`;
   },
   ftReadout(w) {
     AXES.forEach((_, i) => {
@@ -1266,6 +1481,7 @@ pages.OPERATE = {
   // the 30 Hz "live" event (F/T, joints) between full states: only what follows the sensor and the arm
   live(l, s) {
     if (this.ftc) this.ftc.push({ ...l, force: s.force });     // the commanded force comes with the full state
+    l = this.ftAdj(l);
     this.ftReadout(l.wrench);
     if (this.view && l.joints_deg) {
       const q = {};
@@ -1561,7 +1777,7 @@ const forceFrames = (withFixtures) => [["tool", "tool (active TCP axes)"], ["bas
 const pathEq = (a, b) => !!a && !!b && JSON.stringify(a) === JSON.stringify(b);
 const pct = (f) => Math.round((f ?? 0.1) * 100);
 pages.PROGRAMS = {
-  path: null, where: "after", tab: "insert", prog: null, lastExec: null,
+  path: null, where: "after", tab: "insert", prog: null, lastExec: null, pgFtc: null,
   build(el) {
     const files = h("select", { id: "pg-files" });
     // whose programs the list shows: a person's profile, or "" = Shared (the programs that were here before profiles)
@@ -1621,6 +1837,9 @@ pages.PROGRAMS = {
     [...left.lastChild.querySelectorAll(".btn")].slice(0, 4).forEach((b) => (b.dataset.lease = "1"));
     // 3D preview beside the tree, always there: the TCP path of the whole program (relative moves and loops too),
     // the waypoints (selected = orange) and a ghost arm for a selected joint target
+    this.pgFtc = ftChart();
+    this.pgFtc.el.id = "pg-ft-chart";
+    this.pgFtc.el.classList.add("pg-ft-panel");
     const mid = h("div", { class: "card pg-mid" },
       h("div", { class: "row" }, h("span", { class: "section", style: "margin:0" }, "3D preview"), h("div", { class: "grow" }),
         h("label", { class: "chk", title: "The TCP path of the program from where the robot is now (kinematics only: no planning, " +
@@ -1640,7 +1859,8 @@ pages.PROGRAMS = {
         btn("▶", "quiet", () => this.pgStep((this.stepK || 0) + 1), "Next move"),
         btn("▶|", "quiet", () => this.pgStep(1e9), "Last move")),
       h("div", { class: "mono small", id: "pg-step-lab" }, ""),
-      h("div", { class: "muted small", id: "pg-v3-note" }, ""));
+      h("div", { class: "muted small", id: "pg-v3-note" }, ""),
+      this.pgFtc.el);
     // --- Insert tab
     const whereSel = h("select", { id: "pg-where", onchange: (e) => (this.where = e.target.value) },
       h("option", { value: "after" }, "After selection"), h("option", { value: "before" }, "Before selection"),
@@ -1849,11 +2069,8 @@ pages.PROGRAMS = {
     try {
       const m = await import("/static/view3d.js");
       this.view = new m.View3D($("#pg-v3"), { baseLink: INFO.base_link });
-      const r = await fetch("/api/robot_model").then((x) => x.json());
-      if (!r.ok) { $("#pg-v3-msg").textContent = "Robot model: " + r.msg; return; }
-      await this.view.load(r);
-      $("#pg-v3-msg").remove();
-      this.paint3d();
+      this.modelMsg = $("#pg-v3-msg");
+      this.modelLoad = loadViewerModel(this.view, this.modelMsg, () => this.paint3d());
     } catch (e) { $("#pg-v3-msg").textContent = "3D view unavailable: " + e.message; }
   },
   // the ghost's joint trajectory for the previewed path, worked out once per path (IK in the page)
@@ -2237,6 +2454,7 @@ pages.PROGRAMS = {
     return pcmd("program_run", { start, step_mode: step, loop: $("#pg-loop").checked });
   },
   update(s) {
+    if (this.pgFtc) this.pgFtc.push(s);
     if (!this.v3init && $("#pg-v3").offsetParent) { this.v3init = true; this.init3d(); }   // first time PROGRAMS shows
     const st = s.runner.state, idle = st === "IDLE";
     if (this.lastSt !== st) { if (st === "IDLE") this.pathKey = null; this.lastSt = st; if (st === "IDLE") this.paint3d(); }
@@ -2277,6 +2495,9 @@ pages.PROGRAMS = {
     if (JSON.stringify(exec) !== JSON.stringify(this.lastExec)) this.paintTree();
     this.teachUpdate(s);
     this.batchUpdate(s);
+  },
+  live(l, s) {
+    if (this.pgFtc) this.pgFtc.push({ ...l, force: s.force, ft_payload: s.ft_payload });
   },
 
   // --- Teach by hand: Record, move the arm by hand, Mark (waypoints) or Finish (path). Nothing moves by itself.
@@ -2559,6 +2780,7 @@ pages.AUTOMATION = {
       h("div", { class: "card", style: "width:340px" },
         h("div", { class: "row" }, h("span", { class: "dot", id: "au-dot" }), h("span", { class: "title", id: "au-state" }, "—")),
         h("div", { class: "col", id: "au-req", style: "gap:4px" }),
+        note("Vision compatibility", "Missing vision publishers warn and do not block Run. Invalid band_sorting settings that the runner would refuse fail preflight. Publisher counts do not prove valid or fresh band data; the runner validates those and holds output when fixed band data is missing or stale."),
         h("div", { id: "au-live", class: "col hidden" },
           h("div", { class: "muted", id: "au-live-title" }),
           h("div", { class: "bar" }, h("div", { id: "au-bar" })),
@@ -2838,7 +3060,7 @@ pages.SETUP = {
     const pb = this.views["F/T + payload"].querySelectorAll(".card:last-child .btn");
     [this.psave, this.papply] = pb;
     this.pcols = this.views["F/T + payload"];
-    this.views["F/T + payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols, this.buildMatch());
+    this.views["F/T + payload"] = h("div", { class: "col" }, this.buildBias(), this.buildFtAxes(), this.pcols, this.buildMatch());
     this.views["Gains"] = this.buildGains();
     // Drivers & cameras: drivers.js
     this.dr = drivers({ h, btn, note, cmd, toast, ask, lease: (b) => { b.dataset.lease = "1"; return b; } });
@@ -2910,7 +3132,9 @@ pages.SETUP = {
           if (q.ok) loadPolicies();
           return q;
         }));
-        return h("div", { class: "row" }, nn, dd, save);
+        return h("div", { class: "col" }, h("div", { class: "row" }, nn, dd, save),
+          ...(p.vision_issues || []).map((i) => h("div", { class: "row" },
+            h("span", { class: "dot " + (i.blocking ? "bad" : "warn") }), h("span", {}, i.detail))));
       }) : [h("div", { class: "muted" }, "No policy manifests yet.")]));
     };
     const loadFolder = () => cmd("policy_sources", { folder: pfolder.value.trim() }).then((r) => r.ok && pfill(r));
@@ -2966,7 +3190,9 @@ pages.SETUP = {
           h("label", { class: "chk" }, pnoNorm, "no normaliser (model has none)")),
         uploadButton,
         h("div", { class: "row" }, lease(btn("Import", "primary", importPolicy)), pmsg)),
-      h("div", { class: "card" }, h("div", { class: "section" }, "Saved policies"), plist));
+      h("div", { class: "card" }, h("div", { class: "row" }, h("div", { class: "section grow" }, "Saved policies"),
+        btn("Refresh checks", "quiet", loadPolicies)),
+        note("Vision compatibility", "Checks use the policy's training and robot configs and current ROS publisher counts. Missing publishers warn; known runner startup refusals fail preflight. A publisher may still send stale or invalid data: the runner checks that. Refresh checks after changing configs or starting vision. Fixed bands can come from their topic or from runner-side band_sorting with a measured vial_bottom_z."), plist));
     loadPolicies();
     cmd("policy_sources", {}).then((r) => {                      // the allowed folders, as suggestions
       if (!r.ok) return;
@@ -2991,12 +3217,9 @@ pages.SETUP = {
       const m = await import("/static/view3d.js");
       const v = new m.View3D($("#su-v3", this.sv), { baseLink: INFO.base_link });
       this.v3m = m;
-      for (let i = 0; i < 20; i++) {
-        const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => ({ ok: false, msg: "no answer" }));
-        if (r.ok) { await v.load(r); $("#su-v3-msg", this.sv)?.remove(); this.view = v; this.svPaint(true); return; }
-        $("#su-v3-msg", this.sv).textContent = "Robot model not loaded. Is the robot running?";
-        await new Promise((res) => setTimeout(res, 3000));
-      }
+      this.view = v;
+      this.modelMsg = $("#su-v3-msg", this.sv);
+      this.modelLoad = loadViewerModel(v, this.modelMsg, () => this.svPaint(true));
     } catch (e) { $("#su-v3-msg", this.sv).textContent = "3D view unavailable: " + e.message; }
   },
   async svPaint(full) {
@@ -3055,12 +3278,16 @@ pages.SETUP = {
         "from where the arm is now is clear. Keep a hand near STOP.")))
       return cmd("payload_collect", { index: this.pPick });
   },
-  // ---- Match simulation (ft_match.py): push the tip along base +X, +Y, +Z; the GUI maps sensor axes to the sim's
+  // ---- Match simulation (ft_match.py): use plain pushes from where the person stands; map sensor axes to the sim
   buildMatch() {
     const lb = (b) => (b.dataset.lease = "1", b);
     const M = this.fm = {};
     M.pol = h("select", { id: "su-fm-pol", title: "The policy whose sim reference to match to" });
-    M.start = lb(btn("Start", "primary", () => cmd("ftmatch_start", { policy: M.pol.value }),
+    M.stand = h("select", { id: "su-fm-stand", title: "Where you stand relative to the robot" });
+    M.stand.onchange = () => { M.standPicked = true; M.rowKey = null; if (M.lastS) this.mUpdate(M.lastS); };
+    M.standSide = h("span", { class: "muted small", id: "su-fm-stand-side" }, "");
+    M.start = lb(btn("Start", "primary", () => { M.standPicked = false; return cmd("ftmatch_start",
+      { policy: M.pol.value, standing: M.stand.value }); },
       "Nothing moves. Needs Position mode and a live F/T reading"));
     M.stop = lb(btn("Stop", "quiet", () => cmd("ftmatch_cancel")));
     M.rec = lb(btn("Record", "", () => cmd("ftmatch_record"), "Take the push now instead of waiting for it to be steady"));
@@ -3070,10 +3297,12 @@ pages.SETUP = {
     M.rows = h("tbody", { id: "su-fm-rows" });
     this.fmCard = h("div", { class: "card" },
       h("div", { class: "section" }, "Sensor axes for policies"),
-      note("Push the tip along each arrow (~10 N, 2 s)."),
+      note("Choose where you stand. Push the tip toward the robot, to your left, and down (~10 N, 2 s). " +
+        "Then twist it clockwise, looking down from above (~1 Nm), when the sim reference has a twist."),
+      h("div", { class: "row" }, h("span", { class: "k" }, "Where you stand"), M.stand, M.standSide),
       h("div", { class: "row" }, h("span", { class: "k" }, "Policy"), M.pol, M.start, M.stop),
       h("div", { class: "title", id: "su-fm-msg" }, ""),
-      h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Sensor change N"),
+      h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Sensor change"),
         h("th", {}, ""), h("th", {}, ""))), M.rows),
       h("div", { class: "row" }, h("span", { class: "grow mono small", id: "su-fm-now" }, ""), M.rec),
       h("div", { id: "su-fm-fit" }),
@@ -3086,7 +3315,36 @@ pages.SETUP = {
   mUpdate(s) {
     const f = s.ftmatch, M = this.fm;
     if (!f || !M) return;
+    M.lastS = s;
     const v3 = (a) => "[" + a.slice(0, 3).map((x) => (x >= 0 ? "+" : "") + x.toFixed(1)).join(", ") + "]";
+    const options = f.standing_options || [];
+    let info = f.pushes_info || {}, order = f.push_order || ["+X", "+Y", "+Z"];
+    if (!f.active && M.standPicked) {          // not started: show the pushes for the side picked now
+      const o = options.find((x) => x.key === M.stand.value);
+      if (o) {
+        const v = { "+X": [1, 0], "-X": [-1, 0], "+Y": [0, 1], "-Y": [0, -1] }[o.base_side];
+        const moves = [["toward the robot", [-v[0], -v[1], 0]], ["to your left", [v[1], -v[0], 0]], ["down", [0, 0, -1]]];
+        info = {}; order = [];
+        for (const [label, d] of moves) {
+          const i = d.findIndex((x) => x), a = "+" + "XYZ"[i];
+          info[a] = { label, base: (d[i] > 0 ? "+" : "-") + "XYZ"[i] }; order.push(a);
+        }
+        const r = (f.refs || []).find((x) => x.policy === M.pol.value);
+        if (r && r.twist) { info.twist = (f.pushes_info || {}).twist; order.push("twist"); }
+      }
+    } else if (!f.active) {                    // not started, side not changed: add the twist if the policy has one
+      const r = (f.refs || []).find((x) => x.policy === M.pol.value);
+      if (r && r.twist && !order.includes("twist")) order = [...order, "twist"];
+    }
+    const standKey = JSON.stringify(options);
+    if (standKey !== M.standKey) {
+      M.standKey = standKey;
+      M.stand.replaceChildren(...options.map((x) => h("option", { value: x.key, title: `Robot base ${x.base_side} side` }, x.label)));
+    }
+    if (f.active || !M.standPicked) M.stand.value = f.standing || "front";
+    const standing = options.find((x) => x.key === (!f.active && M.standPicked ? M.stand.value : f.standing || "front"));
+    M.stand.title = standing ? `Where you stand: robot base ${standing.base_side} side` : "Where you stand relative to the robot";
+    M.standSide.textContent = standing ? `robot base ${standing.base_side} side` : "";
     const refKey = JSON.stringify(f.refs);
     if (refKey !== M.refKey) {
       M.refKey = refKey;
@@ -3103,33 +3361,41 @@ pages.SETUP = {
     const ax = f.axis, cur = ax && f.pushes ? f.pushes[ax] : null;
     if (!f.active) {
       msg.textContent = !f.refs.length ? "No policy: the sim reference comes from a policy manifest." :
-        ref && !ref.found ? `No sim reference for ${ref.policy}: expected ${ref.path}. Make it with tools/sim_ft_reference.py, ` +
-          "or set sim_ft_reference in the manifest." : f.refusal ? `Not ready: ${f.refusal}.` : "Press Start, then follow the arrows.";
+        ref && !ref.found ? `No sim reference for ${ref.policy}: expected ${ref.path}. Make it from the policy's MuJoCo ` +
+          "model with python3 -m moveit_gui.sim_ft_reference (where mujoco is installed), or set sim_ft_reference in the manifest." : f.refusal ? `Not ready: ${f.refusal}.` : "Press Start, then follow the arrows.";
     } else if (f.error) msg.textContent = `Waiting: ${f.error}.`;
-    else if (cur) msg.textContent = cur.state === "baseline" ? `${ax}: hands off the tool…` :
-      `${ax}: push the tool tip along the arrow, about 10 N, hold 2 s. ${cur.note}`;
+    else if (cur) {
+      const p = info[ax] || { label: ax, instruction: `Push the tip along the arrow`, base: ax };
+      msg.textContent = cur.state === "baseline" ? `${p.label} (base ${p.base}): hands off the tool…` :
+        `${p.instruction} (base ${p.base}), ${p.amount || "about 10 N"}, hold 2 s. ${cur.note}`;
+    }
     else msg.textContent = f.fit && f.fit.ok ? "Matched. Check the result and Save." : "Done. See below.";
-    // the arrow at the tip, along base +X / +Y / +Z (10 N long)
+    // The arrow at the tip follows the selected plain-language push.
     if (this.view) {
       const d = ax && f.dirs[ax];
       this.view.setCommandedForce(f.active && d && f.tip ? d.map((x) => 10 * x) : null, "base", f.tip);
     }
-    const rk = JSON.stringify([holds, f.active, ax, f.pushes && Object.values(f.pushes).map((p) => p && [p.state, p.delta]),
+    const rk = JSON.stringify([holds, f.active, f.standing, order, info, ax,
+      f.pushes && Object.values(f.pushes).map((p) => p && [p.state, p.delta]),
       f.fit && f.fit.pushes, f.fit && f.fit.repeat]);
-    if (rk !== M.rowKey) M.rows.replaceChildren(...["+X", "+Y", "+Z"].map((a) => {
+    if (rk !== M.rowKey) M.rows.replaceChildren(...order.map((a) => {
       const p = f.pushes && f.pushes[a], fp = f.fit && f.fit.pushes && f.fit.pushes[a];
       const bad = f.fit && f.fit.repeat && f.fit.repeat.includes(a);
       const again = btn(p && p.state === "done" ? "Again" : "Now", "quiet", () => cmd("ftmatch_push", { axis: a }),
         "Read this push again (a new no-contact reading first)");
       again.dataset.lease = "1";
       gate(again, f.active);
-      return h("tr", { class: a === ax ? "pick on" : "" }, h("td", {}, `base ${a}`),
-        h("td", { class: "mono" }, p && p.delta ? v3(p.delta) : p ? p.state === "baseline" ? "baseline…" : "push…" : ""),
+      const pi = info[a] || { label: a, base: a };
+      return h("tr", { class: a === ax ? "pick on" : "" }, h("td", {}, pi.label,
+        h("div", { class: "muted small" }, `base ${pi.base}`)),
+        h("td", { class: "mono" }, p && p.delta ? (a === "twist" ? "T " + v3(p.delta.slice(3)) : v3(p.delta)) :
+          p ? p.state === "baseline" ? "baseline…" : a === "twist" ? "twist…" : "push…" : ""),
         h("td", { class: bad ? "error" : "muted" }, fp && fp.angle_deg != null ? `${fp.n.toFixed(1)} N, ${fp.angle_deg}° off` : ""),
         h("td", {}, again));
     }));
     M.rowKey = rk;
-    $("#su-fm-now").textContent = cur && cur.state === "push" ? `now ${cur.now_n.toFixed(1)} N (at least ${f.min_n} N)` : "";
+    $("#su-fm-now").textContent = cur && cur.state === "push" ?
+      `now ${cur.now_n.toFixed(1)} ${cur.unit || "N"} (at least ${cur.min != null ? cur.min : f.min_n} ${cur.unit || "N"})` : "";
     gate(M.rec, f.active && !!cur && cur.state === "push" && !f.error);
     const fit = f.fit, box = $("#su-fm-fit");
     const key = JSON.stringify(fit || null);
@@ -3149,11 +3415,12 @@ pages.SETUP = {
           const cell = (v) => h("td", { class: "mono" }, "F " + v3(v), h("br"), "T " + t3(v));
           kids.push(h("table", { class: "su-ptable small" },
             h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Policy sees now"), h("th", {}, "With the match"), h("th", {}, "Simulation"))),
-            h("tbody", {}, ...["+X", "+Y", "+Z"].map((a) => h("tr", {}, h("td", {}, a),
+            h("tbody", {}, ...order.filter((a) => fit.rows[a]).map((a) => h("tr", {}, h("td", {}, (info[a] || {}).label || a,
+              h("div", { class: "muted" }, `base ${(info[a] || {}).base || a}`)),
               cell(row(a).before), cell(row(a).after), cell(row(a).sim))))));
           const tq = fit.torque;     // the torque signs, from the same pushes (not assumed from the forces)
-          if (tq) kids.push(h("div", { class: "muted small" }, "Torque check: " + ["tx", "ty"].map((n) => (tq.votes[n] || [])
-            .map((v) => `${n} ${v.push}: ${v.measured >= 0 ? "+" : ""}${v.measured.toFixed(2)} vs sim ${v.sim >= 0 ? "+" : ""}${v.sim.toFixed(2)} Nm` +
+          if (tq) kids.push(h("div", { class: "muted small" }, "Torque check: " + ["tx", "ty", "tz"].map((n) => (tq.votes[n] || [])
+            .map((v) => `${n} ${v.label || v.push}: ${v.measured >= 0 ? "+" : ""}${v.measured.toFixed(2)} vs sim ${v.sim >= 0 ? "+" : ""}${v.sim.toFixed(2)} Nm` +
               (v.sign === 1 ? " (same sign)" : v.sign === -1 ? " (opposite: scale -1)" : " (too small)")).join(", ")).filter(Boolean).join("; ") +
             (tq.tz ? `. ${tq.tz[0].toUpperCase()}${tq.tz.slice(1)}.` : "")));
           if (fit.old_scale == null) kids.push(h("div", { class: "muted small" }, "No previous sensor scale was found."));
@@ -3168,8 +3435,10 @@ pages.SETUP = {
     }
     gate(M.save, f.active && !!(fit && fit.ok));
     const sv = f.saved;
+    const savedStanding = sv && options.find((x) => x.key === sv.standing);
     $("#su-fm-saved").textContent = sv ? `${sv.explain.join(", ")} · ${sv.at}` + (sv.profile ? ` · ${sv.profile}` : "") +
-      (sv.policy ? ` · sim reference of ${sv.policy}` : "") : "None: policy runs use the robot config's own F/T settings.";
+      (sv.policy ? ` · sim reference of ${sv.policy}` : "") + (savedStanding ? ` · stood on robot base ${savedStanding.base_side} side` : "") :
+      "None: policy runs use the robot config's own F/T settings.";
     gate(M.clear, !!sv);
   },
   // F/T limit card (ft_guard.py): soft warns, hard stops the GUI's motion
@@ -3611,10 +3880,10 @@ pages.SETUP = {
     B.inputs = AXES.map((a, i) => h("input", { type: "number", step: i < 3 ? "0.01" : "0.001", id: `su-fb-in${i}`,
       style: "width:84px", title: `${a} bias to set (${i < 3 ? "N" : "Nm"})` }));
     const lb = (b) => (b.dataset.lease = "1", b);
-    B.zero = lb(btn("Zero", "primary", () => this.biasZero(),
+    B.zero = lb(btn("Zero, keep tool weight", "primary", () => this.biasZero(),
       "Removes only the sensor drift. With a payload loaded on the admittance controller, the reading keeps that "
       + "tool weight (as the payload fit, the controller and the MuJoCo training expect); without one, it reads 0"));
-    B.zeroAll = lb(btn("Zero all", "", () => this.biasZero(true),
+    B.zeroAll = lb(btn("Zero incl. tool weight", "", () => this.biasZero(true),
       "Make the current load read 0, tool weight included. Admittance with a loaded payload would then subtract "
       + "the weight twice"));
     B.clear = lb(btn("Reset to raw", "", () => this.biasClear(), "Set the bias to zero"));
@@ -3655,6 +3924,82 @@ pages.SETUP = {
           h("div", { class: "muted small", id: "su-fb-why" }, ""))),
         chartBox),
       note("Reading = raw sensor minus offset."));
+  },
+  // F/T reading axes: which sensor axis each published axis reads (a sensor mounted turned), from the next stack start
+  buildFtAxes() {
+    const F = this.fa = { dirty: false };
+    const opts = ["+x", "-x", "+y", "-y", "+z", "-z"];
+    const sel = (k) => h("select", { title: `The sensor axis the published ${k.toUpperCase()} reads`,
+      onchange: () => { F.dirty = true; this.faMark(); } }, ...opts.map((o) => h("option", { value: o }, `sensor ${o.replace("-", "−")}`)));
+    F.x = sel("x"); F.y = sel("y");
+    F.z = h("span", { class: "mono" }, "—");
+    const lb = (b) => (b.dataset.lease = "1", b);
+    F.restart = lb(btn("Save and restart stack", "primary", () => this.faSave(true),
+      "Save and restart the robot stack now: the broadcaster publishes in these axes from then on"));
+    F.save = lb(btn("Save for next start", "", () => this.faSave(false), "Used at the next robot stack restart"));
+    F.preset = [["+90° about Z", "-y", "+x"], ["−90° about Z", "+y", "-x"], ["180° about Z", "-x", "-y"], ["As the sensor", "+x", "+y"]]
+      .map(([t, x, y]) => btn(t, "quiet", () => { F.x.value = x; F.y.value = y; F.dirty = true; this.faMark(); },
+        t === "As the sensor" ? "The sensor's own axes (no turn)" : `Sensor turned ${t} on the flange`));
+    return h("div", { class: "card", id: "su-fa" },
+      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Reading axes"),
+        h("span", { class: "muted small", id: "su-fa-node" }, "")),
+      h("div", { class: "ko-status", id: "su-fa-state" }, "—"),
+      h("div", { class: "row", style: "flex-wrap:wrap;align-items:center" },
+        h("span", {}, "Fx reads"), F.x, h("span", {}, "Fy reads"), F.y, h("span", {}, "Fz reads"), F.z),
+      h("div", { class: "row", style: "flex-wrap:wrap" }, ...F.preset),
+      h("div", { class: "row" }, F.restart, F.save),
+      note("Turn the published F/T reading, for a sensor mounted turned. Applied at a robot stack restart.",
+        "The broadcaster publishes each axis from the sensor axis picked here (torques the same; Z follows from X and Y). "
+        + "The robot model is not changed. The zero offset is kept and turned with it. "
+        + "Run the payload calibration again afterwards: its CoG was fitted in the old axes."));
+  },
+  faZ() {
+    const ax = (v) => [v[0] === "-" ? -1 : 1, "xyz".indexOf(v[1])];
+    const [sx, ix] = ax(this.fa.x.value), [sy, iy] = ax(this.fa.y.value);
+    if (ix === iy) return null;
+    const ex = [0, 0, 0], ey = [0, 0, 0]; ex[ix] = sx; ey[iy] = sy;
+    const ez = [ex[1] * ey[2] - ex[2] * ey[1], ex[2] * ey[0] - ex[0] * ey[2], ex[0] * ey[1] - ex[1] * ey[0]];
+    const iz = ez.findIndex((v) => v);
+    return (ez[iz] > 0 ? "+" : "-") + "xyz"[iz];
+  },
+  faMark() {
+    const f = this.S_fa, F = this.fa;
+    const z = this.faZ();
+    F.z.textContent = z ? `sensor ${z.replace("-", "−")}` : "X and Y must differ";
+    if (!f) return;
+    const changed = !f.next || F.x.value !== f.next.x || F.y.value !== f.next.y;
+    gate(F.save, !!f.available && !!z && changed);
+    gate(F.restart, !!f.available && !!z && (changed || !!f.pending));
+  },
+  faUpdate(s) {
+    const f = this.S_fa = s.ft_axes;
+    if (!f) return;
+    const st = $("#su-fa-state");
+    const txt = (m, name) => `Fx ← ${m.x}, Fy ← ${m.y}, Fz ← ${m.z}` + (name ? ` (${name})` : "");
+    $("#su-fa-node").textContent = f.node || "";
+    if (!f.available || !f.running) {
+      st.className = "ko-status"; st.textContent = f.why || "—";
+    } else if (f.pending) {
+      st.className = "ko-status bad";
+      st.textContent = `Running: ${txt(f.running, f.running_name)}. Saved: ${txt(f.next, f.next_name)}, used after a robot stack restart.`;
+    } else {
+      st.className = "ko-status good"; st.textContent = `Running: ${txt(f.running, f.running_name)}`;
+    }
+    if (!this.fa.dirty && f.next && document.activeElement !== this.fa.x && document.activeElement !== this.fa.y) {
+      this.fa.x.value = f.next.x; this.fa.y.value = f.next.y;
+    }
+    this.faMark();
+  },
+  async faSave(restart) {
+    const x = this.fa.x.value, y = this.fa.y.value, z = this.faZ();
+    const what = `Fx ← sensor ${x}, Fy ← ${y}, Fz ← ${z}`;
+    const pay = S.payload && S.payload.result ? "\n\nRun the payload calibration again afterwards: its CoG was fitted in the old axes." : "";
+    const q = restart ? `Publish the F/T reading as ${what} and restart the robot stack now (about a minute)? `
+      + "The arm must be still; the GUI reconnects by itself." + pay
+      : `Save the F/T reading axes ${what} for the next robot stack start?` + pay;
+    if (!(await ask(q))) return;
+    const r = await cmd("ft_axes_save", { x, y, restart, confirm: restart });
+    if (r.ok) { this.fa.dirty = false; if (r.ft_axes) this.faUpdate({ ft_axes: r.ft_axes }); }
   },
   biasFields() { return this.fb.inputs.map((x) => +x.value || 0); },
   biasFill(b) { if (b) this.fb.inputs.forEach((x, i) => (x.value = String(b[i]))); },
@@ -3862,6 +4207,7 @@ pages.SETUP = {
     if (this.sub === "Setups") this.wc.W.setups.update(s);
     if (this.sub === "F/T + payload") {
       this.biasUpdate(s);
+      this.faUpdate(s);
       this.mUpdate(s);
       const p = s.payload;
       if (!p) { $("#su-pstat").textContent = "This robot profile has no F/T calibration poses."; gate(this.pcollect, false); return; }
@@ -4403,9 +4749,10 @@ async function modelWatch(s) {
   const first = modelRev === null;
   modelRev = rev;
   if (first) return;
-  const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => null);
-  if (!r || !r.ok) return;
-  for (const p of [pages.OPERATE, pages.PROGRAMS, pages.SETUP]) if (p && p.view && p.view.reload) p.view.reload(r);
+  let r;
+  try { r = await fetchRobotModel(); } catch (e) { return; }
+  for (const p of [pages.OPERATE, pages.PROGRAMS, pages.SETUP])
+    if (p && p.view && p.view.reload) p.view.reload(r).catch((e) => console.warn("robot model reload failed:", e));
 }
 
 function render() {

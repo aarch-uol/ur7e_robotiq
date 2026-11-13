@@ -119,11 +119,19 @@ export function axisRange(values, minSpan) {
  */
 export function ftChart(storage = globalThis.localStorage) {
   let t = [], data = [[], [], [], [], [], []];     // Fx Fy Fz Tx Ty Tz
+  // the payload weight at each sample (F/T card "− Payload"): kept beside the reading, so switching redraws the
+  // whole history one way and the chart always matches the card
+  let pay = [[], [], [], [], [], []], payNow = null, comp = false;
   let saved = {};
   try { saved = JSON.parse(storage.getItem("ftchart") || "{}"); } catch (e) { saved = {}; }
   const pick = new Set(Array.isArray(saved.pick) ? saved.pick : ["Fx", "Fy", "Fz"]);
   let win = WINDOWS.includes(saved.win) ? saved.win : 20;
   let paused = false, cmd = null, dirty = true, lastDraw = 0, raf = 0;
+  // Smooth scrolling: samples come in batches (~30 /s, uneven), so "now" follows the page's own clock, mapped to
+  // the sample clock by the fastest arrival seen (off), instead of jumping with each batch.
+  let off = null, lastArrive = 0, dropped = 0, frozen = null;
+  const held = {};                               // per unit: the axis shown, so noise does not make it snap
+  const clock = () => (globalThis.performance ? performance.now() : Date.now()) / 1000;
   const save = () => { try { storage.setItem("ftchart", JSON.stringify({ pick: [...pick], win })); } catch (e) { /* private mode */ } };
   const canvas = el("canvas", { class: "ftc-canvas", role: "img", "aria-label": "Live force and torque chart" });
   const readout = el("div", { class: "ftc-read" });          // empty: pushes the buttons right
@@ -139,9 +147,9 @@ export function ftChart(storage = globalThis.localStorage) {
   const winSel = el("select", { "aria-label": "Time window", onchange: () => { win = +winSel.value; save(); kick(true); } },
     ...WINDOWS.map((w) => el("option", { value: String(w), ...(w === win ? { selected: true } : {}) }, `${w} s`)));
   const pauseBtn = el("button", { class: "btn quiet", type: "button", onclick: () => {
-    paused = !paused; pauseBtn.textContent = paused ? "Resume" : "Pause"; kick(true);
+    paused = !paused; frozen = paused ? nowT() : null; pauseBtn.textContent = paused ? "Resume" : "Pause"; kick(true);
   } }, "Pause");
-  const clearBtn = el("button", { class: "btn quiet", type: "button", onclick: () => { t = []; data = data.map(() => []); kick(true); } }, "Clear");
+  const clearBtn = el("button", { class: "btn quiet", type: "button", onclick: () => { t = []; data = data.map(() => []); pay = pay.map(() => []); dropped = 0; kick(true); } }, "Clear");
   const body = el("div", { class: "ftc-body" },
     el("div", { class: "row ftc-chips" }, ...chips.slice(0, 4), el("span", { class: "ftc-gap" }), ...chips.slice(4)),
     canvas,
@@ -158,16 +166,34 @@ export function ftChart(storage = globalThis.localStorage) {
     if (now) { lastDraw = 0; }
     if (!raf && visible() && globalThis.requestAnimationFrame) raf = requestAnimationFrame(frame);
   }
+  const scrolling = () => !paused && t.length && clock() - lastArrive < 1.0;
   function frame(ts) {
     raf = 0;
-    if (!dirty || !visible()) return;
+    if (!(dirty || scrolling()) || !visible()) return;
     if (ts - lastDraw < 33) { raf = requestAnimationFrame(frame); return; }
     lastDraw = ts;
     draw();
+    if (scrolling()) raf = requestAnimationFrame(frame);         // keep gliding while samples flow
+  }
+  function nowT() {
+    if (!t.length) return 0;
+    if (frozen != null) return frozen;
+    const last = t[t.length - 1];
+    if (off == null) return last;
+    return Math.min(Math.max(clock() + off, last), last + 0.5);  // stops 0.5 s after the samples stop
+  }
+  // the same displayed axis while the data fits it well: grows at once, shrinks only after 2 s
+  function steady(unit, r) {
+    const h = held[unit], c = clock();
+    const fits = h && r.lo >= h.lo && r.hi <= h.hi && (r.hi - r.lo) > 0.5 * (h.hi - h.lo);
+    if (fits) { h.since = c; return h; }
+    if (h && r.lo >= h.lo && r.hi <= h.hi && c - h.since < 2) return h;
+    return (held[unit] = { ...r, since: c });
   }
 
   function seriesValues(s, k) {
-    return s.mag ? Math.hypot(data[s.mag[0]][k], data[s.mag[1]][k], data[s.mag[2]][k]) : data[s.i][k];
+    const v = (i) => data[i][k] - (comp ? pay[i][k] : 0);
+    return s.mag ? Math.hypot(v(s.mag[0]), v(s.mag[1]), v(s.mag[2])) : v(s.i);
   }
 
   function draw() {
@@ -183,16 +209,18 @@ export function ftChart(storage = globalThis.localStorage) {
     g.clearRect(0, 0, W, H);
     const shown = FT_SERIES.filter((s) => pick.has(s.key));
     const forces = shown.filter((s) => s.unit === "N"), torques = shown.filter((s) => s.unit === "Nm");
-    const now = t.length ? t[t.length - 1] : 0;
+    const now = nowT();
     let k0 = 0;
     while (k0 < t.length && t[k0] < now - win) k0++;
     const L = 40, R = torques.length && forces.length ? 40 : 8, T = 6, B = 18, pw = W - L - R, ph = H - T - B;
     const step = Math.max(1, Math.floor((t.length - k0) / (pw * 2)));       // never more points than pixels
-    const vals = (list) => { const out = []; for (const s of list) for (let k = k0; k < t.length; k += step) out.push(seriesValues(s, k)); return out; };
+    // pick the same samples every frame (counted from the first sample ever), so the noise does not shimmer
+    const kA = k0 + ((step - ((k0 + dropped) % step)) % step);
+    const vals = (list) => { const out = []; for (const s of list) for (let k = kA; k < t.length; k += step) out.push(seriesValues(s, k)); return out; };
     const cmdFor = (s) => (cmd && s.i != null && cmd[s.i] ? cmd[s.i] : null);
     const axes = [];
-    if (forces.length) axes.push({ unit: "N", list: forces, side: "L", ...axisRange([...vals(forces), ...forces.map(cmdFor).filter((v) => v != null)], 2) });
-    if (torques.length) axes.push({ unit: "Nm", list: torques, side: forces.length ? "R" : "L", ...axisRange([...vals(torques), ...torques.map(cmdFor).filter((v) => v != null)], 0.2) });
+    if (forces.length) axes.push({ unit: "N", list: forces, side: "L", ...steady("N", axisRange([...vals(forces), ...forces.map(cmdFor).filter((v) => v != null)], 2)) });
+    if (torques.length) axes.push({ unit: "Nm", list: torques, side: forces.length ? "R" : "L", ...steady("Nm", axisRange([...vals(torques), ...torques.map(cmdFor).filter((v) => v != null)], 0.2)) });
     const X = (sec) => L + pw * (1 - sec / win);
     const Yof = (a) => (v) => T + ph * (1 - (v - a.lo) / (a.hi - a.lo));
     g.font = "10px system-ui, sans-serif"; g.lineWidth = 1;
@@ -229,7 +257,7 @@ export function ftChart(storage = globalThis.localStorage) {
         g.setLineDash(s.dash === true ? [5, 3] : s.dash || []);
         g.beginPath();
         let first = true;
-        for (let k = k0; k < t.length; k += step) {
+        for (let k = kA; k < t.length; k += step) {
           const x = X(now - t[k]), y = Y(seriesValues(s, k));
           first ? g.moveTo(x, y) : g.lineTo(x, y); first = false;
         }
@@ -243,7 +271,11 @@ export function ftChart(storage = globalThis.localStorage) {
 
   function add(ts, w) {
     if (t.length && ts <= t[t.length - 1]) return;       // a reconnect may repeat samples
-    t.push(ts); for (let i = 0; i < 6; i++) data[i].push(w[i]);
+    t.push(ts); for (let i = 0; i < 6; i++) { data[i].push(w[i]); pay[i].push(payNow ? payNow[i] : 0); }
+    const c = clock(), o = ts - c;
+    // the fastest arrival sets the offset; it decays slowly so a clock drift or a slower link is followed
+    off = off == null || Math.abs(o - off) > 2 ? o : Math.max(o, off - 0.02 * Math.max(0, c - lastArrive));
+    lastArrive = c;
   }
 
   return {
@@ -252,9 +284,12 @@ export function ftChart(storage = globalThis.localStorage) {
     pick,
     get window() { return win; },
     get length() { return t.length; },
+    /** Show the reading with the payload weight removed (true) or as read (false); redraws the whole history. */
+    setPayloadRemoved(on) { if (comp !== !!on) { comp = !!on; for (const k of Object.keys(held)) delete held[k]; kick(true); } },
     push(s) {
       const c = s.force && s.force.active && s.force.current ? s.force.current : null;
       if (String(c) !== String(cmd)) { cmd = c; dirty = true; }
+      if (s.ft_payload !== undefined) payNow = s.ft_payload && s.ft_payload.w ? s.ft_payload.w : null;
       if (paused) { if (dirty) kick(); return; }
       const before = t.length;
       if (s.ft_samples && s.ft_samples.length) for (const r of s.ft_samples) add(r[0], r.slice(1));
@@ -263,7 +298,7 @@ export function ftChart(storage = globalThis.localStorage) {
         const cut = t[t.length - 1] - MAX_KEEP_S;
         let n = 0;
         while (n < t.length && t[n] < cut) n++;
-        if (n > 500 || (n && t.length > 7000)) { t = t.slice(n); data = data.map((d) => d.slice(n)); }
+        if (n > 500 || (n && t.length > 7000)) { t = t.slice(n); data = data.map((d) => d.slice(n)); pay = pay.map((d) => d.slice(n)); dropped += n; }
         dirty = true;
       }
       if (dirty) kick();

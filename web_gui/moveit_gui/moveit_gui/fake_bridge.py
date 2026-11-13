@@ -24,6 +24,7 @@ from . import transforms as tf
 from .cart_speed import cart_accel_m_s2, trapezoid_duration
 from .bridge_api import Snapshot, gripper_status_dict, reconnect_gripper
 from .control_modes import detect_mode, moveit_controller_for
+from .point_cloud import MAX_POINTS, height_colors, transform_points
 from .profile import RobotProfile
 
 FAKE_T_TOOL0_ROBOTIQ = tf.make([0.0, 0.0, 0.150])
@@ -36,6 +37,7 @@ FAKE_PAYLOAD_MASS = 0.9
 # truly is on tool0 (what a hand-eye calibration should find), and its intrinsics. The ChArUco board sits 0.45 m in
 # front of the camera at the start pose. Nothing publishes tool0 -> camera_link until a part does (SETUP > Parts).
 FAKE_CAM_TOPIC, FAKE_CAM_INFO = "/camera/camera/color/image_rect_raw", "/camera/camera/color/camera_info"
+FAKE_CLOUD_TOPIC = "/zed/zed_node/point_cloud/cloud_registered"
 FAKE_CAM_LINK, FAKE_CAM_OPTICAL = "camera_link", "camera_color_optical_frame"
 FAKE_DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 FAKE_T_LINK_OPTICAL = tf.mm_deg_to_T([0, 15, 0], [-90, 0, -90])
@@ -111,7 +113,9 @@ class FakeBridge:
                 **{f"damping.{k}.{a}": 1.0 for k in ("translation", "rotation") for a in "xyz"},
                 "delta_tau_max": 0.1, "stiffness.update_stiffness": False, "damping.update_damping_factors": False},
             # ft_controllers.yaml sets no offsets: the broadcaster starts raw (offset.* added to the reading)
-            "/ft/force_torque_sensor_broadcaster": {f"offset.{k}.{a}": 0.0 for k in ("force", "torque") for a in "xyz"},
+            "/ft/force_torque_sensor_broadcaster": {**{f"offset.{k}.{a}": 0.0 for k in ("force", "torque") for a in "xyz"},
+                                                     **{f"multiplier.{k}.{a}": 1.0 for k in ("force", "torque") for a in "xyz"},
+                                                     "sensor_name": "tcp_fts_sensor"},
         }
         # Simulated image topics: topic -> (encoding, width, height, hz). ZED and the vision midpoints image are
         # left out on purpose, so SETUP > Cameras shows a camera that is not set up.
@@ -121,6 +125,9 @@ class FakeBridge:
             "/camera/camera/infra1/image_rect_raw": ("mono8", 848, 480, 30.0),
             "/scraping_vision/annotated_image": ("bgr8", 640, 480, 10.0),
         }
+        self.fake_point_cloud_frame = profile.base_link
+        self.fake_point_cloud_age = 0.0
+        self._fake_point_cloud = None
         self.fake_published = set()        # other topics a fake driver 'publishes' (SETUP > Drivers & cameras)
         self._image_watch = None
         self._image_stop = threading.Event()
@@ -254,9 +261,13 @@ class FakeBridge:
             if pen > 0:
                 f_up = R.T @ np.array([0.0, 0.0, float(self.fake_surface.get("k", 5000.0)) * pen])
                 wrench[:3] += f_up
-        off = self.node_params.get("/ft/force_torque_sensor_broadcaster", {})
-        wrench += np.array([float(off.get(f"offset.{k}.{a}", 0.0)) for k in ("force", "torque") for a in "xyz"])
-        return wrench.tolist()
+        # like force_torque_sensor_broadcaster: (sensor value + offset) * multiplier, each axis reading the sensor
+        # axis its interface_names give (ft_axes.py)
+        from . import ft_axes as FA
+        p = self.node_params.get("/ft/force_torque_sensor_broadcaster", {})
+        off = [float(p.get(f"offset.{k}.{a}", 0.0)) for k in ("force", "torque") for a in "xyz"]
+        m = FA.from_params({n: p.get(n) for n in FA.param_names()}) if "sensor_name" in p else None
+        return FA.apply(m or FA.IDENTITY, wrench.tolist(), off)
 
     def joint_state_age(self) -> Optional[float]:
         return self.fake_joint_state_age
@@ -784,7 +795,8 @@ class FakeBridge:
                    ("/robotiq_gripper_controller/gripper_cmd/_action/status", "action_msgs/msg/GoalStatusArray"),
                    ("/policy_runner/status", "std_msgs/msg/String"),
                    ("/policy_runner/step", "std_msgs/msg/String"),
-                   ("/display_planned_path", "moveit_msgs/msg/DisplayTrajectory")]
+                   ("/display_planned_path", "moveit_msgs/msg/DisplayTrajectory"),
+                   (FAKE_CLOUD_TOPIC, "sensor_msgs/msg/PointCloud2")]
 
     def topic_types(self):
         return sorted(set(self.FAKE_TOPICS + [(t, "sensor_msgs/msg/Image") for t in self.fake_cameras]
@@ -802,8 +814,34 @@ class FakeBridge:
         return sorted(set([(t, "sensor_msgs/msg/Image") for t in self.fake_cameras]
                           + (self.real.image_topics() if self.real else [])))
 
+    def point_cloud_topics(self):
+        return sorted(set([(FAKE_CLOUD_TOPIC, "sensor_msgs/msg/PointCloud2")]
+                          + (self.real.point_cloud_topics() if self.real and hasattr(self.real, "point_cloud_topics") else [])))
+
+    def point_cloud_snapshot(self, topic, max_points=MAX_POINTS):
+        if topic != FAKE_CLOUD_TOPIC and self.real and self._is_real(topic) and hasattr(self.real, "point_cloud_snapshot"):
+            return self.real.point_cloud_snapshot(topic, max_points, base_frame=self.profile.base_link)
+        if topic != FAKE_CLOUD_TOPIC:
+            return None, None, "no point cloud topic"
+        if self.fake_point_cloud_age is None or self.fake_point_cloud_age > 2.0:
+            return None, None, "point cloud is stale"
+        T = self.lookup_transform(self.profile.base_link, self.fake_point_cloud_frame)
+        if T is None:
+            return None, None, f"TF unavailable: {self.fake_point_cloud_frame} → {self.profile.base_link}"
+        if self._fake_point_cloud is None:
+            x, y = np.meshgrid(np.linspace(0.15, 0.75, 120), np.linspace(-0.35, 0.35, 80))
+            table = np.c_[x.ravel(), y.ravel(), np.zeros(x.size)]
+            theta = np.linspace(0, 2 * math.pi, 96, endpoint=False)
+            z = np.linspace(0.005, 0.12, 30)
+            cyl = np.c_[0.47 + 0.04 * np.cos(theta)[:, None] * np.ones((1, len(z))),
+                        0.02 + 0.04 * np.sin(theta)[:, None] * np.ones((1, len(z))),
+                        np.ones((len(theta), 1)) * z].reshape(-1, 3)
+            self._fake_point_cloud = np.vstack([table, cyl]).astype(np.float32)
+        points = transform_points(self._fake_point_cloud[:MAX_POINTS], T)
+        return points, height_colors(points), ""
+
     def topic_publishers(self, topic):
-        if topic in self.fake_cameras or topic in self.fake_published:
+        if topic == FAKE_CLOUD_TOPIC or topic in self.fake_cameras or topic in self.fake_published:
             return 1
         return self.real.topic_publishers(topic) if self.real else 0
 
@@ -895,6 +933,12 @@ class FakeBridge:
         if not self.parts_scene_readable:
             return None
         return {i: (o["link"] if o["attach"] else "") for i, o in self.part_objects.items()}
+
+    def tf_parents(self) -> Dict[str, str]:
+        out = dict(self.real.tf_parents()) if self.real else {}
+        out.update({k: v[0] for k, v in self.part_frames.items()})
+        out[FAKE_CAM_OPTICAL] = FAKE_CAM_LINK
+        return out
 
     def tf_parent(self, frame: str) -> Optional[str]:
         if frame == FAKE_CAM_OPTICAL:

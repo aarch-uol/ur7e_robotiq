@@ -4,7 +4,7 @@ This branch is `main` (the robot stack) plus the web GUI for it, in `web_gui/mov
 stack for everyone else.
 
 `web_gui/moveit_gui` is a copy of [mrceki/MoveIt-GUI](https://github.com/mrceki/MoveIt-GUI), branch
-`v2-ur-jazzy`, commit `fb317c1` (maintainer email set to the university address here). Development happens there;
+`v2-ur-jazzy` and its feature branches, commit `4c03bc6` (maintainer email set to the university address here). Development happens there;
 this folder is refreshed from it.
 
 `web_gui/COLCON_IGNORE` keeps the GUI out of the robot image build (its rosdep and colcon steps): the launcher builds

@@ -246,13 +246,37 @@ def test_zero_keeps_the_payload_the_admittance_controller_compensates(s):
     assert result(s, n)["ok"] and np.allclose(reading(s), 0.0, atol=0.03)
 
 
+def test_the_live_view_takes_the_payload_out_like_the_admittance_controller(s):
+    """F/T card "− Payload": after a payload-kept Zero the reading minus the payload view reads ~0 at any pose."""
+    c, b = s.core, s.core.bridge
+    v = c.ft_payload_view()
+    assert v["w"] is None and "reading the payload" in v["why"]           # the controller is read in the background
+    assert wait(lambda: c.ft_payload_view()["w"] is None and "no payload loaded" in c.ft_payload_view()["why"])
+    _load_payload(s)
+    c.PAYLOAD_PARAMS_S = 0.0
+    assert wait(lambda: c.ft_payload_view()["w"] is not None)
+    assert c.ft_payload_view()["kg"] == 0.9
+    n = len(s.results)
+    cmd(s, "ft_bias_zero")
+    assert result(s, n)["ok"]
+    q = list(b.snapshot().joints)
+    for dq in ([0, 0], [0.6, 0.4], [-0.9, 1.2]):
+        assert b.move_joints(q[:4] + [q[4] + dq[0], q[5] + dq[1]], 1.0, 1.0)
+        w = np.array(c.ft_payload_view()["w"])
+        assert np.abs(w[:3]).max() > 1.0                                    # the tool weight is really there
+        assert np.allclose(reading(s) - w, 0.0, atol=0.03)
+    b.node_params.pop("/admittance_controller")                            # controller gone: shown as read
+    assert wait(lambda: "does not answer" in c.ft_payload_view()["why"])
+    assert s.state()["ft_payload"]["w"] is None
+
+
 def test_zero_refuses_when_the_loaded_payload_cannot_be_read(s):
     _load_payload(s)
     s.core.bridge.node_params.pop("/admittance_controller")                   # controller not running
     n = len(s.results)
     cmd(s, "ft_bias_zero")
     r = result(s, n)
-    assert not r["ok"] and "Zero all" in r["msg"]
+    assert not r["ok"] and "Zero incl. tool weight" in r["msg"]
 
 
 def test_gravity_wrench_matches_calibration_math():
@@ -324,7 +348,7 @@ def test_a_zero_with_the_tool_on_does_not_bend_the_payload_fit():
     r = cal.evaluate()
     assert r.passed, r.quality.get("issues")
     assert abs(r.mass - 1.001) < 0.005 and abs(r.cog[2] - 0.0502) < 0.002
-    assert any("Zero now" in w for w in r.quality["warnings"])
+    assert any("no Zero needed" in w for w in r.quality["warnings"])
 
 
 def test_admittance_is_refused_while_the_bias_does_not_match_the_loaded_payload(s):
@@ -343,7 +367,7 @@ def test_admittance_is_refused_while_the_bias_does_not_match_the_loaded_payload(
         return ok, msg
 
     ok, msg = switch()                                            # raw: the sensor's own offset reads as a push
-    assert not ok and "not set" in msg and "Zero now" in msg, msg
+    assert not ok and "not set" in msg and "Zero, keep tool weight" in msg, msg
     n = len(s.results)
     cmd(s, "ft_bias_zero", plain=True)                            # Zero all: weight removed twice
     assert result(s, n)["ok"]
@@ -456,3 +480,35 @@ def test_a_failed_payload_fit_is_used_only_after_the_operator_accepts_it(s, tmp_
     saved = json.loads(cal.saved_path.read_text())
     assert saved["passed"] is False and saved["accepted_despite_failed_checks"] is True
     assert cal.apply_to_admittance("position")[0]
+
+
+def test_zero_then_calibrate_then_admittance_needs_no_second_zero(s):
+    """The operator's flow: Zero with the tool on (nothing loaded yet: the weight leaves the reading), calibrate,
+    Apply. Apply moves the bias by the offset the fit measured, so Admittance starts without another Zero."""
+    c = s.core
+    s.payload.settle_s, s.payload.samples_per_pose, s.payload.sample_period_s = 0.0, 20, 0.005
+    s.payload.base_velocity = 1.0
+    n = len(s.results)
+    cmd(s, "ft_bias_zero")
+    assert result(s, n)["ok"] and c.ft_bias.last["how"] == "zeroed"
+    n = len(s.results)
+    cmd(s, "payload_collect")
+    assert wait(lambda: (s.heartbeat("a") or True) and (s.tick() or True) and len(s.results) > n
+                and not s.payload_progress["running"], 60)
+    assert s.results[-1]["ok"], s.results[-1]["msg"]
+    n = len(s.results)
+    cmd(s, "payload_apply")
+    r = result(s, n)
+    assert r["ok"] and "F/T bias moved by the fitted offset" in r["msg"], r["msg"]
+    assert c.ft_bias.last["how"] == "zeroed, payload kept"
+    v = s.payload_view()["result"]
+    assert not v["bias_changed"] and v["bias_moved"]
+    exp, _ = c._ft_payload_expected()                     # the reading is the tool weight again (no contact)
+    assert np.abs(reading(s)[:3] - np.asarray(exp[:3])).max() < 0.1
+    ok, msg = c.switch_mode("admittance")
+    assert ok, msg
+    assert c.switch_mode("position")[0]
+    before = offsets(s)
+    n = len(s.results)
+    cmd(s, "payload_apply")                               # again: the bias is not moved twice
+    assert result(s, n)["ok"] and offsets(s) == before

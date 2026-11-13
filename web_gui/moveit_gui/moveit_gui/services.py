@@ -32,6 +32,9 @@ START_GRACE_S = 25.0          # a started service without data for this long: "n
 STOP_STEPS = ((signal.SIGINT, 8.0), (signal.SIGTERM, 4.0), (signal.SIGKILL, 2.0))
 CHECK_S = 1.0                 # how often the outputs' publishers are counted
 KEEP_LOGS = 5                 # log files kept per service
+LOG_MAX_BYTES = 50 << 20      # a log past this is cut to its start and end (a driver that lost its device can repeat
+LOG_HEAD_BYTES = 256 << 10    # one error thousands of times a second: one such D405 log reached 6 GB)
+LOG_TAIL_BYTES = 768 << 10
 TOPIC = re.compile(r"^/[A-Za-z0-9_/~{}]*$")
 
 
@@ -340,6 +343,29 @@ def have_package(pkg: str) -> bool:
     return found
 
 
+def trim_log(path: Path, max_bytes: int = LOG_MAX_BYTES, head: int = LOG_HEAD_BYTES, tail: int = LOG_TAIL_BYTES) -> int:
+    """Cut a log that grew past max_bytes to its first `head` and last `tail` bytes (whole lines), in place: the
+    driver keeps writing to it (opened for append, so its writes go to the new end). Returns the bytes cut."""
+    try:
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            return 0
+        with open(path, "rb") as f:
+            start = f.read(head)
+            f.seek(size - tail)
+            end = f.read(tail)
+        start = start[:start.rfind(b"\n") + 1] or start
+        end = end[end.find(b"\n") + 1:] or end
+        cut = size - len(start) - len(end)
+        os.truncate(path, len(start))
+        with open(path, "ab") as f:
+            f.write(b"\n[moveit_gui: %d MB cut from this log: it grew past %d MB, mostly the same lines repeated]\n\n"
+                    % (cut >> 20, max_bytes >> 20) + end)
+        return cut
+    except OSError:
+        return 0
+
+
 def spawn_process(argv: List[str], log_path: Path):
     """The real thing: the command in its own process group (SIGINT reaches every child of `ros2 launch`)."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,6 +524,7 @@ class Run:
     seen: Dict[str, int] = field(default_factory=dict)   # topic -> publishers (last check)
     checked: float = 0.0
     ready_at: Optional[float] = None
+    log_cut: int = 0                      # bytes cut from its log (it floods)
 
 
 # ====================================================================== manager
@@ -753,6 +780,12 @@ class Services:
                     continue
                 if now - r.checked >= CHECK_S:
                     r.checked = now
+                    cut = trim_log(r.log) if r.log and str(r.log) not in ("", ".") else 0
+                    if cut:
+                        if not r.log_cut:
+                            self.log(f"service {n}: its log grew past {LOG_MAX_BYTES >> 20} MB (the same lines over "
+                                     f"and over): cut to its start and end; {r.log}")
+                        r.log_cut += cut
                     s = self.services.get(n)
                     for o in s.outputs() if s else []:
                         try:
@@ -940,11 +973,14 @@ class Services:
         return sorted(self.log_dir.glob(f"{name}_*.log")) if self.log_dir.is_dir() else []
 
     def _prune_logs(self, name: str):
-        for p in self._logs(name)[:-(KEEP_LOGS - 1)]:
+        logs = self._logs(name)
+        for p in logs[:-(KEEP_LOGS - 1)]:
             try:
                 p.unlink()
             except OSError:
                 pass
+        for p in logs[-(KEEP_LOGS - 1):]:                # older logs that flooded before this check existed
+            trim_log(p)
 
     def log_tail(self, name: str, lines: int = 60) -> dict:
         with self._lock:
@@ -970,6 +1006,8 @@ class Services:
                     m for m in s.needs if self.state(m) != "running"),
                        "no_data": "running, but not all its topics publish: see the log",
                        }.get(st) or self.last.get(n, {}).get("msg", "")
+                if r and r.log_cut:
+                    msg = (msg + " · " if msg else "") + f"its log floods (one line repeated; {r.log_cut >> 20} MB cut): see the log"
                 rows.append({"name": n, "label": s.title, "type": s.type, "type_label": TYPES[s.type].label, "kind": s.kind,
                              "state": st, "msg": msg, "pid": r.proc.pid if r else None,
                              "up_s": round(now - r.started) if r else None, "outputs": outs,

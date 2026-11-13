@@ -83,3 +83,77 @@ test('chips pick the axes, the choice is saved, samples arrive at 100 Hz, torque
   c.draw();
   assert.ok(drawn.includes('N') && drawn.includes('Nm'), 'forces and torques on their own axes: ' + drawn.join(' '));
 });
+
+test('the chart glides on the page clock, keeps its axis through noise and draws the same samples each frame', async () => {
+  const { document } = fakeDom();
+  globalThis.document = document;
+  globalThis.devicePixelRatio = 1;
+  globalThis.requestAnimationFrame = () => 0;                 // frames are drawn by hand here
+  let ms = 1000;
+  globalThis.performance = { now: () => ms };
+  const lines = [];
+  const { ftChart } = await load();
+  const c = ftChart(storage());
+  c.el.open = true;
+  // grab what the force line goes through: x of the first point and the y-axis labels
+  const canvas = c.el.all.find((n) => n.tagName === 'CANVAS');
+  const moves = [], labels = [];
+  const rec = { lineTo: (x) => moves.push(x), fillText: (s) => labels.push(String(s)) };
+  const g = new Proxy(rec, { get: (o, k) => (k in o ? o[k] : () => {}), set: () => true });
+  canvas.getContext = () => g;
+  const send = (t0, n, fz) => c.push({ ft_samples: Array.from({ length: n }, (_, i) => [t0 + i * 0.01, 0, 0, fz(i), 0, 0, 0]) });
+  // 30 s of 100 Hz samples arriving in batches of 4 (every 40 ms of page time)
+  let ts = 500;
+  for (let b = 0; b < 750; b++) { send(ts, 4, () => 10); ts += 0.04; ms += 40; }
+  const draw = () => { moves.length = 0; labels.length = 0; c.draw(); return { x: moves.slice(), l: labels.slice() }; };
+  // between two batches "now" moves with the page clock: the line scrolls instead of standing still
+  const a = draw(); ms += 20; const b = draw();
+  assert.ok(b.x[b.x.length - 1] < a.x[a.x.length - 1], 'scrolls between batches');
+  // a spike grows the axis at once; when it leaves the window the axis holds, then shrinks after 2 s
+  send(ts, 1, () => 40); ts += 0.01; ms += 10;
+  assert.ok(draw().l.includes('40') || draw().l.some((s) => +s >= 40), 'grows for a spike');
+  for (let b = 0; b < 503; b++) { send(ts, 4, () => 10); ts += 0.04; ms += 40; if (b % 5 === 0) c.draw(); }   // the spike just left the 20 s window
+  const held = draw().l;
+  assert.ok(held.some((s) => +s >= 40), 'holds right after: ' + held.join(' '));
+  ms += 2500;
+  const shrunk = draw().l;
+  assert.ok(!shrunk.some((s) => +s >= 40), 'shrinks after 2 s: ' + shrunk.join(' '));
+  delete globalThis.performance;
+});
+
+test('"− Payload" redraws the whole history with the payload each sample came with, so it matches the card', async () => {
+  const { document } = fakeDom();
+  globalThis.document = document;
+  globalThis.devicePixelRatio = 1;
+  globalThis.requestAnimationFrame = () => 0;
+  let ms = 1000;
+  globalThis.performance = { now: () => ms };
+  const { ftChart } = await load();
+  const c = ftChart(storage());
+  c.el.open = true;
+  const canvas = c.el.all.find((n) => n.tagName === 'CANVAS');
+  const ys = [], labels = [];
+  const g = new Proxy({ lineTo: (x, y) => ys.push(y), fillText: (s) => labels.push(String(s)) },
+    { get: (o, k) => (k in o ? o[k] : () => {}), set: () => true });
+  canvas.getContext = () => g;
+  // 10 s at rest, then the wrist turns: the tool weight moves from Fz to Fx; the reading is only the weight
+  let ts = 500;
+  for (let b = 0; b < 250; b++) {
+    const w = b < 125 ? [0, 0, 12, 0, 0, 0] : [9, 0, 8, 0, 0, 0];
+    c.push({ ft_payload: { w, kg: 1.2 }, ft_samples: Array.from({ length: 4 }, (_, i) => [ts + i * 0.01, ...w]) });
+    ts += 0.04; ms += 40;
+  }
+  const draw = () => { ys.length = 0; labels.length = 0; c.draw(); return { ys: ys.slice(), top: Math.max(...labels.map(Number).filter(Number.isFinite)) }; };
+  const raw = draw();
+  assert.ok(raw.top >= 12, 'as read: the weight is drawn');
+  c.setPayloadRemoved(true);
+  const comp = draw();
+  assert.ok(comp.top < 5, 'payload removed: the axis falls to the residual, top label ' + comp.top);
+  const n = {};                                                // series points: many lineTo at one y; grid lines: few
+  for (const y of comp.ys) n[y.toFixed(1)] = (n[y.toFixed(1)] || 0) + 1;
+  const lineYs = Object.keys(n).filter((y) => n[y] >= 20);
+  assert.equal(lineYs.length, 1, 'every line flat at 0, before and after the turn: ' + JSON.stringify(n));
+  c.setPayloadRemoved(false);
+  assert.ok(draw().top >= 12, 'and back');
+  delete globalThis.performance;
+});

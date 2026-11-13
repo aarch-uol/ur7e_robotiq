@@ -80,7 +80,7 @@ class RobotCore:
         # SETUP > F/T + payload > Match simulation: the result in use goes into every policy run's robot config
         self.ft_match = FtMatchStore(ft_match_path(_config_dir(), profile.name))
         self.settings_owner: Callable[[], str] = lambda: ""      # whose settings are in use (set by the web GUI)
-        library.ft_axes = lambda: (self.settings_owner(), self.ft_match.load())
+        library.ft_axes = lambda: (self.settings_owner(), self._ft_match_checked())
         library.notify = bridge.log
         self.policies = PolicyExecutor(library, self.modes, bridge,
                                        MockPolicyRunner() if fake else SubprocessPolicyRunner(library, self.modes),
@@ -157,6 +157,7 @@ class RobotCore:
         # {"route", "restore", "kind", "t"}; renewed by the page, dropped JOG_ARM_S after the last renewal.
         self._jog_arm: Optional[dict] = None
         self._arm_lock = threading.RLock()
+        self._jog_ready_held = False        # after STOP: Servo is made ready again only by a jog press
         self._disarming = False
         self.jog_cfg = jog.jog_config(profile)
         self._force: Optional[force.ForceStream] = None
@@ -520,6 +521,7 @@ class RobotCore:
 
     def jog_start_velocity(self, velocity: JogVelocity, speed: float, shape_values: bool = True) -> Result:
         """Begin a Servo hold with six simultaneous normalized axes; every renewal can change them."""
+        self._jog_ready_held = False                 # a deliberate press: the Jog tab may keep Servo ready again
         why = self.jog_hold_refusal()
         if why:
             return False, why
@@ -647,6 +649,8 @@ class RobotCore:
                 self.jog_disarm()
             if self.jogging:
                 return True, "jogging"
+            if self._jog_ready_held:
+                return False, "stopped: Servo is made ready again by the next jog press"
             why = self.jog_hold_refusal()
             if why:
                 return False, why
@@ -1121,18 +1125,19 @@ class RobotCore:
         ok, msg = self.gains.restore(target, f"before switching to {target}")
         return ok, (msg if ok else f"saved controller gains could not be restored: {msg}")
 
-    def _ft_payload_expected(self):
-        """The weight of the payload loaded on the admittance controller, as the sensor sees it now (FtBias.payload)."""
+    _PAYLOAD_KEYS = ["gravity_compensation.CoG.force", "gravity_compensation.CoG.pos", "gravity_compensation.frame.id"]
+
+    def _ft_payload_node(self):
+        return ((self.profile.ft_calibration or {}).get("apply_to") or {}).get("node")
+
+    def _ft_payload_from(self, node, p):
+        """(wrench, note) of the payload loaded on node (its parameters p), as the sensor sees it now. Same maths as
+        the admittance controller's gravity compensation."""
         fc = self.profile.ft_calibration or {}
-        node = (fc.get("apply_to") or {}).get("node")
-        if not node:
-            return None, ""
-        keys = ["gravity_compensation.CoG.force", "gravity_compensation.CoG.pos", "gravity_compensation.frame.id"]
-        p = self.bridge.get_node_parameters(node, keys)
         if p is None:
             return None, (f"cannot read the payload loaded on {node} (not running?): zeroing now would also zero "
-                          "the tool weight the controller compensates. Start the stack, or use Zero all")
-        w, pos, frame = p.get(keys[0]), p.get(keys[1]), p.get(keys[2])
+                          "the tool weight the controller compensates. Start the stack, or use Zero incl. tool weight")
+        w, pos, frame = (p.get(k) for k in self._PAYLOAD_KEYS)
         if not w or abs(float(w)) < 1e-6 or pos is None:
             return None, ""                       # no payload compensated: zero everything
         sensor = fc.get("sensor_frame") or frame
@@ -1143,6 +1148,46 @@ class RobotCore:
             return None, f"no transform {fc.get('reference_frame', 'base_link')} -> {sensor} for the payload weight"
         from .ft_bias import G, gravity_wrench
         return gravity_wrench(T, float(w), pos), f"Kept the {abs(float(w)) / G:.3f} kg payload loaded on {node}"
+
+    def _ft_payload_expected(self):
+        """The weight of the payload loaded on the admittance controller, as the sensor sees it now (FtBias.payload)."""
+        node = self._ft_payload_node()
+        if not node:
+            return None, ""
+        return self._ft_payload_from(node, self.bridge.get_node_parameters(node, self._PAYLOAD_KEYS))
+
+    PAYLOAD_PARAMS_S = 3.0                         # how often the live view re-reads the controller's payload
+
+    def ft_payload_view(self) -> Optional[dict]:
+        """The payload weight the admittance controller removes, as the sensor sees it now, for showing the reading
+        the way the controller does. The controller's parameters are re-read in the background every few seconds;
+        only the pose is current. None: no payload calibration in this profile."""
+        node = self._ft_payload_node()
+        if not node:
+            return None
+        c = getattr(self, "_payload_cache", None)
+        if (c is None or time.monotonic() - c[0] > self.PAYLOAD_PARAMS_S) and not getattr(self, "_payload_reading", False):
+            self._payload_reading = True
+
+            def read():
+                try:
+                    self._payload_cache = (time.monotonic(), self.bridge.get_node_parameters(node, self._PAYLOAD_KEYS))
+                finally:
+                    self._payload_reading = False
+            threading.Thread(target=read, daemon=True, name="payload-params").start()
+        if c is None:
+            return {"w": None, "kg": 0.0, "why": f"reading the payload on {node}"}
+        p = c[1]
+        if p is None:
+            return {"w": None, "kg": 0.0, "why": f"{node} does not answer (not running?)"}
+        w = p.get(self._PAYLOAD_KEYS[0])
+        if not w or abs(float(w)) < 1e-6 or p.get(self._PAYLOAD_KEYS[1]) is None:
+            return {"w": None, "kg": 0.0, "why": f"no payload loaded on {node} (SETUP › F/T + Payload › Apply)"}
+        wr, note = self._ft_payload_from(node, p)
+        from .ft_bias import G
+        if wr is None:
+            return {"w": None, "kg": 0.0, "why": note}
+        return {"w": [round(v, 4) for v in wr], "kg": round(abs(float(w)) / G, 3), "why": ""}
 
     def program_zero_ft(self, stopped) -> Result:
         """zero_ft step: the program's own run does not block it; a mode using the reading or a force does."""
@@ -1196,6 +1241,7 @@ class RobotCore:
         if reason:
             self.note_stop(reason)
         # each part on its own: one that raises must not keep the others (or the cancel) from running
+        self._jog_ready_held = True                  # the Jog tab's renewals must not prepare Servo again
         for part in (lambda: self.batch.stop("stopped by STOP"),                   # first: no next run of a batch starts
                      lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
                      lambda: self.jog_stop("STOP"), self.jog_disarm, self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
@@ -1206,10 +1252,27 @@ class RobotCore:
         self.command_source = "idle"
         self.bridge.log(f"STOPPED: {reason}" if reason else "STOP GUI MOTION pressed")
 
+    def _ft_match_checked(self) -> Optional[dict]:
+        """The saved Match simulation result, with "stale" set when the F/T reading axes now running are not the
+        ones it was measured with (it was fitted to the published axes of then)."""
+        from . import ft_axes as FA
+        res = self.ft_match.load()
+        fb = getattr(self, "ft_bias", None)
+        if not res or fb is None or not fb.available or fb.live is None:     # running axes not known (yet)
+            return res
+        saved = FA.decode(res["reading_axes"]) if res.get("reading_axes") is not None else list(FA.IDENTITY)
+        if saved is not None and list(saved) != list(fb.axes):
+            a, b = FA.label(saved), FA.label(fb.axes)
+            return {**res, "stale": f"the F/T reading axes changed since this Match (X {a['x']}, Y {a['y']} then; "
+                                    f"X {b['x']}, Y {b['y']} now): run the Match again or remove it"}
+        return res
+
     def _ft_hard_stop(self, why: str):
         """The F/T hard limit (ft_guard.py, its own thread): stop everything the GUI commands, motion first."""
         self.bridge.log(f"F/T HARD LIMIT: {why}: stopping the GUI's motion")
-        for part in (self.bridge.cancel_motion, self.runner.stop, self.policies.cancel,
+        self._jog_ready_held = True
+        for part in (self.bridge.cancel_motion, lambda: self.batch.stop("stopped by the F/T hard limit"),
+                     self.runner.stop, self.policies.cancel,     # the batch before its run: no next run starts
                      lambda: self.jog_stop("F/T hard limit"), self.jog_disarm,
                      lambda: self.force_stop("F/T hard limit: zeroed")):
             try:

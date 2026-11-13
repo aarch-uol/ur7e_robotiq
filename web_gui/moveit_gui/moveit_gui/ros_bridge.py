@@ -47,6 +47,7 @@ from .bridge_api import (DASHBOARD_COMMANDS, DASHBOARD_TIMEOUT_S, Snapshot, Wren
                          dashboard_with_reconnect, gripper_status_dict, reconnect_gripper)
 from .camera import IMAGE as IMAGE_TYPE, IMAGE_TYPES, ImageWatch
 from .control_modes import ReferenceShiftError, moveit_controller_for, shift_to_reference
+from .point_cloud import MAX_POINTS, decode_pointcloud2, transform_points
 from .profile import RobotProfile, reorder_joints
 
 
@@ -276,6 +277,16 @@ class CameraTopics:
         p = (d.get(frame) or {}).get("parent")
         return p if p and p != "NO_PARENT" else None
 
+    def tf_parents(self) -> Dict[str, str]:
+        """{frame: parent} of every frame in TF now (roots left out)."""
+        if self._tf is None:
+            return {}
+        try:
+            d = yaml.safe_load(self._tf.all_frames_as_yaml()) or {}
+        except Exception:
+            return {}
+        return {k: v["parent"] for k, v in d.items() if isinstance(v, dict) and v.get("parent") not in (None, "NO_PARENT")}
+
     def topic_types(self) -> List[Tuple[str, str]]:
         """(topic, type) for every topic in the graph now (one row per type), for the recorder."""
         try:
@@ -364,6 +375,113 @@ class CameraTopics:
         return self._image_watch
 
 
+class PointCloudTopics:
+    """Lazy PointCloud2 subscriptions shared by the real bridge and the real-camera helper."""
+
+    POINT_CLOUD_KEEP_S = 5.0
+    POINT_CLOUD_STALE_S = 2.0
+
+    def _point_cloud_init(self):
+        self._point_clouds, self._point_cloud_lock = {}, threading.Lock()
+        self._point_cloud_timer = None
+
+    def point_cloud_topics(self):
+        try:
+            return sorted((name, t) for name, types in self.node.get_topic_names_and_types() for t in types
+                          if t == "sensor_msgs/msg/PointCloud2")
+        except Exception:
+            return []
+
+    def _point_cloud_reap(self):
+        now = time.monotonic()
+        with self._point_cloud_lock:
+            old = [k for k, e in self._point_clouds.items() if now - e["used"] > self.POINT_CLOUD_KEEP_S]
+            entries = [self._point_clouds.pop(k) for k in old]
+            if not self._point_clouds and self._point_cloud_timer is not None:
+                timer, self._point_cloud_timer = self._point_cloud_timer, None
+            else:
+                timer = None
+        for e in entries:
+            self.node.destroy_subscription(e["sub"])
+        if timer is not None:
+            self.node.destroy_timer(timer)
+
+    def _point_cloud_sub(self, topic):
+        from sensor_msgs.msg import PointCloud2
+        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
+        if "sensor_msgs/msg/PointCloud2" not in types:
+            return None, "no point cloud topic"
+        entry = {"msg": None, "received": 0.0, "used": time.monotonic()}
+
+        def on_msg(msg):
+            entry["msg"], entry["received"] = msg, time.monotonic()
+
+        entry["sub"] = self.node.create_subscription(PointCloud2, topic, on_msg, qos_profile_sensor_data,
+                                                       callback_group=self.cb)
+        return entry, ""
+
+    def _point_cloud_tf(self, base_frame, frame):
+        if frame == base_frame:
+            return np.eye(4)
+        lookup = getattr(self, "lookup_transform", None)
+        if lookup is not None:
+            return lookup(base_frame, frame)
+        if self._tf is None:
+            return None
+        try:
+            tr = self._tf.lookup_transform(base_frame, frame, Time())
+        except TransformException:
+            return None
+        p, q = tr.transform.translation, tr.transform.rotation
+        return tf.make([p.x, p.y, p.z], [q.x, q.y, q.z, q.w])
+
+    def point_cloud_snapshot(self, topic, max_points=MAX_POINTS, base_frame=None):
+        if not hasattr(self, "_point_clouds"):
+            self._point_cloud_init()
+        if topic not in dict(self.point_cloud_topics()):
+            return None, None, "no point cloud topic"
+        with self._point_cloud_lock:
+            entry = self._point_clouds.get(topic)
+            if entry is None:
+                entry, why = self._point_cloud_sub(topic)
+                if entry is None:
+                    return None, None, why
+                self._point_clouds[topic] = entry
+                if self._point_cloud_timer is None:
+                    self._point_cloud_timer = self.node.create_timer(1.0, self._point_cloud_reap,
+                                                                     callback_group=self.cb)
+            entry["used"] = time.monotonic()
+            msg, received = entry["msg"], entry["received"]
+        if msg is None:
+            return None, None, "waiting for point cloud"
+        if time.monotonic() - received > self.POINT_CLOUD_STALE_S:
+            return None, None, "point cloud is stale"
+        frame = str(getattr(getattr(msg, "header", None), "frame_id", "") or "")
+        base = base_frame or getattr(self.profile, "base_link", "base_link")
+        if not frame:
+            return None, None, "point cloud has no frame"
+        T = self._point_cloud_tf(base, frame)
+        if T is None:
+            return None, None, f"TF unavailable: {frame} → {base}"
+        try:
+            points, colors = decode_pointcloud2(msg, max_points=max_points)
+            return transform_points(points, T), colors, ""
+        except Exception as e:
+            return None, None, f"point cloud: {e}"
+
+    def point_cloud_shutdown(self):
+        if not hasattr(self, "_point_clouds"):
+            return
+        with self._point_cloud_lock:
+            entries = list(self._point_clouds.values())
+            self._point_clouds.clear()
+            timer, self._point_cloud_timer = self._point_cloud_timer, None
+        for e in entries:
+            self.node.destroy_subscription(e["sub"])
+        if timer is not None:
+            self.node.destroy_timer(timer)
+
+
 def light_executor():
     """rclpy's EventsExecutor (Jazzy: rclpy.experimental), else a SingleThreadedExecutor. Both cost much less per
     message than a MultiThreadedExecutor; only for callbacks that never block."""
@@ -375,7 +493,7 @@ def light_executor():
         return SingleThreadedExecutor()
 
 
-class RealCameras(CameraTopics):
+class RealCameras(CameraTopics, PointCloudTopics):
     """Real cameras next to a fake robot (moveit_gui_web --fake --real-cameras): its own node that only reads
     topics and TF, so camera drivers can be tried on a PC without a robot. It publishes nothing."""
 
@@ -387,6 +505,7 @@ class RealCameras(CameraTopics):
         self._image_sub = None
         self._image_watch: Optional[ImageWatch] = None
         self._tf = None
+        self._point_cloud_init()
         if Buffer is not None:
             self._tf = Buffer()
             self._tf_listener = TransformListener(self._tf, self.node, spin_thread=False)
@@ -395,13 +514,14 @@ class RealCameras(CameraTopics):
         threading.Thread(target=self._executor.spin, daemon=True, name="ros-cameras").start()
 
     def shutdown(self):
+        self.point_cloud_shutdown()
         self._executor.shutdown(timeout_sec=1.0)
         self.node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
 
-class RosBridge(CameraTopics):
+class RosBridge(CameraTopics, PointCloudTopics):
     STALE_S = 1.0
     SPIN_STALE_S = 2.0              # executor heartbeat older than this: the ROS thread is stuck
     CONTROLLERS_STALE_S = 3.0       # polled every 0.5 s by _health_tick
@@ -431,6 +551,7 @@ class RosBridge(CameraTopics):
         self._pose_latest: Dict[str, Tuple[float, PoseStamped]] = {}
         self._image_sub = None
         self._image_watch: Optional[ImageWatch] = None
+        self._point_cloud_init()
 
         t, s = profile.topics, profile.services
         n = self.node
@@ -1379,6 +1500,7 @@ class RosBridge(CameraTopics):
         """A taught replay (replay.py): one JointTrajectory, sent like a planned one (MoveIt ExecuteTrajectory to the
         active mode's controller, or from its reference in chained admittance)."""
         from trajectory_msgs.msg import JointTrajectoryPoint
+        epoch = self.stop_epoch                     # a STOP while the message is built cancels it
         traj = JointTrajectory()
         traj.joint_names = list(joint_names)
         for k, (t, q) in enumerate(zip(times, positions)):
@@ -1390,7 +1512,7 @@ class RosBridge(CameraTopics):
             p.time_from_start = DurationMsg(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
             traj.points.append(p)
         self.log(f"replay: {len(traj.points)} points, {float(times[-1]):.1f} s")
-        return self._execute_on_active_controller(traj)
+        return self._execute_on_active_controller(traj, epoch)
 
     def joint_sample(self):
         """(JointState header stamp s, joints) of the last arm joint state, or None."""
@@ -1939,6 +2061,10 @@ class RosBridge(CameraTopics):
             self.cancel_motion()
         except Exception as e:
             self.log(f"shutdown: cancel motion: {e}")
+        try:
+            self.point_cloud_shutdown()
+        except Exception as e:
+            self.log(f"shutdown: point cloud: {e}")
         for topic, pub in list(self._wrench_pubs.items()):
             frame = next((m.wrench.get("frame", self.profile.base_link) for m in self.profile.modes.values()
                           if m.wrench.get("topic") == topic), self.profile.base_link)

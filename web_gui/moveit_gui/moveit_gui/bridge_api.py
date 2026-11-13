@@ -25,6 +25,9 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
   set_node_parameters(node, {name: value}) -> (ok, msg)     rcl_interfaces SetParameters
   get_node_parameters(node, [names]) -> Optional[dict]      None = node not reachable
   image_topics() -> [(topic, type)]          advertised sensor_msgs Image / CompressedImage topics
+  point_cloud_topics() -> [(topic, type)]    advertised sensor_msgs PointCloud2 topics
+  point_cloud_snapshot(topic, max_points=30000) -> (points, colors, msg)
+                                             latest bounded cloud in the profile base frame, or a short msg
   topic_publishers(topic) -> int
   watch_image(topic | None) -> (ok, msg)     the ONE previewed image topic (camera.ImageWatch)
   watched_image() -> Optional[ImageWatch]

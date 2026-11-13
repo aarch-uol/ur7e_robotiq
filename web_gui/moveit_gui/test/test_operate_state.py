@@ -86,3 +86,61 @@ def test_run_again_right_after_a_run_ends_is_not_silently_ignored(s):
         s.command("a", "program_run", {})
         assert wait(lambda: s.core.program_result is not None, 5)
         assert s.core.program_result == (True, "finished")
+
+
+def test_program_restart_stops_the_current_run_and_starts_at_step_zero(s):
+    d = {"version": 2, "name": "restartable", "steps": [
+        {"type": "wait", "seconds": 0.4},
+        {"type": "wait", "seconds": 0.05},
+    ]}
+    s.command("a", "program_set_yaml", {"text": yaml.safe_dump(d)})
+    s.command("a", "program_run", {})
+    assert wait(lambda: s.core.runner.state.name == "RUNNING" and s.core.runner.current_path == (0,))
+    first_started = s.core.runner.started_at
+
+    result = s.command("a", "program_restart", {})
+
+    assert result["ok"]
+    assert wait(lambda: s.core.runner.state.name == "RUNNING" and s.core.runner.current_path == (0,))
+    assert s.core.runner.started_at > first_started
+    assert wait(lambda: s.core.program_result is not None)
+    assert s.core.program_result == (True, "finished")
+
+
+def test_program_restart_refuses_preflight_and_unknown_control_state_without_stopping(s):
+    d = {"version": 2, "name": "restartable", "steps": [
+        {"type": "wait", "seconds": 0.4},
+    ]}
+    s.command("a", "program_set_yaml", {"text": yaml.safe_dump(d)})
+    s.command("a", "program_run", {})
+    assert wait(lambda: s.core.runner.state.name == "RUNNING")
+    s.core.modes.unknown_reason = "test"
+
+    with pytest.raises(Exception, match="control state|busy"):
+        s.command("a", "program_restart", {})
+
+    assert s.core.runner.state.name == "RUNNING"
+    s.core.modes.unknown_reason = ""
+    s.command("a", "program_stop", {})
+    assert wait(lambda: s.core.runner.state.name == "IDLE")
+
+    bad = {"version": 2, "name": "bad-restart", "steps": [
+        {"type": "movej", "target": "missing", "velocity": 0.5},
+    ]}
+    s.command("a", "program_set_yaml", {"text": yaml.safe_dump(bad)})
+    with pytest.raises(Exception, match="preflight failed"):
+        s.command("a", "program_restart", {})
+    assert s.core.runner.state.name == "IDLE"
+
+
+def test_program_restart_refuses_when_another_program_is_open(s):
+    run = {"version": 2, "name": "running-one", "steps": [{"type": "wait", "seconds": 0.6}]}
+    s.command("a", "program_set_yaml", {"text": yaml.safe_dump(run)})
+    s.command("a", "program_run", {})
+    assert wait(lambda: s.core.runner.state.name == "RUNNING")
+    s.program.name = "other-one"                               # editing is refused during a run: set it directly
+    with pytest.raises(Exception, match="is running but"):
+        s.command("a", "program_restart", {})
+    assert s.core.runner.state.name == "RUNNING"               # the run goes on, untouched
+    s.command("a", "program_stop", {})
+    assert wait(lambda: s.core.runner.state.name == "IDLE")

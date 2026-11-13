@@ -3,10 +3,13 @@ import sys
 import threading
 import time
 import json
+import struct
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +87,33 @@ def test_is_stationary_unknown_without_velocities(ros_bridge_module):
     assert b.is_stationary() is True
     b._t_joints = time.monotonic() - 5
     assert b.is_stationary() is None          # stale
+
+
+def test_point_cloud_subscription_is_lazy_and_decodes_latest_sample(ros_bridge_module):
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b.node = mock.MagicMock()
+    b.cb = mock.MagicMock()
+    b._tf = None
+    b.node.get_topic_names_and_types.return_value = [("/cloud", ["sensor_msgs/msg/PointCloud2"])]
+    sub = object()
+    callbacks = []
+    b.node.create_subscription.side_effect = lambda _cls, _topic, cb, *_args, **_kw: (callbacks.append(cb) or sub)
+    fields = [SimpleNamespace(name=n, offset=i * 4, datatype=7, count=1) for i, n in enumerate(("x", "y", "z"))]
+    raw = struct.pack("<fff", 1.0, 2.0, 3.0)
+    msg = SimpleNamespace(width=1, height=1, point_step=12, row_step=12, fields=fields,
+                          is_bigendian=False, data=raw,
+                          header=SimpleNamespace(frame_id=b.profile.base_link))
+    b.lookup_transform = lambda _parent, _child: np.eye(4)
+
+    assert b.point_cloud_topics() == [("/cloud", "sensor_msgs/msg/PointCloud2")]
+    assert b.node.create_subscription.call_count == 0
+    assert b.point_cloud_snapshot("/cloud")[2] == "waiting for point cloud"
+    callbacks[0](msg)
+    points, colors, why = b.point_cloud_snapshot("/cloud")
+
+    assert why == "" and points.tolist() == [[1.0, 2.0, 3.0]] and colors.shape == (1, 3)
+    assert b.node.create_subscription.call_count == 1
 
 
 def test_trajectory_goal_names_the_controller_of_the_active_mode(ros_bridge_module):

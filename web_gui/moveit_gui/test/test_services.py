@@ -209,3 +209,35 @@ def test_two_copies_of_a_driver_are_both_stopped_and_one_is_started(mgr):
     assert fresh.pid not in (first.pid, second.pid) and fresh.poll() is None
     m2.stop("cam")
     assert wait(lambda: (m2.tick(), m2.state("cam"))[1] == "stopped")
+
+
+def test_a_log_cut_to_its_start_and_end(tmp_path):
+    p = tmp_path / "d405_x.log"
+    p.write_bytes(b"started ok\n" + b"ERROR No such device\n" * 5000 + b"last line\n")
+    assert SV.trim_log(p, max_bytes=10 ** 6) == 0                     # small: untouched
+    with open(p, "ab") as f:                                        # the driver keeps appending (O_APPEND)
+        cut = SV.trim_log(p, max_bytes=20000, head=100, tail=300)
+        assert cut > 90000
+        f.write(b"after the cut\n")
+    t = p.read_bytes()
+    assert t.startswith(b"started ok\n") and b"MB cut from this log" in t and t.endswith(b"last line\nafter the cut\n")
+    assert len(t) < 1000
+
+
+def test_a_flooding_driver_log_is_cut_and_shown(mgr, monkeypatch):
+    make, pubs = mgr
+    monkeypatch.setattr(SV, "LOG_MAX_BYTES", 50000)
+    monkeypatch.setattr(SV.trim_log, "__defaults__", (50000, 1000, 2000))
+    m = make()
+    m.save({"name": "cam", "type": "usb_cam"})
+    old = m.log_dir / "cam_20200101_000000.log"                      # flooded before this check existed
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(b"x" * 200000)
+    m.start("cam")
+    assert old.stat().st_size < 5000
+    assert wait(lambda: (m.tick(), m.state("cam"))[1] == "running")
+    with open(m.runs["cam"].log, "ab") as f:
+        f.write(b"ERROR No such device\n" * 10000)
+    assert wait(lambda: (m.tick(), m.runs["cam"].log_cut)[1] > 0, 5)
+    assert m.runs["cam"].log.stat().st_size < 10000
+    assert "its log floods" in m.view()["services"][0]["msg"]

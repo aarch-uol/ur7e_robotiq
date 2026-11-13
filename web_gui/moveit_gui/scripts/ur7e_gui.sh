@@ -137,23 +137,28 @@ build_ws() {                                        # $1: the image the stack an
 # build for this image (the stamp has the time that build started); a new image starts it from scratch.
 OVERLAY_DIR=/data/overlay                           # $DATA/overlay on this PC
 OVERLAY_STAMP="$DATA/overlay/.built_for"            # the image id it was built for
-overlay_pkgs() { sed -n 's:.*<name>\(.*\)</name>.*:\1:p' "$REPO"/*/package.xml | paste -sd' '; }
+# third_party/<pkg>: patched copies of packages the image builds from upstream (e.g. net_ft_driver). Built here by
+# path and overriding the image's copy; third_party/COLCON_IGNORE keeps the image's own build from seeing them twice.
+overlay_tp() { for d in "$REPO"/third_party/*/; do [ -f "$d/package.xml" ] && basename "$d"; done; }
+overlay_pkgs() { sed -n 's:.*<name>\(.*\)</name>.*:\1:p' "$REPO"/*/package.xml \
+  $(for d in $(overlay_tp); do echo "$REPO/third_party/$d/package.xml"; done) | paste -sd' '; }
 build_overlay() {
   [ "$OVERLAY" = 1 ] || return 0
-  local id pkgs
+  local id pkgs bases
   id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
   if [ -f "$OVERLAY_STAMP" ] && [ "$(cat "$OVERLAY_STAMP" 2>/dev/null)" = "$id" ] && \
      [ -z "$(find "$REPO" -path "$REPO/.git" -prune -o -newer "$OVERLAY_STAMP" -print -quit)" ]; then
     return 0
   fi
   pkgs=$(overlay_pkgs)
+  bases="/ur7e_robotiq$(for d in $(overlay_tp); do printf ' /ur7e_robotiq/third_party/%s' "$d"; done)"
   say "Building ~/ur7e_robotiq's packages (overlay on $IMAGE): $pkgs"
   docker run --rm --network none -v "$REPO:/ur7e_robotiq:ro" -v "$DATA:/data" -e ID="$id" "$IMAGE" bash -c "
     mkdir -p $OVERLAY_DIR && cd $OVERLAY_DIR || exit 1
     [ \"\$(cat .built_for 2>/dev/null)\" = \"\$ID\" ] || rm -rf build install log .built_for
     touch .started && source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash &&
     ov=''; colcon build --help 2>/dev/null | grep -q -- --allow-overriding && ov='--allow-overriding $pkgs'
-    colcon build --symlink-install --base-paths /ur7e_robotiq --packages-select $pkgs \$ov &&
+    colcon build --symlink-install --base-paths $bases --packages-select $pkgs \$ov &&
     printf '%s' \"\$ID\" > .built_for && touch -r .started .built_for && rm -f .started" \
     > "$DATA/logs/overlay_build.log" 2>&1 || { tail -30 "$DATA/logs/overlay_build.log"; echo "Building ~/ur7e_robotiq failed (log: ~/ur7e_data/logs/overlay_build.log)"; return 1; }
 }
@@ -212,6 +217,12 @@ parts_env() {                                       # -e options for the parts f
     set -- $f
     [ -f "$DATA/config/moveit_gui/parts/generated/$2" ] && printf -- '-e UR7E_USER_PARTS_%s=%s/%s ' "$1" "$PARTS" "$2"
   done
+  return 0
+}
+# SETUP > F/T + payload > Reading axes (moveit_gui/ft_axes.py): the F/T broadcaster's axis mapping, a parameters file
+# drivers.launch.py loads after ft_controllers.yaml (UR7E_FT_AXES_PARAMS). No file: the sensor's own axes.
+ft_axes_env() {
+  [ -f "$DATA/config/moveit_gui/ft_axes.yaml" ] && printf -- '-e UR7E_FT_AXES_PARAMS=/data/config/moveit_gui/ft_axes.yaml '
   return 0
 }
 ROBOTS="ur7e fr3"                                   # moveit_gui/robots.py ROBOTS
@@ -413,7 +424,7 @@ start_stack() {
     [ -f "$WS/scraping/export_policy_card.py" ] && \
       POLICY_ENV+=(-e "MOVEIT_GUI_POLICY_CARD_COMMAND=python3 /ws/scraping/export_policy_card.py")
   fi
-  docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host --ulimit rtprio=99 -e ROS_DOMAIN_ID="$DOMAIN" "${NET_ENV[@]}" -e UR7E_EE_CONFIG="$BASE" $(parts_env) \
+  docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host --ulimit rtprio=99 -e ROS_DOMAIN_ID="$DOMAIN" "${NET_ENV[@]}" -e UR7E_EE_CONFIG="$BASE" $(parts_env) $(ft_axes_env) \
     -v /dev:/dev --device-cgroup-rule 'c 81:* rmw' --device-cgroup-rule 'c 189:* rmw' "${ZED_ENV[@]}" \
     -e UR7E_ROBOT="$ROBOT" -e UR7E_ROBOT_MODE="$([ "$FAKE" = 1 ] && echo fake || echo real)" -e UR7E_ROBOT_IP="$ROBOT_IP" -e UR7E_FT_IP="$FT_IP" \
     -e UR7E_SERVO="$SERVO" \

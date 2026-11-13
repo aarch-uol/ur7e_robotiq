@@ -568,3 +568,64 @@ def test_handeye_adjusted_by_hand_and_reopened(env):
     assert not v["samples"]
     run(s, "handeye_save", name="wrist", as_part=False, xyz_mm=list(xyz), rpy_deg=list(rpy))   # back, samples kept
     assert s.cams.cameras["wrist"]["samples"] == n and len(s.cams.cameras["wrist"]["sample_data"]) == n
+
+
+def test_handeye_result_in_a_picked_camera_frame(env):
+    """Like MoveIt's sensor frame: the result, the hand edit and the saved pose are in the picked camera frame."""
+    from moveit_gui import handeye as he
+    s, b, _ = env
+    b.time_scale = 20.0
+    run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC)
+    v = run(s, "handeye_get")["he"]
+    assert v["sensor"] == fb.FAKE_CAM_OPTICAL and fb.FAKE_CAM_LINK in v["sensor_frames"]
+    assert fb.FAKE_CAM_OPTICAL in v["sensor_frames"] and "tool0" not in v["sensor_frames"]
+    with pytest.raises(CommandError, match="TF tree"):
+        run(s, "handeye_sensor", frame="tool0")
+    v = run(s, "handeye_sensor", frame=fb.FAKE_CAM_LINK)["he"]
+    assert v["sensor"] == fb.FAKE_CAM_LINK
+    assert np.allclose(np.array(v["T_sensor_optical"]).reshape(4, 4), fb.FAKE_T_LINK_OPTICAL, atol=1e-6)
+    run(s, "handeye_plan", tilt_deg=20)
+    run(s, "handeye_collect")
+    assert wait(lambda: not s.he["progress"]["running"], 60) and s.results[-1]["ok"]
+    r = run(s, "handeye_get")["he"]["result"]
+    want, _ = tf.T_to_mm_deg(fb.FAKE_T_TOOL0_CAMLINK)
+    assert max(abs(a - c) for a, c in zip(r["xyz_mm"], want)) < 3
+    X = s.he["result"]["X"]
+    out = run(s, "handeye_save", name="wrist", as_part=False, xyz_mm=[r["xyz_mm"][0] + 1.0, *r["xyz_mm"][1:]],
+              rpy_deg=r["rpy_deg"])
+    assert "adjusted by hand 1.0 mm" in out["msg"]
+    e = s.cams.cameras["wrist"]
+    assert e["sensor_frame"] == fb.FAKE_CAM_LINK
+    assert tf.T_to_mm_deg(he._T_in(e["T_parent_sensor"]))[0][0] == pytest.approx(r["xyz_mm"][0] + 1.0, abs=1e-3)
+    d = tf.inv(X) @ s.cams.T_parent_optical("wrist")                  # the optical frame moved 1 mm too
+    assert np.linalg.norm(d[:3, 3]) * 1000 == pytest.approx(1.0, abs=0.01)
+    v = run(s, "handeye_load", name="wrist")["he"]
+    assert v["sensor"] == fb.FAKE_CAM_LINK and v["result"]["xyz_mm"][0] == pytest.approx(r["xyz_mm"][0] + 1.0, abs=0.01)
+
+
+def test_a_paused_pendant_program_blocks_a_restart_only_while_the_arm_has_power(env):
+    s, b, _ = env
+    b.program_running, b.program_paused = False, True
+    assert "paused" in s._restart_refusal()
+    b.robot_mode = "POWER_OFF"                    # nothing can move: the paused program does not matter
+    assert s._restart_refusal() is None
+    b.robot_mode = "IDLE"                         # powered, brakes on
+    assert s._restart_refusal() is None
+
+
+def test_virtual_tcps_are_published_in_tf(env):
+    """A policy runner looks its ee_frame (e.g. spatula_tip) up in TF: the GUI's virtual TCPs are static frames there,
+    a TCP on a TCP too; a name the model already has is left alone."""
+    s, b, _ = env
+    run(s, "tcp_save", name="spatula_tip", parent="tool0", xyz_mm=[0, 0, 150], rpy_deg=[0, 0, 90])
+    run(s, "tcp_save", name="tip_probe", parent="spatula_tip", xyz_mm=[10, 0, 0], rpy_deg=[0, 0, 0])
+    assert synced(s), s.parts_sync
+    assert b.part_frames["spatula_tip"][0] == "tool0"
+    assert np.allclose(b.part_frames["spatula_tip"][1][:3, 3], [0, 0, 0.150])
+    assert b.part_frames["tip_probe"][0] == "spatula_tip"
+    T = b.lookup_transform("tool0", "tip_probe")
+    assert np.allclose(T[:3, 3], [0, 0.010, 0.150], atol=1e-9)                # 90° about z: x of the tip is y
+    assert "tool0" not in b.part_frames
+    run(s, "tcp_save", name="spatula_tip", parent="tool0", xyz_mm=[0, 0, 160], rpy_deg=[0, 0, 90], replace=True)
+    assert synced(s)
+    assert np.allclose(b.part_frames["spatula_tip"][1][:3, 3], [0, 0, 0.160])

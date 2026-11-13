@@ -455,6 +455,8 @@ def test_programs_per_profile(env):
     s.command(a, "profile_activate", {})
     with pytest.raises(CommandError, match="belongs to Ayesha"):   # her program is open: he cannot save over it
         s.command(a, "program_save", {})
+    with pytest.raises(CommandError, match="belongs to Ayesha"):   # nor the batch kept next to it
+        s.command(a, "batch_save", {"batch": {"kind": "repeat", "repeats": 2}})
     r = s.command(a, "program_copy", {"source_owner": "", "name": "shared1.yaml", "owner": "Cenk"})
     assert r["files"] == ["shared1.yaml"] and (tmp / "progs" / "shared1.yaml").is_file()
     with pytest.raises(CommandError, match="already exists"):

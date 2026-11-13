@@ -1,18 +1,20 @@
 """SETUP > F/T + payload > Match simulation: map the F/T sensor's axes onto the policy's (sim) axes.
 
 A trained policy observes the F/T as [fx, fy, fz, tx, ty, tz] in the axes the simulation used. When the sensor is
-mounted turned (a camera bracket, a different tool), those axes no longer match. Instead of hand-written sign tables
-the person in control pushes the tool tip along base +X, +Y and +Z while the robot holds still; each push gives the
-sensor's force change s_i. The simulation's answer to the same push (the sim reference, made by
-tools/sim_ft_reference.py in the policy repo) is r_i. The fit picks the signed permutation M (one of 48) with
-M s_i / |s_i| closest to r_i / |r_i|. The force sign convention is inside M (MuJoCo reports the reaction wrench, so
-the sim signs may be opposite to the physical push: that is why the fit matches to the sim, not to physics).
+mounted turned (a camera bracket, a different tool), those axes no longer match. The person in control stands at one
+side of the robot and pushes the tool tip toward the robot, to their left, and down while the robot holds still. Each
+plain-language push has a sim axis and a sign; the signed sensor change is compared with the matching sim reference.
+The fit picks the signed permutation M (one of 48) with M s_i / |s_i| closest to r_i / |r_i|. The force sign
+convention is inside M (MuJoCo reports the reaction wrench, so the sim signs may be opposite to the physical push:
+that is why the fit matches to the sim, not to physics).
 
 Torques are not assumed to follow the force signs (the FR3's measured config had ft_obs_scale [-1,-1,-1, 1,1,1]).
 A push at the tip, away from the sensor, also twists it: the sign of tx and ty comes from comparing M t_i with the
 sim torque of the same pushes (each axis from the pushes whose sim torque on it is at least MIN_TORQUE_NM). A push
-through the tip hardly twists about z, so tz is not measured: it keeps the robot config's tz sign relative to its
-force sign when that is clear, else it takes the tx / ty sign. The runner applies (observations section):
+through the tip hardly twists about z, so tz comes from a fourth step when the sim reference has a "twist" entry
+(the tool twisted clockwise, looking down from above; sim_ft_reference.py makes it). Without one, tz keeps the robot
+config's tz sign relative to its force sign when that is clear, else it takes the tx / ty sign. The runner applies
+(observations section):
 
     ft_obs_axes: M          (rows = policy axes, columns = sensor axes; f_policy = M f_sensor, t_policy = M t_sensor)
     ft_obs_scale: [1, 1, 1, s_t, s_t, s_tz]     (forces 1: their signs are in M)
@@ -21,7 +23,8 @@ The result is one of the files each profile owns (setups.members(): config_dir()
 switches with control like gains and payload. Policy runs write an effective robot config with these keys
 (effective_robot_config) and pass that instead of the manifest's file.
 
-Sim reference JSON: {"pushes": {"+X": [6], "+Y": [6], "+Z": [6]}, "no_contact": {"<tilt_deg>": [6], ...}, ...}
+Sim reference JSON: {"pushes": {"+X": [6], "+Y": [6], "+Z": [6]}, "twist": [6] (optional),
+"no_contact": {"<tilt_deg>": [6], ...}, ...}: python3 -m moveit_gui.sim_ft_reference makes one from the MuJoCo model.
 """
 from __future__ import annotations
 
@@ -37,9 +40,19 @@ import numpy as np
 import yaml
 
 AXES = ("+X", "+Y", "+Z")
+TWIST = "twist"
+TWIST_INFO = {"key": "twist", "label": "clockwise twist", "instruction": "Twist the tool clockwise, looking down from above",
+              "base": "-Z torque", "amount": "about 1 Nm", "sign": 1, "direction": None}
+STANDING_SIDES = {
+    "front": {"label": "In front of the robot", "base_side": "+X", "vector": (1, 0)},
+    "behind": {"label": "Behind the robot", "base_side": "-X", "vector": (-1, 0)},
+    "left": {"label": "On the robot's left", "base_side": "+Y", "vector": (0, 1)},
+    "right": {"label": "On the robot's right", "base_side": "-Y", "vector": (0, -1)},
+}
 MIN_PUSH_N = 5.0              # a push weaker than this is refused (too close to the noise)
 MAX_ANGLE_DEG = 15.0          # a push more than this off the chosen matrix is refused
 MIN_TORQUE_NM = 0.3           # a torque change (or sim torque) under this cannot show its sign
+STEADY_SPREAD_NM = 0.15       # a twist counts when it stays within this of its mean (each torque axis)
 STEADY_S = 1.0                # a push counts when it stays steady this long
 STEADY_SPREAD_N = 1.5         # ... within this of its mean (each force axis)
 BASELINE_S = 0.5              # the no-contact reading before each push
@@ -51,6 +64,31 @@ NAMES = ("fx", "fy", "fz", "tx", "ty", "tz")
 
 class FtMatchError(ValueError):
     pass
+
+
+def standing_pushes(standing: str = "front") -> dict:
+    """Return the three plain pushes and their base direction for a standing side."""
+    side = STANDING_SIDES.get(standing)
+    if side is None:
+        raise FtMatchError(f"unknown standing side {standing!r}")
+    sx, sy = side["vector"]
+    moves = (
+        ("toward", "toward the robot", "Push the tip toward the robot", (-sx, -sy, 0)),
+        ("left", "to your left", "Push the tip to your left", (sy, -sx, 0)),
+        ("down", "down", "Push the tip down", (0, 0, -1)),
+    )
+    pushes = {}
+    order = []
+    for key, label, instruction, direction in moves:
+        i = next(i for i, value in enumerate(direction) if value)
+        axis = AXES[i]
+        sign = int(direction[i])
+        base = f"{'+' if sign > 0 else '-'}{axis[1]}"
+        pushes[axis] = {"key": key, "label": label, "instruction": instruction, "base": base, "sign": sign,
+                        "direction": list(direction)}
+        order.append(axis)
+    return {"key": standing, "label": side["label"], "base_side": side["base_side"],
+            "pushes": pushes, "order": order}
 
 
 # ----------------------------------------------------------------------------- sim reference
@@ -94,8 +132,13 @@ def load_reference(path) -> dict:
     nc = {}
     for k, v in (d.get("no_contact") or {}).items():
         nc[str(k)] = _six(v, f"sim reference {path.name} no_contact {k}")
-    return {"pushes": pushes, "no_contact": nc, "path": str(path),
-            "meta": {k: v for k, v in d.items() if k not in ("pushes", "no_contact")}}
+    twist = None
+    if d.get("twist") is not None:
+        twist = _six(d["twist"], f"sim reference {path.name} twist")
+        if abs(twist[5]) < MIN_TORQUE_NM:
+            twist = None                                  # no clear tz: the twist step would show nothing
+    return {"pushes": pushes, "twist": twist, "no_contact": nc, "path": str(path),
+            "meta": {k: v for k, v in d.items() if k not in ("pushes", "twist", "no_contact")}}
 
 
 # ----------------------------------------------------------------------------- the fit
@@ -135,12 +178,23 @@ def explain(M, scale=None) -> List[str]:
     return out
 
 
+def _signed_deltas(deltas: Dict[str, Sequence[float]], signs=None) -> dict:
+    signs = signs or {ax: 1 for ax in AXES}
+    return {ax: (None if deltas.get(ax) is None else
+                 [float(signs.get(ax, 1)) * float(x) for x in deltas[ax]]) for ax in AXES}
+
+
 def torque_signs(M, deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[float]],
-                 old_scale=None, min_nm: float = MIN_TORQUE_NM) -> dict:
+                 old_scale=None, min_nm: float = MIN_TORQUE_NM, push_signs=None, push_labels=None,
+                 twist=None, twist_ref=None) -> dict:
     """The torque entries of ft_obs_scale from the torque part of the pushes (forces' M already chosen).
 
-    Returns {"scale": [3] | None, "votes": {"tx": [...], "ty": [...]}, "tz": str, "problems", "repeat"}."""
+    `twist` / `twist_ref`: the measured and sim change for the clockwise twist; given both, tz is measured.
+    Returns {"scale": [3] | None, "votes": {"tx": [...], "ty": [...], "tz": [...]}, "tz": str, "problems",
+    "repeat"}."""
     M = np.asarray(M, float)
+    signed = _signed_deltas(deltas, push_signs)
+    labels = push_labels or {ax: ax for ax in AXES}
     votes, problems, repeat, signs = {}, [], [], {}
     for k, name in ((0, "tx"), (1, "ty")):
         votes[name] = []
@@ -148,13 +202,14 @@ def torque_signs(M, deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[
             tr = float(ref[ax][3 + k])
             if abs(tr) < min_nm:
                 continue                                  # the sim hardly twists about this axis for this push
-            tp = float((M @ np.asarray(deltas[ax], float)[3:6])[k])
-            v = {"push": ax, "sim": round(tr, 3), "measured": round(tp, 3),
+            tp = float((M @ np.asarray(signed[ax], float)[3:6])[k])
+            v = {"push": ax, "label": labels.get(ax, ax), "sim": round(tr, 3), "measured": round(tp, 3),
                  "sign": 0 if abs(tp) < min_nm else (1 if tp * tr > 0 else -1)}
             votes[name].append(v)
             if v["sign"] == 0:
-                problems.append(f"the {ax} push changed {name} by {abs(tp):.2f} Nm, under {min_nm:g} Nm: its sign "
-                                f"cannot be read. Repeat the {ax} push at the very tip, along the arrow")
+                text = labels.get(ax, ax)
+                problems.append(f"the {text} push changed {name} by {abs(tp):.2f} Nm, under {min_nm:g} Nm: its sign "
+                                f"cannot be read. Repeat the {text} push at the very tip, along the arrow")
                 repeat.append(ax)
         if not votes[name]:
             problems.append(f"the sim reference has no {name} torque of {min_nm:g} Nm or more in any push: the {name} "
@@ -162,20 +217,37 @@ def torque_signs(M, deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[
             continue
         got = {v["sign"] for v in votes[name] if v["sign"]}
         if len(got) > 1:
-            pushes = [v["push"] for v in votes[name]]
+            pushes = [v["label"] for v in votes[name]]
             problems.append(f"the {name} sign disagrees between the {' and '.join(pushes)} pushes: repeat them")
-            repeat += pushes
+            repeat += [v["push"] for v in votes[name]]
         elif got:
             signs[name] = got.pop()
     if "tx" in signs and "ty" in signs and signs["tx"] != signs["ty"]:
-        problems.append("tx and ty need opposite signs, which a rigid sensor cannot do: repeat the +X and +Y pushes")
+        problems.append(f"tx and ty need opposite signs, which a rigid sensor cannot do: repeat the "
+                        f"{labels.get('+X', '+X')} and {labels.get('+Y', '+Y')} pushes")
         repeat += ["+X", "+Y"]
+    tz_measured = None
+    if twist is not None and twist_ref is not None:
+        tr = float(twist_ref[5])
+        tp = float((M @ np.asarray(twist, float)[3:6])[2])
+        v = {"push": TWIST, "label": TWIST_INFO["label"], "sim": round(tr, 3), "measured": round(tp, 3),
+             "sign": 0 if abs(tp) < min_nm else (1 if tp * tr > 0 else -1)}
+        votes["tz"] = [v]
+        if v["sign"] == 0:
+            problems.append(f"the twist changed tz by {abs(tp):.2f} Nm, under {min_nm:g} Nm: its sign cannot be read. "
+                            "Repeat the twist, firmer")
+            repeat.append(TWIST)
+        else:
+            tz_measured = float(v["sign"])
     if problems or len(signs) < 2:
         return {"scale": None, "votes": votes, "tz": "", "problems": problems,
-                "repeat": [ax for ax in AXES if ax in repeat]}
+                "repeat": [ax for ax in AXES + (TWIST,) if ax in repeat]}
     st = float(signs["tx"])
     old = [float(x) for x in old_scale] if old_scale is not None and len(old_scale) == 6 else None
-    if old and len({math.copysign(1, x) for x in old[:3]}) == 1 and old[5] != 0:
+    if tz_measured is not None:
+        tz = tz_measured
+        how = "tz from the twist"
+    elif old and len({math.copysign(1, x) for x in old[:3]}) == 1 and old[5] != 0:
         tz = math.copysign(1, old[5]) * math.copysign(1, old[0])
         how = "tz not measured: its sign relative to the forces kept from the robot config"
     else:
@@ -185,19 +257,24 @@ def torque_signs(M, deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[
 
 
 def fit(deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[float]], min_n: float = MIN_PUSH_N,
-        max_deg: float = MAX_ANGLE_DEG, old_scale=None, min_nm: float = MIN_TORQUE_NM) -> dict:
+        max_deg: float = MAX_ANGLE_DEG, old_scale=None, min_nm: float = MIN_TORQUE_NM,
+        push_signs=None, push_labels=None, twist=None, twist_ref=None) -> dict:
     """Match the pushes (sensor-frame wrench changes) to the sim reference.
 
     Returns {"ok", "M", "scale" (ft_obs_scale), "torque" (torque_signs), "problems", "repeat",
     "pushes": {axis: {"n", "angle_deg"}}, "rotation_deg", "error"}. ok is False (with problems and the pushes to
     repeat) when a push is weak or too far off the chosen M, or its torque sign cannot be read or disagrees.
-    `old_scale`: the robot config's ft_obs_scale now (for the tz sign).
+    `old_scale`: the robot config's ft_obs_scale now (for the tz sign). `push_signs` changes each captured push to
+    the sim direction before the force and torque checks; `push_labels` keeps errors readable. `twist` and
+    `twist_ref` (the measured and sim clockwise twist) set the tz sign; without them it is not measured.
     """
-    missing = [ax for ax in AXES if deltas.get(ax) is None]
+    labels = push_labels or {ax: ax for ax in AXES}
+    signed = _signed_deltas(deltas, push_signs)
+    missing = [ax for ax in AXES if signed.get(ax) is None]
     if missing:
-        return {"ok": False, "M": None, "problems": [f"no {ax} push yet" for ax in missing], "repeat": missing,
+        return {"ok": False, "M": None, "problems": [f"no {labels.get(ax, ax)} push yet" for ax in missing], "repeat": missing,
                 "pushes": {}, "rotation_deg": None, "error": None, "scale": None, "torque": None}
-    S = np.array([np.asarray(deltas[ax], float)[:3] for ax in AXES])
+    S = np.array([np.asarray(signed[ax], float)[:3] for ax in AXES])
     Rf = np.array([np.asarray(ref[ax], float)[:3] for ax in AXES])
     mags = np.linalg.norm(S, axis=1)
     weak = [ax for ax, n in zip(AXES, mags) if n < min_n]
@@ -205,8 +282,8 @@ def fit(deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[float]], min
     if weak:
         return {"ok": False, "M": None, "repeat": weak, "pushes": pushes, "rotation_deg": None, "error": None,
                 "scale": None, "torque": None,
-                "problems": [f"the {ax} push was {pushes[ax]['n']:.1f} N, under {min_n:g} N: repeat it, pushing "
-                             "harder" for ax in weak]}
+                "problems": [f"the {labels.get(ax, ax)} push was {pushes[ax]['n']:.1f} N, under {min_n:g} N: repeat it, "
+                             "pushing harder" for ax in weak]}
     sh = S / mags[:, None]
     rh = Rf / np.linalg.norm(Rf, axis=1)[:, None]
     best, err = None, None
@@ -219,13 +296,13 @@ def fit(deltas: Dict[str, Sequence[float]], ref: Dict[str, Sequence[float]], min
     Q = best_orthogonal(sh, rh, np.linalg.det(best))
     rot = math.degrees(math.acos(max(-1.0, min(1.0, (np.trace(best.T @ Q) - 1.0) / 2.0))))
     off = [ax for ax in AXES if pushes[ax]["angle_deg"] > max_deg]
-    problems = [f"the {ax} push is {pushes[ax]['angle_deg']:.0f}° off the best match (at most {max_deg:g}°): "
-                f"repeat the {ax} push, straight along the arrow" for ax in off]
-    tq = torque_signs(best, deltas, ref, old_scale, min_nm) if not off else None
+    problems = [f"the {labels.get(ax, ax)} push is {pushes[ax]['angle_deg']:.0f}° off the best match (at most {max_deg:g}°): "
+                f"repeat the {labels.get(ax, ax)} push, straight along the arrow" for ax in off]
+    tq = torque_signs(best, deltas, ref, old_scale, min_nm, push_signs, labels, twist, twist_ref) if not off else None
     scale = [1.0, 1.0, 1.0] + tq["scale"] if tq and tq["scale"] else None
     if tq:
         problems += tq["problems"]
-        off = [ax for ax in AXES if ax in off or ax in tq["repeat"]]
+        off = [ax for ax in AXES + (TWIST,) if ax in off or ax in tq["repeat"]]
     return {"ok": not problems, "M": best.astype(int).tolist(), "scale": scale, "torque": tq, "problems": problems,
             "repeat": off, "pushes": pushes, "rotation_deg": round(rot, 1), "error": round(err, 4)}
 
@@ -268,8 +345,17 @@ class PushCapture:
     still on the tool after the previous push is not read as no contact (its release would look like a push)."""
 
     def __init__(self, min_n: float = MIN_PUSH_N, steady_s: float = STEADY_S, spread_n: float = STEADY_SPREAD_N,
-                 baseline_s: float = BASELINE_S, baseline_spread_n: float = BASELINE_SPREAD_N, release_from=None):
+                 baseline_s: float = BASELINE_S, baseline_spread_n: float = BASELINE_SPREAD_N, release_from=None,
+                 torque: bool = False):
+        """torque: a twist, read on the torque axes (min_n and spread_n then in Nm: MIN_TORQUE_NM, STEADY_SPREAD_NM
+        unless given). The baseline and the release check stay on the forces (hands off is hands off)."""
         self.release_from = None if release_from is None else np.asarray(release_from, float)[:6]
+        self.torque = bool(torque)
+        if self.torque:
+            min_n = MIN_TORQUE_NM if min_n == MIN_PUSH_N else min_n
+            spread_n = STEADY_SPREAD_NM if spread_n == STEADY_SPREAD_N else spread_n
+        self.sl = slice(3, 6) if self.torque else slice(0, 3)
+        self.unit = "Nm" if self.torque else "N"
         self.min_n, self.steady_s, self.spread_n = min_n, steady_s, spread_n
         self.baseline_s, self.baseline_spread_n = baseline_s, baseline_spread_n
         self.state = "baseline"
@@ -311,13 +397,15 @@ class PushCapture:
             return self.state
         self.now = w - self.baseline
         win = self._window(t, self.steady_s)
-        f = win[:, :3] - self.baseline[:3]
-        n = float(np.linalg.norm(self.now[:3]))
-        self.note = f"Push harder: {n:.1f} N (at least {self.min_n:g} N)" if n < self.min_n else "Hold it"
+        sl, u = self.sl, self.unit
+        f = win[:, sl] - self.baseline[sl]
+        n = float(np.linalg.norm(self.now[sl]))
+        more = "Twist harder" if self.torque else "Push harder"
+        self.note = f"{more}: {n:.1f} {u} (at least {self.min_n:g} {u})" if n < self.min_n else "Hold it"
         if len(win) < 2 or self._span() < self.steady_s * 0.9 or np.min(np.linalg.norm(f, axis=1)) < self.min_n:
             return self.state
         if np.max(np.abs(f - f.mean(0))) > self.spread_n:
-            self.note = "Hold the push steady"
+            self.note = "Hold the twist steady" if self.torque else "Hold the push steady"
             return self.state
         self._take(win)
         return self.state
@@ -335,12 +423,13 @@ class PushCapture:
     def _take(self, win: np.ndarray):
         self.push = win.mean(0)
         self.delta = self.push - self.baseline
-        self.state, self.note = "done", f"Recorded {np.linalg.norm(self.delta[:3]):.1f} N"
+        self.state, self.note = "done", f"Recorded {np.linalg.norm(self.delta[self.sl]):.1f} {self.unit}"
 
     def view(self) -> dict:
         r = lambda v: None if v is None else [round(float(x), 3) for x in v]   # noqa: E731
         return {"state": self.state, "note": self.note, "baseline": r(self.baseline), "push": r(self.push),
-                "delta": r(self.delta), "now_n": round(float(np.linalg.norm(self.now[:3])), 2)}
+                "delta": r(self.delta), "now_n": round(float(np.linalg.norm(self.now[self.sl])), 2),
+                "unit": self.unit, "min": self.min_n}
 
 
 # ----------------------------------------------------------------------------- the saved result
