@@ -100,6 +100,8 @@ def parse_urdf(xml: str) -> dict:
             "parent": parent.get("link"), "child": child.get("link"), **_origin(j),
             "axis": _floats(axis.get("xyz") if axis is not None else None, 3) if axis is not None else [1.0, 0, 0],
             "limit": limit,
+            # rad/s (m/s): the constant-speed retime of linear moves keeps under it (cart_speed.py)
+            "max_velocity": float(lim.get("velocity")) if lim is not None and lim.get("velocity") else None,
             "mimic": None if mimic is None else {"joint": mimic.get("joint"),
                                                  "multiplier": float(mimic.get("multiplier", 1.0)),
                                                  "offset": float(mimic.get("offset", 0.0))},

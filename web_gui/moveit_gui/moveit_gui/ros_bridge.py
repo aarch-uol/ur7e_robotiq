@@ -40,6 +40,7 @@ from std_srvs.srv import Trigger
 import numpy as np
 import yaml
 
+from . import cart_speed as cart_speed_mod
 from . import transforms as tf
 from .bridge_api import (DASHBOARD_COMMANDS, DASHBOARD_TIMEOUT_S, Snapshot, WrenchHistory, dashboard_lost,
                          dashboard_with_reconnect, gripper_status_dict, reconnect_gripper)
@@ -128,6 +129,7 @@ class RosBridge:
         self._t_spin = time.monotonic()                 # executor heartbeat
         self._shutting_down = False
         self.wrench_history = WrenchHistory()           # 100 Hz F/T for the web chart
+        self.on_wrench = None                           # every F/T sample, for the F/T limit (core: ft_guard.feed)
         self._joints_received = False
         self._velocities_ok = False
         self._freedrive_on = False
@@ -454,6 +456,12 @@ class RosBridge:
             self._snap.wrench = w = [f.x, f.y, f.z, t.x, t.y, t.z]
         self._t_wrench = time.monotonic()
         self.wrench_history.add(time.time(), w)
+        cb = self.on_wrench
+        if cb is not None:
+            try:
+                cb(w)
+            except Exception as e:  # pragma: no cover - never break the F/T subscription
+                self.log(f"F/T limit check failed: {e}")
 
     def _on_speed(self, msg: Float64):
         with self._lock:
@@ -921,15 +929,27 @@ class RosBridge:
             self.log("plan: planning failed")
         return traj
 
-    def plan_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1):
-        """A JointTrajectory that brings `target_link` to T_base_link (in profile.base_link), or None."""
+    def plan_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
+                  cart_speed=0.0, speed_point=None):
+        """A JointTrajectory that brings `target_link` to T_base_link (in profile.base_link), or None.
+        cart_speed (m/s, <= 0 = none; linear moves only): the trajectory is retimed so the point `speed_point`
+        (xyz in target_link, the TCP) goes at that constant speed, never faster (cart_speed.py: move_group ignores
+        max_cartesian_speed)."""
         if self.moveit is None:
             self.log("plan: MoveIt not available")
             return None
+        limit = bool(cartesian) and float(cart_speed or 0.0) > 0.0
+        point_at = None
+        if limit:
+            point_at = self._speed_point(target_link, speed_point)
+            if point_at is None:         # never move faster than asked: no plan rather than an unlimited one
+                self.log(f"plan: cannot limit the speed of {target_link} (no robot model with that link)")
+                return None
         position, quat_xyzw = tf.to_pos_quat(T_base_link)
         self.set_scaling(vel, acc)
         self.log(f"plan {'linear ' if cartesian else ''}{target_link} -> "
-                 f"{[round(v, 4) for v in position]} {[round(v, 4) for v in quat_xyzw]}")
+                 f"{[round(v, 4) for v in position]} {[round(v, 4) for v in quat_xyzw]}"
+                 + (f" at <= {cart_speed * 1000.0:.0f} mm/s" if limit else ""))
         try:
             traj = self.moveit.plan(position=position, quat_xyzw=quat_xyzw, target_link=target_link,
                                     cartesian=bool(cartesian), frame_id=self.profile.base_link,
@@ -939,7 +959,32 @@ class RosBridge:
             return None
         if traj is None:
             self.log("plan: planning failed")
+        elif limit:
+            try:
+                # constant TCP speed within the joint limits (URDF velocity x Speed %, profile acceleration x
+                # Accel %); the uniform slow-down stays as the fallback and the final peak check
+                vlim, alim = cart_speed_mod.joint_limits(self._fk_model, self.profile, traj.joint_names, vel, acc)
+                cart_speed_mod.retime_linear(traj, point_at, float(cart_speed),
+                                             cart_speed_mod.cart_accel_m_s2(self.profile, acc), vlim, alim, self.log)
+            except Exception as e:      # a malformed trajectory: do not run it unlimited
+                self.log(f"plan: speed limit failed: {e}")
+                return None
         return traj
+
+    def _speed_point(self, link: str, point):
+        """cart_speed point_at for a point in `link`, from robot_description (parsed once per description)."""
+        xml = self.robot_description()
+        if not xml:
+            return None
+        if getattr(self, "_fk_xml", None) is not xml:
+            try:
+                from .robot_model import parse_urdf
+                self._fk_model = parse_urdf(xml)
+            except Exception as e:
+                self.log(f"robot_description not usable for the speed limit: {e}")
+                return None
+            self._fk_xml = xml
+        return cart_speed_mod.point_fk(self._fk_model, self.profile.base_link, link, point)
 
     def execute_trajectory(self, trajectory) -> bool:
         return self._execute_on_active_controller(trajectory)
@@ -950,11 +995,12 @@ class RosBridge:
         traj = self.plan_joints(joints, vel, acc)
         return traj is not None and self._execute_on_active_controller(traj, epoch)
 
-    def move_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1) -> bool:
+    def move_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
+                  cart_speed=0.0, speed_point=None) -> bool:
         """Move `target_link` to T_base_link (pose in profile.base_link). TCP/frame conversion
-        already happened in geometry.Geometry.planning_target."""
+        already happened in geometry.Geometry.planning_target. cart_speed / speed_point: see plan_pose."""
         epoch = self.stop_epoch
-        traj = self.plan_pose(target_link, T_base_link, cartesian, vel, acc)
+        traj = self.plan_pose(target_link, T_base_link, cartesian, vel, acc, cart_speed, speed_point)
         return traj is not None and self._execute_on_active_controller(traj, epoch)
 
     # ========================================================= planning scene
@@ -1122,10 +1168,8 @@ class RosBridge:
         return out
 
     # Camera calibration (handeye.py): one full-resolution frame and the camera's intrinsics, on demand.
-    def grab_image(self, topic: str, timeout_s: float = 3.0):
-        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
-        or (None, why)."""
-        import cv2
+    def _next_image(self, topic: str, timeout_s: float):
+        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why)."""
         types = dict(self.node.get_topic_names_and_types()).get(topic, [])
         t = next((x for x in types if x in IMAGE_TYPES), None)
         if t is None:
@@ -1146,7 +1190,15 @@ class RosBridge:
                 return None, f"{topic}: no image within {timeout_s:.0f} s"
         finally:
             self.node.destroy_subscription(sub)
-        m = got["m"]
+        return t, got["m"]
+
+    def grab_image(self, topic: str, timeout_s: float = 3.0):
+        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
+        or (None, why)."""
+        import cv2
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
         try:
             if t == IMAGE_TYPE:
                 from .camera import to_gray
@@ -1158,6 +1210,28 @@ class RosBridge:
         except Exception as e:
             return None, f"{topic}: {e}"
         return img, m.header.frame_id
+
+    def grab_photo(self, topic: str, timeout_s: float = 3.0):
+        """(JPEG bytes at full resolution, "") of the next frame of an image topic, or (None, why). A JPEG
+        CompressedImage is passed through unchanged."""
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
+        try:
+            if t == IMAGE_TYPE:
+                from .camera import decode_image, encode_jpeg
+                return encode_jpeg(decode_image(m.encoding, m.width, m.height, m.step, m.data,
+                                                bool(m.is_bigendian), max_width=max(1, int(m.width)))), ""
+            if "jpeg" in str(m.format).lower() or "jpg" in str(m.format).lower():
+                return bytes(m.data), ""
+            import cv2
+            from .camera import encode_jpeg
+            bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None, f"{topic}: could not decode {m.format}"
+            return encode_jpeg(bgr[..., ::-1]), ""
+        except Exception as e:
+            return None, f"{topic}: {e}"
 
     def camera_info(self, topic: str, timeout_s: float = 3.0) -> Tuple[Optional[dict], str]:
         from sensor_msgs.msg import CameraInfo

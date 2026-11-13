@@ -25,6 +25,7 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
   topic_publishers(topic) -> int
   watch_image(topic | None) -> (ok, msg)     the ONE previewed image topic (camera.ImageWatch)
   watched_image() -> Optional[ImageWatch]
+  grab_photo(topic, timeout_s=3.0) -> (jpeg bytes | None, why)   next frame of an image topic, full size (program photo step)
   scene_set_box(object_id, size_m, T_base_box) -> (ok, msg)   add / replace a world collision box in MoveIt's
                                              planning scene, pose in profile.base_link (keepout.py)
   scene_remove(object_id) -> (ok, msg)       remove a world collision object
@@ -32,7 +33,9 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
                                              (T in the base frame or None, size [m] of a box or None);
                                              None = planning scene not readable
   move_joints(joints, vel, acc) -> bool
-  move_pose(target_link, T_base_link, cartesian, vel, acc) -> bool
+  move_pose(target_link, T_base_link, cartesian, vel, acc, cart_speed=0.0, speed_point=None) -> bool
+                                             cart_speed: m/s limit of a linear move (<= 0 = none) for the point
+                                             speed_point (xyz m in target_link: the TCP); plan_pose takes the same
 """
 from __future__ import annotations
 

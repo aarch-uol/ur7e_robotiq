@@ -18,7 +18,7 @@ Virtual TCPs change pose semantics only, not MoveIt collision geometry.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +72,9 @@ class PoseSpec:
 class PlanningTarget:
     link: str                       # link whose pose MoveIt should reach
     T_base_link: np.ndarray         # goal pose of that link in the base frame
+    # the TCP in that link (a virtual TCP's offset; identity when the link is the TCP): the point whose speed a
+    # linear move limits (cart_speed.py)
+    T_link_tcp: np.ndarray = field(default_factory=lambda: np.eye(4))
 
 
 # lookup(parent, child) -> T_parent_child, or None if unavailable / stale
@@ -183,8 +186,9 @@ class Geometry:
         link, moveit_ok, T_link_tcp = self.tcp_anchor(pose.tcp)
         if moveit_ok and np.allclose(T_link_tcp, np.eye(4)):
             return PlanningTarget(link, T_base_tcp)
-        T_base_planning = T_base_tcp @ tf.inv(self.T_planning_tcp(pose.tcp))
-        return PlanningTarget(self.profile.planning_link, T_base_planning)
+        T_planning_tcp = self.T_planning_tcp(pose.tcp)
+        T_base_planning = T_base_tcp @ tf.inv(T_planning_tcp)
+        return PlanningTarget(self.profile.planning_link, T_base_planning, T_planning_tcp)
 
     def static_problems(self, frame: str, tcp: str) -> List[str]:
         """Checks that need no robot: names exist. Used by program preflight."""

@@ -15,6 +15,9 @@ moveit:
   default_velocity_scaling: 0.1
   default_acceleration_scaling: 0.1
   planning_timeout_s: 60.0
+  max_cartesian_speed_mm_s: 250.0  # upper limit of the mm/s speed of linear moves (MoveL)
+  cartesian_accel_mm_s2: 500.0     # ramp of a linear move with mm/s, at Accel 100 % (scaled by Accel %)
+  joint_accel_limit_rad_s2: 5.0    # joint acceleration limit of that retime (MoveIt joint_limits.yaml)
 tcps:
   default: tool0
   model_links:

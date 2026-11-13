@@ -108,6 +108,12 @@ class RobotProfile:
     def planning_link(self) -> str:
         return self.moveit["planning_link"]
 
+    @property
+    def max_cart_speed_mm_s(self) -> float:
+        """Upper limit of a linear move's TCP speed (moveit.max_cartesian_speed_mm_s, default 250)."""
+        from .cart_speed import max_mm_s
+        return max_mm_s(self)
+
     # ------------------------------------------------------------------ load
     @classmethod
     def load(cls, path: str | Path) -> "RobotProfile":

@@ -14,7 +14,7 @@ export function upTime(s) {
 }
 
 export function drivers(ctx) {
-  const { h, btn, note, cmd, toast, lease } = ctx;
+  const { h, btn, note, cmd, toast, lease, ask, askText } = ctx;
   const chip = (t, cls) => h("span", { class: "chip " + (cls || "") }, t);
   const list = h("div", { class: "list", id: "dr-list" });
   const others = h("div", { class: "list", id: "dr-others" });
@@ -142,7 +142,7 @@ export function drivers(ctx) {
     if (r.ok) { logBox.textContent = r.text || "(empty)"; logBox.scrollTop = logBox.scrollHeight; }
   }
   async function del(s) {
-    if (!window.confirm(`Delete "${s.name}"? (Its log files stay.)`)) return;
+    if (!(await ask(`Delete "${s.name}"? (Its log files stay.)`))) return;
     const r = await cmd("drivers_delete", { name: s.name });
     if (r.ok) { D.sel = null; took(r); }
   }

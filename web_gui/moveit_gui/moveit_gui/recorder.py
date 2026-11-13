@@ -1,7 +1,10 @@
 """Session recording: a rosbag2 (MCAP) of the topics the operator picks, started and stopped from the GUI.
 
     <recordings_dir>/<YYYYmmdd_HHMMSS>_<name>/bag/          the `ros2 bag record` output (metadata.yaml + *.mcap)
+                                              meta.json      the short human summary: start / stop time, operator,
+                                                             program, control mode, note, topics
                                               gui_meta.json  what started it, which run it belongs to, why it ended
+                                              photos/        stills from a program's `photo` step (if any)
                                               record.log     the recorder's own output (errors land here)
 
 Nothing here moves the robot. The recorder is a child process (`ros2 bag record`) in its own process group, so a
@@ -42,6 +45,11 @@ PRESETS: Dict[str, Tuple[str, Optional[str], Optional[str], str]] = {
                           "camera images, compressed (small)"),
     "camera_raw": ("Cameras (raw)", None, r"^sensor_msgs/msg/Image$",
                    "uncompressed images: about 30 MB/s per 640x480 camera at 30 fps"),
+    # The one-button recording: everything useful for a run. TCP pose is in /tf (tool0) and the UR pose broadcaster.
+    "all": ("Everything for a run", r"^/(joint_states|dynamic_joint_states|tf|tf_static|robot_description)$"
+            r"|speed_scaling|controller_state$|^/io_and_status_controller/|tcp_pose|pose_broadcaster"
+            r"|^/controller_manager/|gripper|robotiq", r"^(geometry_msgs/msg/WrenchStamped"
+            r"|sensor_msgs/msg/CompressedImage)$", "joints, TCP pose, F/T, gripper, controllers, compressed cameras"),
     "log": ("ROS log", r"^/rosout$", None, "every node's log messages"),
 }
 DEFAULT_PRESETS = ["robot", "ft", "gripper", "policy"]
@@ -212,10 +220,22 @@ class Recorder:
         return self._cur is not None
 
     def start(self, name: str = "", source: str = "manual", run: Optional[dict] = None,
-              topics: Optional[List[str]] = None) -> Result:
+              topics: Optional[List[str]] = None, presets: Optional[List[str]] = None,
+              info: Optional[dict] = None) -> Result:
+        """presets: record these presets (plus the single topics ticked in the settings) instead of the saved
+        selection. info: operator / program / mode / note, for meta.json."""
         with self._lock:
             if self._cur is not None:
                 return False, f"already recording ({self._cur['name']})"
+            if presets:
+                bad = [p for p in presets if p not in PRESETS]
+                if bad:
+                    return False, f"unknown preset(s): {', '.join(bad)}"
+                avail = self.list_topics()
+                chosen = set(self.settings["topics"])
+                for p in presets:
+                    chosen.update(preset_topics(p, avail))
+                topics = sorted(chosen - set(self.settings["exclude"])) if not topics else topics
             topics = sorted(set(topics)) if topics else self.selected_topics()
             if not topics:
                 return False, "nothing to record: no selected topic is published now"
@@ -241,6 +261,7 @@ class Recorder:
             self._stopping = False
             self._cur = {"name": out.name, "dir": str(out), "label": label,
                          "source": source, "run": run or {}, "topics": topics, "started": time.time(),
+                         "info": dict(info or {}), "presets": list(presets or self.settings["presets"]),
                          "t0": time.monotonic(), "size_mb": 0.0, "limits": {k: self.settings[k]
                                                                            for k in ("max_s", "max_mb")}}
             self._write_meta(self._cur, ended=None, reason="recording")
@@ -301,8 +322,15 @@ class Recorder:
     def _write_meta(self, cur: dict, ended: Optional[float], reason: str, ok: Optional[bool] = None) -> dict:
         meta = {k: cur[k] for k in ("name", "dir", "source", "run", "topics", "started", "size_mb", "limits")}
         meta.update(ended=ended, duration_s=round((ended or time.time()) - cur["started"], 1), reason=reason, ok=ok)
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t)) if t else None  # noqa: E731
+        info = cur.get("info", {})
+        small = {"started": iso(cur["started"]), "stopped": iso(ended), "duration_s": meta["duration_s"],
+                 "operator": info.get("operator", ""), "program": info.get("program", ""),
+                 "mode": info.get("mode", ""), "note": info.get("note", ""), "presets": cur.get("presets", []),
+                 "topics": cur["topics"], "size_mb": round(cur["size_mb"], 1), "ok": ok, "reason": reason}
         try:
             Path(cur["dir"], "gui_meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+            Path(cur["dir"], "meta.json").write_text(json.dumps(small, indent=1), encoding="utf-8")
         except OSError:
             pass
         return meta

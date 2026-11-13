@@ -1,0 +1,43 @@
+// Small line icons (SVG, currentColor): used instead of emoji so they look the same in every browser and font.
+const P = {
+  camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
+  record: '<circle cx="12" cy="12" r="6"/>',
+  stop: '<rect x="7" y="7" width="10" height="10" rx="1.5"/>',
+  popout: '<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v6H4V6h6"/>',
+  eye: '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  warn: '<path d="M12 3.5 21.5 20h-19z"/><path d="M12 10v4.5"/><path d="M12 17.5v.01"/>',
+  grip: '<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>',
+  chevron: '<path d="m6 9 6 6 6-6"/>',
+  minus: '<path d="M6 12h12"/>',
+  power: '<path d="M12 3v8"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/>',
+  pause: '<path d="M9 6v12M15 6v12"/>',
+  play: '<path d="M8 5.5v13l10-6.5z"/>',
+  panelL: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  panelR: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>',
+  hand: '<path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12"/><path d="M11 11V4.5a1.5 1.5 0 0 1 3 0V12"/><path d="M14 11.5V6a1.5 1.5 0 0 1 3 0v8a6 6 0 0 1-6 6h-.5a6 6 0 0 1-4.8-2.4L3.6 14a1.5 1.5 0 0 1 2.3-1.9L8 14"/>',
+  lay1: '<rect x="3" y="4" width="18" height="16" rx="2"/>',
+  lay2: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M12 4v16"/>',
+  lay3: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M14 4v16M14 12h7"/>',
+  lay4: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 12h18M12 4v16"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  unlock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.5-2"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  check: '<path d="m5 12 5 5 9-10"/>',
+  restore: '<rect x="5" y="5" width="14" height="14" rx="2"/>',
+  chevL: '<path d="m15 6-6 6 6 6"/>',
+  chevR: '<path d="m9 6 6 6-6 6"/>',
+  reset: '<path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/>',
+  bars: '<path d="M4 6h10M4 12h16M4 18h7"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6h.01M4 12h.01M4 18h.01"/>',
+  chart: '<path d="M4 4v16h16"/><path d="m7 14 4-4 3 3 5-6"/>',
+  dockBottom: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18"/><path d="m12 7 0 4m-2-2 2 2 2-2"/>',
+  dockSide: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="M17 12h-5m2-2-2 2 2 2"/>',
+  users: '<circle cx="9" cy="8" r="3.2"/><path d="M3 19c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4"/><path d="M18 13.8c1.8.7 3 2.6 3 5.2"/>',
+  fit: '<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/><rect x="8" y="9" width="8" height="6" rx="1"/>',
+  line: '<path d="M3 12h18"/><path d="M7 9v6M12 9v6M17 9v6"/>',
+};
+export function icon(name, cls = "") {
+  return `<svg class="ic ${cls}" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" ` +
+    `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name]}</svg>`;
+}

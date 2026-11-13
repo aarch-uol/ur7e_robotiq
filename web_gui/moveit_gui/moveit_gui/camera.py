@@ -67,6 +67,22 @@ def decode_image(encoding: str, width: int, height: int, step: int, data, is_big
     return np.ascontiguousarray(rgb, dtype=np.uint8)
 
 
+def encode_jpeg(rgb: np.ndarray, quality: int = 90) -> bytes:
+    """HxWx3 uint8 RGB -> JPEG bytes (a program's `photo` step)."""
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".jpg", np.ascontiguousarray(rgb[..., ::-1]), [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if ok:
+            return buf.tobytes()
+    except ImportError:
+        pass
+    import io
+    from PIL import Image
+    out = io.BytesIO()
+    Image.fromarray(rgb).save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
 def to_gray(encoding: str, width: int, height: int, step: int, data, is_bigendian: bool = False) -> np.ndarray:
     """sensor_msgs/Image (colour or mono, 8 bit) -> HxW uint8 grey at full resolution, for calibration."""
     ch, dtype, kind = _channels(encoding)

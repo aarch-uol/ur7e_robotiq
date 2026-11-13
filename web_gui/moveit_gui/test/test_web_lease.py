@@ -29,7 +29,7 @@ def test_token_is_secret_and_not_broadcast(env):
     assert len(tok) >= 20 and r["client"] and r["client"] != tok
     s.tick()
     assert tok not in json.dumps(s.state()) and tok not in json.dumps(s.info())
-    assert s.state()["lease"] == {"client": r["client"], "name": "alice"}
+    assert s.state()["lease"] == {"client": r["client"], "name": "alice", "uid": None, "away": False, "ask": None, "offer": None}
     # the public id is no credential
     with pytest.raises(CommandError, match="take control"):
         s.command(r["client"], "move_waypoint", {"name": "ready"})
@@ -61,7 +61,7 @@ def test_any_request_with_the_token_is_a_heartbeat(env):
     s.command("not-the-token", "program_list", {})                           # read-only without token: no renewal
     clock.t += 1.0
     s.tick()
-    assert s.lease.client is None
+    assert s.lease.away                                                       # idle robot: only away, not renewed
 
 
 # -------------------------------------------------------------- watchdogs

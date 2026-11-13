@@ -100,13 +100,45 @@ def test_lost_heartbeat_stops_a_moving_robot(env):
         "lost contact" in line for line in bridge.drain_logs())
 
 
-def test_lost_heartbeat_while_idle_just_releases(env):
+def test_lost_heartbeat_while_idle_is_only_away(env):
     s, bridge, clock, _ = env
     a = s.take_lease("")["token"]
     n = bridge.calls.count(("cancel",))
     clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1
     s.tick()
+    assert s.lease.holds(a) and s.lease.away and bridge.calls.count(("cancel",)) == n
+    assert s._lease_state()["away"] is True
+    clock.t += 30
+    s.tick()
+    assert s.heartbeat(a) and not s.lease.away                   # back from the background: still in control
+    clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1
+    s.tick()
+    assert s.lease.away
+    clock.t += svc_mod.IDLE_LEASE_S
+    s.tick()
     assert s.lease.client is None and bridge.calls.count(("cancel",)) == n
+    assert any("was away" in line for line in [l for _, l in s.logs] + bridge.drain_logs())
+
+
+def test_away_holder_never_stops_the_robot(env):
+    s, bridge, clock, _ = env
+    a = s.take_lease("")["token"]
+    clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1
+    s.tick()
+    assert s.lease.away
+    s.core.idle = lambda: False                                  # someone moves it from the teach pendant
+    n = bridge.calls.count(("cancel",))
+    clock.t += 10
+    s.tick()
+    assert s.lease.holds(a) and bridge.calls.count(("cancel",)) == n
+
+
+def test_away_holder_can_be_taken_over(env):
+    s, bridge, clock, _ = env
+    s.take_lease("", "alice")
+    clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1
+    s.tick()
+    assert s.take_lease("", "bob")["name"] == "bob"
 
 
 # --------------------------------------------------------------- commands

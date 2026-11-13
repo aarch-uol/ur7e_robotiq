@@ -18,7 +18,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from . import force, jog
+from . import cart_speed, force, jog
 from .bridge_api import Snapshot, wrench_fresh
 from .calibration import CalibrationStore
 from .control_modes import CONTROL_STATE_UNKNOWN, ControlModeManager, detect_mode
@@ -30,9 +30,11 @@ from .policies import PolicyLibrary
 from .policy_action import MockPolicyRunner, RunPolicyFeedback, RunPolicyResult, SubprocessPolicyRunner
 from .policy_executor import PolicyExecutor
 from .profile import RobotProfile, reorder_joints
+from .batch import BatchRunner
 from .program import ProgramHooks, ProgramRunner, RunState
-from .recorder import FakeBagProcess, Recorder
+from .recorder import NAME_RE, FakeBagProcess, Recorder
 from .ft_bias import FtBias
+from .ft_guard import FtGuard
 from .gains import Gains
 from .calibration import config_dir as _config_dir
 
@@ -52,6 +54,8 @@ class RobotCore:
                                  getattr(bridge, "topic_types", lambda: []), bridge.log,
                                  spawn=FakeBagProcess if fake else None)
         self._auto_rec: Optional[str] = None         # recording directory started by auto-record
+        self.operator: Callable[[], str] = lambda: ""    # who is in control (the web service sets it)
+        self._step_rec: Optional[str] = None         # recording directory a program's record_start step began
         for note in self.store.notes:
             bridge.log(f"calibration: {note}")
         self.geo = Geometry(self.store, bridge.lookup_transform, bridge.read_pose_source)
@@ -65,7 +69,7 @@ class RobotCore:
         self.modes = ControlModeManager(
             bridge, profile, log=bridge.log,
             policy_running=lambda: self.policies.busy,
-            program_running=lambda: self.runner is not None and self.runner.state != RunState.IDLE)
+            program_running=lambda: self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active))
         # One policy runtime path: AUTOMATION and the program `policy` step both go through this.
         library = PolicyLibrary(policies_dir)
         self.policies = PolicyExecutor(library, self.modes, bridge,
@@ -91,6 +95,9 @@ class RobotCore:
         self.runner.speed_override = lambda: self.speed_override
         self.runner.robot_stopped = self._robot_stopped_during_run
         self.runner.hooks = _CoreProgramHooks(self)
+        # PROGRAMS > Batch: one program run several times; the whole batch counts as one program run (idle())
+        self.batch = BatchRunner(self)
+        self.last_run_recording = ""                 # the recording of the last program run ("" = none)
         self.last_snap = Snapshot()
         self._watchdog_why = None
         self._watchdog_stop = None
@@ -101,6 +108,9 @@ class RobotCore:
         self.last_refusal = ""
         self.mode_before_freedrive = profile.default_mode
         self.program_step = -1
+        self._runs: dict = {}                  # kind -> facts about the run going on now (see _touch_run)
+        self.log_mark: Callable[[], int] = lambda: 0                 # the web service sets these two: the log lines
+        self.log_since: Callable[[int], list] = lambda mark: []      # a run produced
         self.program_result: Optional[Tuple[bool, str]] = None
         self.policy_feedback: Optional[RunPolicyFeedback] = None
         self.policy_result: Optional[RunPolicyResult] = None
@@ -120,6 +130,14 @@ class RobotCore:
         self._selected_axes: dict = {}               # mode -> admittance selected_axes (read once per mode entry)
         self._mode_seen = "unknown"
         self._plan: Optional[dict] = None            # the last plan: trajectory, preview, start, time
+        # F/T soft / hard limit (ft_guard.py): RosBridge feeds every sample from its F/T callback; other bridges
+        # (fake) get the 10 Hz snapshot reading from update()
+        self.ft_guard = FtGuard(_config_dir() / "ft_limit.yaml", on_hard=self._ft_hard_stop, log=bridge.log)
+        self.ft_guard.freedrive = lambda: bool(self.last_snap.freedrive)
+        self.ft_guard.commanding = self.commanding
+        self._ft_pushed = hasattr(bridge, "on_wrench")
+        if self._ft_pushed:
+            bridge.on_wrench = self.ft_guard.feed
         self.policies.feedback_listeners.append(self._on_policy_feedback)
         self.policies.done_listeners.append(self._on_policy_done)
         for f, e in self.policies.errors.items():
@@ -130,6 +148,8 @@ class RobotCore:
         """Poll once: snapshot, detected mode, command source. Call at the UI rate."""
         s = self.bridge.snapshot()
         self.last_snap = s
+        if not self._ft_pushed:
+            self.ft_guard.feed(s.wrench)
         if self.modes.control_state_unknown:
             self.mode = CONTROL_STATE_UNKNOWN
         else:
@@ -156,6 +176,7 @@ class RobotCore:
         # Startup / move_group restart / fixture re-taught: re-apply the keep-out boxes (never while moving)
         self.keepout.poll(bool(s.connected.get("MoveIt")), self.idle() and not s.freedrive)
         self._auto_record()
+        self._track_runs(s)
         self.recorder.poll()
         self.gains.poll(self.idle() and not s.freedrive)
         self.ft_bias.poll(not self.ft_bias.busy)
@@ -190,6 +211,41 @@ class RobotCore:
         live = self.recorder.view()["recording"]
         return live["dir"] if live else ""
 
+    def record_start(self, name: str = "", note: str = "", presets=None, source: str = "") -> Tuple[bool, str]:
+        """Start a recording with the who / what / why in meta.json. presets None = the saved selection."""
+        who = self.operator() or ""
+        run = self._run_label()
+        info = {"operator": who, "note": note or "", "mode": self.mode,
+                "program": run[1] if run and run[0] == "program" else ""}
+        return self.recorder.start(name=name or (f"program_{run[1]}" if run else ""),
+                                   source=source or f"manual ({who or 'operator'})",
+                                   run={"kind": run[0], "name": run[1], "start": time.time()} if run else None,
+                                   presets=presets, info=info)
+
+    def take_photo(self, topic: str, label: str = "") -> Tuple[bool, str]:
+        """One still from an image topic: into the running recording's photos/ folder, else <recordings>/../photos.
+        File name: <date>_<time>_<label>.jpg"""
+        grab = getattr(self.bridge, "grab_photo", None)
+        if grab is None:
+            return False, "this bridge cannot take photos"
+        jpeg, why = grab(topic)
+        if jpeg is None:
+            return False, why or f"{topic}: no image"
+        live = self.recording_dir()
+        folder = Path(live) / "photos" if live else self.recorder.root.parent / "photos"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        tag = NAME_RE.sub("_", (label or "photo").strip())[:60].strip("_") or "photo"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path, n = folder / f"{stamp}_{tag}.jpg", 1
+            while path.exists():
+                n += 1
+                path = folder / f"{stamp}_{tag}~{n}.jpg"
+            path.write_bytes(jpeg)
+        except OSError as e:
+            return False, f"cannot save the photo in {folder}: {e}"
+        return True, f"photo saved: {path}"
+
     def mode_label(self) -> str:
         m = self.profile.modes.get(self.mode)
         if self.mode == CONTROL_STATE_UNKNOWN:
@@ -207,7 +263,7 @@ class RobotCore:
             return "a force is applied"
         if self.policies.busy:
             return "a policy is running"
-        if self.runner is not None and self.runner.state != RunState.IDLE:
+        if self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active):
             return "a program is running"
         if self.busy or self.jogging:
             return "the robot is moving"
@@ -225,7 +281,7 @@ class RobotCore:
         return ok, msg
 
     def idle(self) -> bool:
-        return not self.busy and self.runner.state == RunState.IDLE and not self.policies.busy
+        return not self.busy and self.runner.state == RunState.IDLE and not self.policies.busy and not self.batch.active
 
     def refuse(self, msg: str) -> Result:
         self.last_refusal = msg
@@ -235,7 +291,7 @@ class RobotCore:
     # ----------------------------------------------------------------- motion
     def motion_refusal(self) -> Optional[str]:
         """Why manual MoveIt motion is not allowed right now, or None."""
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy:
+        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
             return "robot is busy"
         if self.modes.control_state_unknown:
             return ("control state is UNKNOWN: GUI motion is disabled until it is recovered "
@@ -346,11 +402,23 @@ class RobotCore:
         vel, acc = self.scaled(vel, acc)
         return self.run_motion(lambda: self.bridge.move_joints(list(q), vel, acc))
 
-    def move_pose(self, pose, linear: bool, vel: float, acc: float) -> Result:
-        """pose: geometry.PoseSpec (frame + TCP). Resolved to the MoveIt link goal here."""
+    def linear_speed(self, speed_mm_s, linear: bool) -> float:
+        """A linear move's TCP speed limit for the bridge: m/s after the GUI speed override, 0.0 = none (no value,
+        0, or not a linear move). Raises ValueError outside (0, profile max]."""
+        v = cart_speed.optional_mm_s(speed_mm_s, self.profile.max_cart_speed_mm_s)
+        return v / 1000.0 * self.speed_override if (v > 0 and linear) else 0.0
+
+    def move_pose(self, pose, linear: bool, vel: float, acc: float, speed_mm_s=None) -> Result:
+        """pose: geometry.PoseSpec (frame + TCP). Resolved to the MoveIt link goal here. speed_mm_s: TCP speed
+        limit of a linear move (None / 0 = only the velocity scaling)."""
         target = self.geo.planning_target(pose)          # GeometryError propagates to the caller
+        try:
+            cs = self.linear_speed(speed_mm_s, linear)
+        except ValueError as e:
+            return False, str(e)
         vel, acc = self.scaled(vel, acc)
-        return self.run_motion(lambda: self.bridge.move_pose(target.link, target.T_base_link, linear, vel, acc))
+        return self.run_motion(lambda: self.bridge.move_pose(target.link, target.T_base_link, linear, vel, acc,
+                                                             cart_speed=cs, speed_point=target.T_link_tcp[:3, 3]))
 
     # ------------------------------------------------------------------- jog
     def jog_step(self, cmd: JogCommand, step: float, vel: float, acc: float) -> Result:
@@ -603,13 +671,19 @@ class RobotCore:
         vel, acc = self.scaled(vel, acc)
         return self._keep_plan(self.bridge.plan_joints(list(q), vel, acc), "joint target")
 
-    def plan_pose(self, pose, linear: bool, vel: float, acc: float) -> Result:
+    def plan_pose(self, pose, linear: bool, vel: float, acc: float, speed_mm_s=None) -> Result:
         if self.busy:
             return False, "robot is busy"
         target = self.geo.planning_target(pose)          # GeometryError propagates to the caller
+        try:
+            cs = self.linear_speed(speed_mm_s, linear)
+        except ValueError as e:
+            return False, str(e)
         vel, acc = self.scaled(vel, acc)
-        return self._keep_plan(self.bridge.plan_pose(target.link, target.T_base_link, linear, vel, acc),
-                               f"{'linear ' if linear else ''}{pose.tcp} in {pose.frame}")
+        return self._keep_plan(self.bridge.plan_pose(target.link, target.T_base_link, linear, vel, acc,
+                                                     cart_speed=cs, speed_point=target.T_link_tcp[:3, 3]),
+                               f"{'linear ' if linear else ''}{pose.tcp} in {pose.frame}"
+                               + (f" ≤ {cs * 1000:.0f} mm/s" if cs else ""))
 
     def _keep_plan(self, traj, what: str) -> Result:
         if traj is None or not getattr(traj, "points", None):
@@ -665,7 +739,7 @@ class RobotCore:
         return self.robot_refusal()
 
     def _force_claim_refusal(self) -> Optional[str]:
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy:
+        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
             return "robot is busy"
         return self.force_refusal()
 
@@ -883,9 +957,43 @@ class RobotCore:
             return wrench_fresh(snap), still       # a frozen sensor reads as "no F/T data": the zero fails
         return self.ft_bias.zero(sample, stopped=stopped, refusal=lambda: None)
 
+    # ---------------------------------------------------------- run history facts
+    def _touch_run(self, kind: str) -> dict:
+        """Facts about the run going on now (who started it, F/T peak, log start, who stopped it)."""
+        r = self._runs.get(kind)
+        if r is None:
+            r = self._runs[kind] = {"operator": self.operator() or "", "peak_f": 0.0, "peak_t": 0.0, "stopped_by": "",
+                                    "log": self.log_mark(), "step": -1}
+        return r
+
+    def _track_runs(self, snap):
+        if self.runner.state != RunState.IDLE:
+            self._touch_run("program")
+        if getattr(self.policies, "current", None):       # cleared just before the policy's done callbacks
+            self._touch_run("policy")
+        w = snap.wrench if self._runs else None
+        if w and len(w) >= 6 and snap.wrench_age is not None and snap.wrench_age < 1.0:
+            f, t = sum(x * x for x in w[:3]) ** 0.5, sum(x * x for x in w[3:6]) ** 0.5
+            for r in self._runs.values():
+                r["peak_f"], r["peak_t"] = max(r["peak_f"], f), max(r["peak_t"], t)
+
+    def note_stop(self, who: str):
+        """Remember who ended the runs going on now (the first one counts)."""
+        for r in self._runs.values():
+            r["stopped_by"] = r["stopped_by"] or who
+
+    def _run_extras(self, kind: str) -> dict:
+        r = self._runs.pop(kind, None) or {"operator": self.operator() or "", "peak_f": 0.0, "peak_t": 0.0,
+                                           "stopped_by": "", "log": self.log_mark(), "step": -1}
+        return {"operator": r["operator"], "stopped_by": r["stopped_by"], "peak_force_n": round(r["peak_f"], 2),
+                "peak_torque_nm": round(r["peak_t"], 3), "_step": r["step"], "_log": self.log_since(r["log"])}
+
     def stop_all(self, reason: str = ""):
+        if reason:
+            self.note_stop(reason)
         # each part on its own: one that raises must not keep the others (or the cancel) from running
-        for part in (lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
+        for part in (lambda: self.batch.stop("stopped by STOP"),                   # first: no next run of a batch starts
+                     lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
                      lambda: self.jog_stop("STOP"), self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
             try:
                 part()
@@ -893,6 +1001,18 @@ class RobotCore:
                 self.bridge.log(f"STOP: {type(e).__name__}: {e}")
         self.command_source = "idle"
         self.bridge.log(f"STOPPED: {reason}" if reason else "STOP GUI MOTION pressed")
+
+    def _ft_hard_stop(self, why: str):
+        """The F/T hard limit (ft_guard.py, its own thread): stop everything the GUI commands, motion first."""
+        self.bridge.log(f"F/T HARD LIMIT: {why}: stopping the GUI's motion")
+        for part in (self.bridge.cancel_motion, self.runner.stop, self.policies.cancel,
+                     lambda: self.jog_stop("F/T hard limit"), lambda: self.force_stop("F/T hard limit: zeroed")):
+            try:
+                part()
+            except Exception as e:
+                self.bridge.log(f"F/T limit stop: {type(e).__name__}: {e}")
+        self.last_refusal = f"F/T hard limit: {why}"
+        self.command_source = "idle"
 
     def commanding(self) -> bool:
         """The GUI is commanding the arm: a move, a program or policy run, a jog or a force."""
@@ -962,6 +1082,9 @@ class RobotCore:
     # ---------------------------------------------------------------- runner
     def _on_step(self, i: int):
         self.program_step = i
+        if i >= 0:
+            r = self._touch_run("program")
+            r["step"] = max(r["step"], i)
         for fn in list(self.step_listeners):
             fn(i)
 
@@ -973,9 +1096,15 @@ class RobotCore:
     def _on_done(self, ok: bool, msg: str):
         self.program_result = (ok, msg)
         self.bridge.log(f"program: {msg}")
+        x = self._run_extras("program")
+        self.last_run_recording = self.recording_dir() or self._step_rec or ""
+        total = int(getattr(self.runner, "steps_total", 0) or 0)
         self.history.record("program", getattr(self.runner, "program_name", "?"),
                             getattr(self.runner, "started_at", None), ok, msg.splitlines()[0] if msg else "",
-                            speed_override=self.speed_override, recording=self.recording_dir())
+                            log=x.pop("_log"), speed_override=self.speed_override,
+                            steps_done=total if ok else max(0, x.pop("_step")), steps_total=total,
+                            recording=self.last_run_recording, **{k: v for k, v in x.items() if k != "_step"})
+        self._step_rec = None
         for fn in list(self.done_listeners):
             fn((ok, msg))
 
@@ -987,8 +1116,10 @@ class RobotCore:
         self.policy_result = res
         name, t0 = getattr(self.policies, "started", (None, None))
         if name:
+            x = self._run_extras("policy")
+            x.pop("_step")
             self.history.record("policy", name, t0, res.success, res.stop_reason, res.log_dir or "",
-                                recording=self.recording_dir())
+                                log=x.pop("_log"), recording=self.recording_dir(), **x)
         if self.command_source.startswith("policy"):
             self.command_source = "idle"
         self.bridge.log(f"policy: {res.stop_reason}" + (f" (log {res.log_dir})" if res.log_dir else ""))
@@ -1023,3 +1154,22 @@ class _CoreProgramHooks(ProgramHooks):
 
     def zero_ft(self, stopped):
         return self.core.program_zero_ft(stopped)
+
+    def record_start(self, presets, name, note):
+        ok, msg = self.core.record_start(name=name, note=note, presets=presets or None)
+        live = self.core.recorder.view()["recording"]
+        if ok and live:
+            self.core._step_rec = live["dir"]
+        return ok, msg
+
+    def record_stop(self, reason, wait=False):
+        if wait:
+            self.core.recorder.stop_and_wait(reason)
+            return True, "recording finished"
+        return self.core.recorder.stop(reason)
+
+    def recording(self):
+        return self.core.recording_dir() or None
+
+    def photo(self, topic, label):
+        return self.core.take_photo(topic, label)

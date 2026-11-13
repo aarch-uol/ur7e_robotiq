@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.db
 build/
+!moveit_gui/web/static/vendor/three/build/
 install/
 log/
 .pytest_cache/

@@ -19,7 +19,7 @@ export function meshPartDefaults(file, parent, existing = [], scale = 0.001) {
 }
 
 export function workcell(ctx) {
-  const { h, btn, note, cmd, toast, lease } = ctx;
+  const { h, btn, note, cmd, toast, lease, ask, askText } = ctx;
   // the views are built once and only one is in the page at a time: look in the page, then in the hidden views
   const roots = [];
   const $ = (sel) => document.querySelector(sel) || roots.map((r) => r.querySelector(sel)).find(Boolean) || null;
@@ -343,14 +343,14 @@ export function workcell(ctx) {
       onChange();
     }
     async function del(p) {
-      if (!window.confirm(`Delete part "${p.name}"?`)) return;
+      if (!(await ask(`Delete part "${p.name}"?`))) return;
       const r = await cmd("parts_delete", { name: p.name });
       if (r.ok) { fill(r.parts); if (P.editing === p.name) startFrom({}); onChange(); }
     }
     async function makeTcp() {
       const n = P.editing || $("#pt-name").value.trim();
       if (!n) return toast("save the part first", false);
-      const t = window.prompt(`Name of the TCP at the far face of "${n}" (it follows the part when you edit it):`, `${n}_tip`);
+      const t = (await askText(`Name of the TCP at the far face of "${n}" (it follows the part when you edit it):`, `${n}_tip`));
       if (t) cmd("parts_make_tcp", { name: n, tcp: t });
     }
     function fill(d) {
@@ -413,7 +413,7 @@ export function workcell(ctx) {
         "with the parts in the robot model. The arm stays where it is (stopped, powered). On the pendant, press Play on the " +
         "External Control program again afterwards (unless headless). Every browser must take control again."
       : "Restart the GUI?\n\nThe robot stack keeps running. Every browser must take control again.";
-    if (!window.confirm(msg)) return;
+    if (!(await ask(msg))) return;
     const r = await cmd("restart", { what });
     if (r.ok) toast(r.msg, true, true);
   }
@@ -492,9 +492,9 @@ export function workcell(ctx) {
     async function capture() { const r = await cmd("handeye_capture"); shot(r); if (r.ok) fill(r.he); }
     async function plan() { const r = await cmd("handeye_plan", { tilt_deg: +$("#he-tilt").value }); if (r.ok) fill(r.he); }
     async function collect() {
-      if (!ctx.fake() && !window.confirm(`Move through ${C.data?.poses || 0} poses and sample at each?\n\nThe arm turns up to ` +
+      if (!ctx.fake() && !(await ask(`Move through ${C.data?.poses || 0} poses and sample at each?\n\nThe arm turns up to ` +
         `±${$("#he-tilt").value}° about the board (or the tool tip). MoveIt plans each move around the keep-out zones and parts, ` +
-        "but check the space around the arm. Keep a hand near STOP.")) return;
+        "but check the space around the arm. Keep a hand near STOP."))) return;
       cmd("handeye_collect");
     }
     async function saveCam() {
@@ -549,7 +549,7 @@ export function workcell(ctx) {
           h("div", { class: "muted small" }, `${c.verdict} · ${c.rms_mm} mm / ${c.rms_deg}° · ${c.samples} samples · ${c.saved}`),
           h("div", { class: "mono small" }, `${c.parent} → ${c.optical_frame}: ${c.xyz_mm.join(", ")} mm`)),
         lease(btn("Add to robot", "quiet", () => cmd("handeye_apply", { name: c.name }).then((r) => r.ok && W.parts?.fill(r.parts)))),
-        lease(btn("✕", "quiet", () => window.confirm(`Delete calibration ${c.name}?`) && cmd("handeye_delete", { name: c.name }).then((r) => r.ok && fill(r.he))))))
+        lease(btn("✕", "quiet", async () => (await ask(`Delete calibration ${c.name}?`)) && cmd("handeye_delete", { name: c.name }).then((r) => r.ok && fill(r.he))))))
         : [h("div", { class: "muted small" }, "None yet.")]));
     }
     roots.push(left, right);
@@ -568,7 +568,7 @@ export function workcell(ctx) {
   function buildSetups() {
     // the internal names of what a setup holds, in plain words (several files can be one thing to the user)
     const LABEL = { "TCPs, fixtures, vision": "TCPs + fixtures", "controller gains + payload": "gains + payload",
-      "vial profiles": "vials", "part meshes": "parts", "parts URDF/SRDF": "", "last payload calibration": "payload calibration" };
+      "vial profiles": "vials", "flask profiles": "flasks", "part meshes": "parts", "parts URDF/SRDF": "", "last payload calibration": "payload calibration" };
     const words = (keys) => [...new Set((keys || []).map((k) => LABEL[k] ?? k).filter(Boolean))];
     const list = h("div", { class: "list", id: "st-list" }), autos = h("div", { class: "list", id: "st-auto" });
     const cur = h("div", { class: "st-cur", id: "st-current" }, "—");
@@ -603,7 +603,7 @@ export function workcell(ctx) {
       nt = nt ?? $("#st-note").value;
       if (!name) return toast("name the setup first", false);
       const r = await cmd("setup_save", { name, note: nt, replace });
-      if (!r.ok && /exists/.test(r.msg || "") && window.confirm(`Replace setup "${name}" with what is on the robot now?`)) return save(true, name, nt);
+      if (!r.ok && /exists/.test(r.msg || "") && (await ask(`Replace setup "${name}" with what is on the robot now?`))) return save(true, name, nt);
       if (r.ok) { fillBase(r.base); fill(r.setups, r.current); }
     }
     const baseLabel = (n) => (B?.choices.find((c) => c.name === n) || { label: n || "?" }).label;
@@ -617,9 +617,9 @@ export function workcell(ctx) {
         c.name === b.running ? "" : lease(btn("Switch…", "quiet", () => switchBase(c))))));
     }
     async function switchBase(c) {
-      if (!window.confirm(`Switch the base to "${c.label}"?\n\n${c.text}.\n\nCheck first that this is what is really on the robot. ` +
+      if (!(await ask(`Switch the base to "${c.label}"?\n\n${c.text}.\n\nCheck first that this is what is really on the robot. ` +
         "The robot stack restarts (about a minute). Parts on hardware this base does not have are left out.\n\n" +
-        "Save the current setup first if you want to come back to it.")) return;
+        "Save the current setup first if you want to come back to it."))) return;
       const r = await cmd("base_switch", { base: c.name, confirm: true });
       if (r.ok) toast(r.msg, true, true);
     }
@@ -633,7 +633,7 @@ export function workcell(ctx) {
           : "Restarts the GUI (a few seconds)."].filter(Boolean);
       const unsaved = CUR?.name && (CUR.changed?.length || CUR.base_changed) && CUR.name !== s.name
         ? `\n\nNot saved in "${CUR.name}": ${words(CUR.changed).concat(CUR.base_changed ? ["base"] : []).join(", ")} (kept in an automatic backup).` : "";
-      if (!window.confirm(`Load setup "${s.name}"?\n\n${lines.join("\n")}${unsaved}`)) return;
+      if (!(await ask(`Load setup "${s.name}"?\n\n${lines.join("\n")}${unsaved}`))) return;
       const r = await cmd("setup_load", { name: s.name });
       if (r.ok) toast(r.msg, true, true);
     }
@@ -644,7 +644,7 @@ export function workcell(ctx) {
           s.note ? h("span", { class: "muted" }, " · " + s.note) : ""),
         h("div", { class: "muted small" }, `${s.saved} · ${words(s.holds).join(", ") || "empty"}`), s.error ? h("div", { class: "error small" }, s.error) : ""),
       lease(btn("Load…", "", () => load(s), "Shows what changes first")),
-      lease(btn("✕", "quiet", () => window.confirm(`Delete setup "${s.name}"?`) && cmd("setup_delete", { name: s.name }).then((r) => r.ok && fill(r.setups, r.current)))));
+      lease(btn("✕", "quiet", async () => (await ask(`Delete setup "${s.name}"?`)) && cmd("setup_delete", { name: s.name }).then((r) => r.ok && fill(r.setups, r.current)))));
     function fillCurrent(c) {
       CUR = c ? { ...c, note: (W.setups.all || []).find((s) => s.name === c.name)?.note || "" } : null;
       if (!c) return;
@@ -657,7 +657,7 @@ export function workcell(ctx) {
       const ch = words(c.changed).concat(c.base_changed ? ["base"] : []);
       cur.replaceChildren(h("div", { class: "row" }, h("span", { class: "grow" }, "In use: ", h("b", {}, c.name), " ",
           ch.length ? chip("changed", "warn") : chip("saved", "ok")),
-        ch.length ? lease(btn(`Save into "${c.name}"`, "primary", () => window.confirm(`Save the changes (${ch.join(", ")}) into "${c.name}"?`) &&
+        ch.length ? lease(btn(`Save into "${c.name}"`, "primary", async () => (await ask(`Save the changes (${ch.join(", ")}) into "${c.name}"?`)) &&
           save(true, c.name, CUR.note))) : ""),
         h("div", { class: "muted small" }, ch.length ? `Changed since saved: ${ch.join(", ")}` : "Nothing changed since it was saved or loaded."));
     }

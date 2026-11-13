@@ -126,7 +126,7 @@ export function ftChart(storage = globalThis.localStorage) {
   let paused = false, cmd = null, dirty = true, lastDraw = 0, raf = 0;
   const save = () => { try { storage.setItem("ftchart", JSON.stringify({ pick: [...pick], win })); } catch (e) { /* private mode */ } };
   const canvas = el("canvas", { class: "ftc-canvas", role: "img", "aria-label": "Live force and torque chart" });
-  const readout = el("div", { class: "ftc-read mono" });
+  const readout = el("div", { class: "ftc-read" });          // empty: pushes the buttons right
   const chips = FT_SERIES.map((s) => {
     const b = el("button", { class: "ftc-chip", type: "button", "aria-pressed": String(pick.has(s.key)),
       title: `Show ${s.key} (${s.unit})`, onclick: () => {
@@ -236,10 +236,8 @@ export function ftChart(storage = globalThis.localStorage) {
       }
     }
     g.restore(); g.setLineDash([]);
-    if (!shown.length) { g.fillStyle = "#515a65"; g.textAlign = "center"; g.fillText("pick an axis above", L + pw / 2, T + ph / 2); }
-    const k = t.length - 1;
-    readout.textContent = k >= 0 ? shown.map((s) => `${s.key} ${seriesValues(s, k).toFixed(s.unit === "N" ? 2 : 3)}`).join("  ") +
-      (paused ? "  (paused)" : "") : "no F/T data";
+    const empty = !shown.length ? "pick an axis above" : !t.length ? "no F/T data" : "";
+    if (empty) { g.fillStyle = "#515a65"; g.textAlign = "center"; g.fillText(empty, L + pw / 2, T + ph / 2); }
   }
 
   function add(ts, w) {

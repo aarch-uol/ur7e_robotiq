@@ -42,6 +42,7 @@ def members(profile: str) -> Dict[str, str]:
         "F/T bias": f"ft_bias/{profile}.json",
         "controller gains + payload": f"gains/{profile}.json",
         "vial profiles": f"vials/{profile}.yaml",
+        "flask profiles": f"flasks/{profile}.yaml",
         "parts": f"parts/{profile}.yaml",
         "part meshes": "parts/meshes/",
         "parts URDF/SRDF": "parts/generated/",
