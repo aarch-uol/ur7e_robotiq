@@ -21,6 +21,7 @@ from .policies import PolicyLibrary, PolicyManifest, RecordingOptions
 from .policy_action import RunPolicyFeedback, RunPolicyGoal, RunPolicyResult
 
 OK, FAIL, RUNNER = "ok", "fail", "runner"          # RUNNER = only the runner can check it, at its start
+WARN = "warn"                                      # shown, never blocks a run
 
 
 @dataclass
@@ -136,6 +137,15 @@ class PolicyExecutor:
         if m.required_mode not in self.modes.profile.modes:
             out.append(Requirement("Control mode", FAIL, f"'{m.required_mode}' is not a mode of this robot"))
         out += deployment_requirements(m, self.bridge)
+        if "robot_config" in files:
+            got = self.library.ft_axes_in_use()
+            if got:
+                owner, res = got
+                out.append(Requirement("F/T axes", OK, f"Match simulation of {owner or 'the settings in use'} "
+                                                       f"({res.get('at', '')})"))
+            else:
+                out.append(Requirement("F/T axes", WARN, "no Match simulation result in this profile: the robot "
+                                                         "config's own F/T settings are used"))
         if m.required_tcp:
             tcp = self.active_tcp()
             out.append(Requirement(f"TCP {m.required_tcp}", OK if tcp == m.required_tcp else FAIL,
@@ -210,6 +220,19 @@ class PolicyExecutor:
             finished(RunPolicyResult(False, "preflight failed: " + "; ".join(problems) if problems
                                      else "a policy is already running"))
             return False
+        route = self.modes.profile.servo.get("policy_route", "admittance") \
+            if self.manifests[goal.policy].backend == "servo_admittance" else ""
+        sp = getattr(self, "servo_pause", None)
+        if route and sp is not None:
+            ok, msg = sp.hold(route)                     # the runner talks to Servo itself: resume it first
+            if not ok:
+                finished(RunPolicyResult(False, msg))
+                return False
+            done = finished
+
+            def finished(res):                           # noqa: F811  (released when the policy ends)
+                sp.release(route)
+                done(res)
         self._cancelled.clear()
         self.current = goal.policy
         self.started = (goal.policy, time.time())

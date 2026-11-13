@@ -106,3 +106,12 @@ def test_give_is_refused_while_the_robot_moves(env):
         s.command(ta, "control_answer", {"give": True})
     assert s.heartbeat(ta)
     s.stop()
+
+
+def test_give_is_refused_when_measured_joints_move_without_a_gui_job(env):
+    s, bridge, _, _ = env
+    ta = s.take_lease("", "Alice", bid=A)["token"]
+    s.ask_control(B)
+    bridge._qd = [0.1] * len(bridge._qd)
+    with pytest.raises(CommandError, match="moving"):
+        s.command(ta, "control_answer", {"give": True})

@@ -484,7 +484,7 @@ def make_handler(hub: Hub, allow_hosts=()):
                 if path == "/api/heartbeat":
                     return self._json(200, {"ok": True, "holds": service.heartbeat(client)})
                 if path == "/api/release":
-                    service.release(client)
+                    service.release(client, confirm=body.get("confirm") is True)
                     return self._json(200, {"ok": True})
                 if path == "/api/cmd":
                     return self._json(200, service.command(client, str(body.get("cmd", "")), body.get("args") or {},

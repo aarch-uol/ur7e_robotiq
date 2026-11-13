@@ -341,6 +341,26 @@ def test_setup_current_changes_and_preview(env):
     assert run(s, "setup_list")["current"]["name"] == ""   # the one in use was deleted
 
 
+def test_setup_load_restores_files_and_markers_if_later_step_fails(env, monkeypatch):
+    s, _, tmp = env
+    s.on_restart = lambda: None
+    run(s, "tcp_save", name="tip_one", parent="tool0", xyz_mm=[0, 0, 100], rpy_deg=[0, 0, 0])
+    run(s, "setup_save", name="one")
+    run(s, "tcp_save", name="tip_two", parent="tool0", xyz_mm=[0, 0, 200], rpy_deg=[0, 0, 0])
+    run(s, "setup_save", name="two")
+    cfg = tmp / "cfg" / "moveit_gui"
+    before = (cfg / "calibrations" / "ur7e_lab.yaml").read_text()
+
+    def fail(*_args, **_kwargs):
+        raise OSError("simulated base write failure")
+
+    monkeypatch.setattr("moveit_gui.web.workcell.B.write_next", fail)
+    with pytest.raises(CommandError, match="simulated base write failure"):
+        run(s, "setup_load", name="one")
+    assert (cfg / "calibrations" / "ur7e_lab.yaml").read_text() == before
+    assert s.setups.in_use()["name"] == "two"
+
+
 def test_restart_rules(env):
     s, _, _ = env
     with pytest.raises(CommandError, match="launcher"):

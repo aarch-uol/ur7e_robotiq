@@ -18,6 +18,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
+from .servo_pause import ServoPause
 from . import cart_speed, force, jog
 from .bridge_api import Snapshot, wrench_fresh
 from .calibration import CalibrationStore
@@ -34,6 +35,7 @@ from .batch import BatchRunner
 from .program import ProgramHooks, ProgramRunner, RunState
 from .recorder import MIN_FREE_MB, NAME_RE, FakeBagProcess, Recorder, _atomic_write
 from .ft_bias import FtBias
+from .ft_match import FtMatchStore, store_path as ft_match_path
 from .ft_guard import FtGuard
 from .gains import Gains
 from .calibration import config_dir as _config_dir
@@ -72,10 +74,18 @@ class RobotCore:
             program_running=lambda: self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active))
         # One policy runtime path: AUTOMATION and the program `policy` step both go through this.
         library = PolicyLibrary(policies_dir)
+        # SETUP > F/T + payload > Match simulation: the result in use goes into every policy run's robot config
+        self.ft_match = FtMatchStore(ft_match_path(_config_dir(), profile.name))
+        self.settings_owner: Callable[[], str] = lambda: ""      # whose settings are in use (set by the web GUI)
+        library.ft_axes = lambda: (self.settings_owner(), self.ft_match.load())
+        library.notify = bridge.log
         self.policies = PolicyExecutor(library, self.modes, bridge,
                                        MockPolicyRunner() if fake else SubprocessPolicyRunner(library, self.modes),
                                        active_tcp=lambda: self.store.active_tcp,
                                        frame_exists=lambda f: f in self.store.frame_names())
+        # MoveIt Servo is paused while no jog or policy uses it (servo_pause.py)
+        self.servo_pause = ServoPause(bridge, (profile.servo.get("routes") or {}).keys(), bridge.log)
+        self.policies.servo_pause = self.servo_pause
         # SETUP > Controller gains: admittance / impedance parameters on the running controller nodes
         self.gains = Gains.from_profile(profile.gains, bridge, bridge.log, lambda: self.mode, self._gains_refusal,
                                         settings_path=_config_dir() / "gains" / f"{profile.name}.json")
@@ -121,6 +131,7 @@ class RobotCore:
         self.speed_override = 1.0              # GUI speed override: scales every GUI motion (not policies)
         self._jog_mode = ""
         self._jog_route = ""
+        self._jog_hold_route = ""                    # the Servo route this jog holds unpaused (servo_pause.py)
         self._jog_restore_mode = ""
         self._servo_home_mode = ""             # the user's mode while a Servo jog borrows a hidden mode (shown_mode)
         self._jog_shape = True
@@ -165,6 +176,7 @@ class RobotCore:
                 threading.Thread(target=self.force_stop, args=("control mode changed: zeroed at once",),
                                  daemon=True).start()
         self._robot_watchdog()
+        self.servo_pause.tick()
         p = self._plan
         if p is not None and s.joints and \
                 max(abs(a - b) for a, b in zip(s.joints, p["points"][0][1])) > self.PLAN_START_TOL_RAD:
@@ -494,10 +506,16 @@ class RobotCore:
         start_mode = self.mode
         route_name, route_cfg = jog.servo_route(self.profile, start_mode)
         restore_mode = ""
+        ok, msg = self.servo_pause.hold(route_name or "")
+        if not ok:
+            self.end_motion()
+            return False, msg
+        self._jog_hold_route = route_name or ""
         try:
             ok, msg = self.bridge.servo_command_type(
                 velocity.kind if velocity.kind == "joint" else "twist", route_name)
             if not ok:
+                self._jog_release_servo()
                 self.end_motion()
                 return False, f"Servo: {msg}"
 
@@ -510,6 +528,7 @@ class RobotCore:
                 if not ok:
                     self.update()
                     self._servo_home_mode = ""
+                    self._jog_release_servo()
                     self.end_motion()
                     return False, f"Servo controller switch: {msg}"
                 restore_mode = start_mode
@@ -518,6 +537,7 @@ class RobotCore:
                     self.modes.switch_to(restore_mode)
                     self.update()
                     self._servo_home_mode = ""
+                    self._jog_release_servo()
                     self.end_motion()
                     return False, f"Servo controller switch succeeded but mode is {self.mode}"
 
@@ -543,9 +563,14 @@ class RobotCore:
                     self.bridge.log(f"Servo cleanup could not restore {restore_mode}: {msg}")
                 self.update()
             self._servo_home_mode = ""
+            self._jog_release_servo()
             self.end_motion()
             raise
         return True, f"jogging {velocity.describe()}"
+
+    def _jog_release_servo(self):
+        r, self._jog_hold_route = getattr(self, "_jog_hold_route", ""), ""
+        self.servo_pause.release(r)
 
     def _jog_senders(self, velocity: JogVelocity, route: str, route_cfg: dict):
         c, b = self.jog_cfg, self.bridge
@@ -665,6 +690,7 @@ class RobotCore:
                 self.bridge.log(f"Servo jog stopped but could not restore {restore_mode}: {msg}")
             self.update()
         self._servo_home_mode = ""
+        self._jog_release_servo()
         self.end_motion()
         if reason != "released":
             self.bridge.log(f"jog ended: {reason}")

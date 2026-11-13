@@ -81,6 +81,51 @@ def test_takeover_is_refused_while_the_robot_moves(env):
         s.command(a, "switch_mode", {"mode": "admittance"})
 
 
+def test_takeover_is_refused_when_measured_joints_move_without_a_gui_job(env):
+    s, bridge, _, _ = env
+    s.take_lease("", "alice")
+    bridge._qd = [0.1] * len(bridge._qd)
+    with pytest.raises(CommandError, match="moving"):
+        s.take_lease("", "bob")
+
+
+def test_release_while_moving_needs_confirmation_and_is_logged(env):
+    s, bridge, _, _ = env
+    a = s.take_lease("", "alice")["token"]
+    bridge._qd = [0.1] * len(bridge._qd)
+    with pytest.raises(CommandError, match="release anyway"):
+        s.release(a)
+    assert s.lease.holds(a)
+    s.release(a, confirm=True)
+    assert s.lease.client is None
+    assert any(e["what"] == "released control while busy" for e in s.activity.recent())
+
+
+def test_release_while_idle_needs_no_confirmation(env):
+    s, _, _, _ = env
+    a = s.take_lease("", "alice")["token"]
+    s.release(a)
+    assert s.lease.client is None
+
+
+def test_queued_job_is_not_started_after_takeover(env):
+    import threading
+
+    s, _, _, _ = env
+    s.take_lease("", "alice")
+    started = []
+    release = threading.Event()
+    for _ in range(4):
+        s._submit("block", lambda: (release.wait(2), "ok"))
+    queued = s._submit("queued", lambda: (started.append(True), "ran"))
+    s.take_lease("", "bob")
+    release.set()
+    assert wait(lambda: any(r["id"] == queued["job"] for r in s.results))
+    result = next(r for r in s.results if r["id"] == queued["job"])
+    assert result["msg"] == "not started: control changed"
+    assert not started
+
+
 def test_lost_heartbeat_stops_a_moving_robot(env):
     s, bridge, clock, _ = env
     a = s.take_lease("", "alice")["token"]

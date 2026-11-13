@@ -15,6 +15,8 @@ model: ~/policies/v4/model.zip
 normalization: ~/policies/v4/vec_normalize.pkl
 training_config: ~/policies/v4/config.yaml
 robot_config: ~/ur7e_ws/src/ur7e_robotiq/ur7e_robotiq_bringup/config/ur7e_policy_deployment.yaml
+sim_ft_reference: ~/policies/v4/sim_ft_reference.json   # optional, SETUP > F/T + payload > Match simulation
+                                  # (default: sim_ft_reference.json next to robot_config)
 entrypoint: run_policy            # run_policy | run_scraping_policy
 duration: 8.0
 stop_signal: SIGINT

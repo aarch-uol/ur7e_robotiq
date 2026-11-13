@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import threading
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,29 @@ from .calibration import config_dir
 
 DEFAULT_SOURCE = "~/franka_ros2/ft_sensor_calibration"
 G = 9.80665          # calibration_math.GRAVITY: the fitted mass and the applied weight use the same g
+
+
+def _atomic_write(path: Path, text: str):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                         mode="w", encoding="utf-8", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 class PayloadCalibrationError(RuntimeError):
@@ -173,8 +197,13 @@ class PayloadCalibration:
         r = self.result
         directory = Path(directory) if directory else config_dir() / "ft_payload"
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{self.profile.name}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        path.write_text(json.dumps({
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+        path = directory / f"{self.profile.name}_{stamp}.json"
+        counter = 0
+        while path.exists():
+            counter += 1
+            path = directory / f"{self.profile.name}_{stamp}_{counter}.json"
+        _atomic_write(path, json.dumps({
             "robot": self.profile.name, "sensor_frame": self.sensor_frame, "reference_frame": self.reference_frame,
             "mass_kg": r.mass, "cog_m": r.cog, "passed": r.passed,
             "issues": r.quality.get("issues", []), "warnings": r.quality.get("warnings", []),
@@ -246,7 +275,7 @@ class PayloadCalibration:
         if self.saved_path and self.saved_path.exists():
             d = json.loads(self.saved_path.read_text())
             d["applied_to_controller"] = {"node": self.apply_node, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
-            self.saved_path.write_text(json.dumps(d, indent=2))
+            _atomic_write(self.saved_path, json.dumps(d, indent=2))
         return True, (f"{self.apply_node}: CoG {params['gravity_compensation.CoG.pos']} m, weight "
                       f"{params['gravity_compensation.CoG.force']} N. " +
                       ("Saved: restored automatically after a controller restart." if kept else

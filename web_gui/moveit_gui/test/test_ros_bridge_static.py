@@ -343,3 +343,19 @@ def test_joint_states_are_read_at_about_100_hz(ros_bridge_module):
     b._t_joints -= 0.02                                  # the arm is due
     b._on_joints_raw(b"y")
     assert seen == [b"y"]
+
+
+def test_servo_outside_commanders_counts_only_other_nodes(ros_bridge_module):
+    """servo_pause.py keeps Servo running while a policy run without the GUI publishes its commands."""
+    from types import SimpleNamespace
+    me = SimpleNamespace(node_name="moveit_gui", node_namespace="/")
+    other = SimpleNamespace(node_name="policy_runner", node_namespace="/")
+    topics = {"/servo_node/delta_twist_cmds": [me, other], "/servo_node/delta_joint_cmds": [me]}
+    b = object.__new__(ros_bridge_module.RosBridge)
+    b.node = SimpleNamespace(get_name=lambda: "moveit_gui", get_namespace=lambda: "/",
+                             get_publishers_info_by_topic=lambda t: topics.get(t, []))
+    b._servo_endpoint = lambda route: (route, {"cfg": {"twist_topic": "/servo_node/delta_twist_cmds",
+                                                       "joint_topic": "/servo_node/delta_joint_cmds"}})
+    assert b.servo_outside_commanders("admittance") == 1
+    topics["/servo_node/delta_twist_cmds"] = [me]
+    assert b.servo_outside_commanders("admittance") == 0

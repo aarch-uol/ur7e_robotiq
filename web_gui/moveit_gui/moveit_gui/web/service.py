@@ -66,6 +66,8 @@ from .batching import BatchCommands
 from ..batch import BatchError, sweep_options
 from ..teach import TeachError
 from .flask_cmds import FLASK_ADMIN, FlaskCommands
+from .ftmatch_cmds import FTMATCH_ADMIN, FtMatchCommands
+from ..ft_match import FtMatchError
 from ..flask_geometry import FlaskGeometryError
 from ..flask_scrape import FlaskScrapeError
 from ..flask_setup import FlaskSetupError
@@ -88,7 +90,8 @@ ADMIN_COMMANDS = frozenset((
     "parts_make_tcp", "base_switch", "robot_setup", "setup_save", "setup_delete", "setup_load", "setup_copy",
     "profile_delete",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
-    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN))
+    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN,
+    *FTMATCH_ADMIN))
 # commands allowed while the one in control does not have their own settings in use (worksets.py)
 SWITCH_FREE = frozenset(("profile_activate", "stack_stop"))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
@@ -136,6 +139,7 @@ class Lease:
     take_lease, never broadcast); `id` is public and only lets the holder's page recognise itself in the state."""
 
     def __init__(self):
+        self.generation = 0
         self.token: Optional[str] = None
         self.id: Optional[str] = None
         self.name = ""
@@ -163,16 +167,19 @@ def remote_power() -> bool:
     return os.environ.get("MOVEIT_GUI_LOCAL_POWER_ONLY", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
-class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
+class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, FtMatchCommands):
     def __init__(self, core: RobotCore, clock: Callable[[], float] = time.monotonic):
         self.core = core
         self.clock = clock
-        self.lease = Lease()
+        self._lease_generation = 0
+        self.lease = self._new_lease()
         core.operator = lambda: self.lease.name or ""
         self.activity = ActivityLog(Path(os.environ["MOVEIT_GUI_ACTIVITY"]) if os.environ.get("MOVEIT_GUI_ACTIVITY") else None)
+        self.activity.on_error = core.bridge.log
         core.log_mark = lambda: self._log_last
         core.log_since = self._log_since
         self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
+        self._command_context = threading.local()         # caller token while a command handler submits a job
         self.users = Users(clock)                         # who has the page open (one per browser)
         self.roles = Roles(Path(os.environ.get("MOVEIT_GUI_ROLES") or config_dir() / "roles.yaml"))
         self.asking: Optional[dict] = None                # someone asks the holder for control: {uid, name, at, kept}
@@ -216,6 +223,13 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         self._workcell_init()
         self._teach_init()
         self._flask_init()
+        self._ftmatch_init()
+
+    def _new_lease(self) -> Lease:
+        self._lease_generation += 1
+        lease = Lease()
+        lease.generation = self._lease_generation
+        return lease
 
     # ================================================================= polling
     def _log_error(self, what: str, e: BaseException):
@@ -249,6 +263,10 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             self._teach_tick()
         except Exception as e:
             self._log_error("teach", e)
+        try:
+            self._ftmatch_tick()
+        except Exception as e:
+            self._log_error("F/T match", e)
         self._drain_logs()
 
     def _drain_logs(self):
@@ -296,7 +314,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             if lease.away:
                 if silent <= IDLE_LEASE_S:
                     return                                # away: never stops anything
-                self.lease = Lease()
+                self.lease = self._new_lease()
         who = lease.name or lease.id
         if lease.away:
             self.core.bridge.log(f"web: {who} was away for {silent:.0f} s (limit {IDLE_LEASE_S:.0f} s): control released")
@@ -318,7 +336,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         with self._lease_lock:
             if self.lease is not lease or self.clock() - lease.seen <= LEASE_TIMEOUT_S:
                 return                                    # taken over, or a heartbeat came meanwhile
-            self.lease = Lease()
+            self.lease = self._new_lease()
         self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
                              f"{LEASE_TIMEOUT_S:.1f} s): STOPPING")
         self.core.note_stop(f"lost contact with {lease.name.split(' @ ')[0] or lease.id}")
@@ -351,11 +369,12 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             if off and not again and off["uid"] != uid:
                 raise CommandError(f"control is being handed to {off['name']} (for a few seconds)")
             if cur.token and not again:
-                if not self.core.idle() or self.core.last_snap.freedrive:
-                    raise CommandError(f"{cur.name or 'another browser'} is controlling a moving robot")
+                why = self.verified_standstill()
+                if why:
+                    raise CommandError(f"{cur.name or 'another browser'} is controlling a moving robot: {why}")
                 self.core.bridge.log(f"web: {name or 'a browser'} took over control from {cur.name or cur.id}")
                 took_from = cur.name.split(" @ ")[0] or "another browser"
-            lease = Lease()
+            lease = self._new_lease()
             lease.token, lease.id = client or secrets.token_urlsafe(24), secrets.token_urlsafe(6)
             lease.name, lease.seen, lease.uid = name or "browser", self.clock(), uid
             lease.key, lease.role = key, role
@@ -416,9 +435,10 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 a["kept"], a["at"] = True, self.clock()
                 holder = self.lease.name
             else:
-                if not self.core.idle() or self.core.last_snap.freedrive:
-                    raise CommandError("the robot is moving: stop it first, then give control")
-                holder, self.lease = self.lease.name, Lease()
+                why = self.verified_standstill()
+                if why:
+                    raise CommandError(f"the robot is moving or busy: {why}; stop it first, then give control")
+                holder, self.lease = self.lease.name, self._new_lease()
                 self.offer = {"uid": a["uid"], "name": a["name"], "until": self.clock() + self.OFFER_S}
                 self.asking = None
         self.core.bridge.log(f"web: {holder} {'gave control to' if give else 'keeps control; asked by'} {a['name']}")
@@ -447,12 +467,35 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 return True
             return False
 
-    def release(self, token: str):
+    def verified_standstill(self) -> Optional[str]:
+        """Return why the robot is not proven still, or None when the check is fail-closed and clear."""
+        if (not self.core.idle() or self.core.jogging or self.core.force_active or
+                getattr(self, "payload_progress", {}).get("running") or
+                getattr(self, "he", {}).get("progress", {}).get("running", False)):
+            return "the robot is busy (motion, program, policy or force mode is running)"
+        snap = self.core.bridge.snapshot()
+        age = snap.joint_state_age
+        if age is None or age > self.core.profile.joint_state_timeout_s:
+            return "joint states are not fresh: cannot verify the robot is still"
+        qd = snap.joint_velocities
+        if qd is None:
+            return "joint speeds are unavailable: cannot verify the robot is still"
+        if any(abs(float(v)) > self.core.profile.stationary_joint_velocity for v in qd):
+            return "the robot is moving"
+        if snap.program_state == "PAUSED" or (snap.program_state == "PLAYING" and snap.program_running is not True):
+            return "a pendant program is running"
+        return None
+
+    def release(self, token: str, confirm: bool = False):
         with self._lease_lock:
             if not self.lease.holds(token):
                 return
-            who, self.lease = self._actor(), Lease()
-        self._act("control", "released control", who)
+            if not confirm:
+                why = self.verified_standstill()
+                if why:
+                    raise CommandError(f"{why}: release anyway? (the robot keeps running)")
+            who, self.lease = self._actor(), self._new_lease()
+        self._act("control", "released control while busy" if confirm else "released control", who)
 
     # ------------------------------------------------------------------ roles
     def cmd_roles_get(self):
@@ -482,7 +525,19 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         return {"ok": True, "msg": "stopped"}
 
     # ================================================================ commands
+    def _log_refusal(self, cmd: str, reason: str):
+        self.core.bridge.log(f"web: REFUSED {cmd}: {reason}")
+        kind = "roles" if cmd == "roles_save" else "setup" if cmd in ADMIN_COMMANDS else ACTIVITY_COMMANDS.get(cmd, "setup")
+        self._act(kind, f"refused {cmd.replace('_', ' ')}", details=reason)
+
     def command(self, client: str, cmd: str, args: dict, local: bool = False, role: str = "admin") -> dict:
+        try:
+            return self._command(client, cmd, args, local=local, role=role)
+        except CommandError as e:
+            self._log_refusal(cmd, str(e))
+            raise
+
+    def _command(self, client: str, cmd: str, args: dict, local: bool = False, role: str = "admin") -> dict:
         """local: the browser runs on the robot PC (decided by the server from the connection, never by the page).
         role: the caller's role (roles.py, decided by the server); in-process callers and tests are admin."""
         handler = getattr(self, f"cmd_{cmd}", None)
@@ -513,12 +568,20 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 raise CommandError("the program was changed (another browser or an undo): it has been reloaded, "
                                    "check your selection and try again")
             before = self._snapshot() if edits else None
+            previous_token = getattr(self._command_context, "token", None)
+            self._command_context.token = client
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
                     GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError, R.RobotError,
-                    TeachError, BatchError, ProfileError, FlaskGeometryError, FlaskScrapeError, FlaskSetupError) as e:
+                    TeachError, BatchError, ProfileError, FlaskGeometryError, FlaskScrapeError, FlaskSetupError,
+                    FtMatchError) as e:
                 raise CommandError(str(e)) from None
+            finally:
+                if previous_token is None:
+                    self._command_context.__dict__.pop("token", None)
+                else:
+                    self._command_context.token = previous_token
             if before is not None and self._record_edit(before, undoable=cmd in PROGRAM_EDITS):
                 if isinstance(out, dict) and "program" in out:
                     out["program"].update(self._history_view(), rev=self.program_rev)
@@ -542,12 +605,20 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
     def _submit(self, cmd: str, fn: Callable[[], tuple]) -> dict:
         jid = next(self._job_ids)
         epoch = getattr(self.core.bridge, "stop_epoch", 0)
+        actor = self._actor()
+        caller_token = getattr(self._command_context, "token", None)
+        with self._lease_lock:
+            submitted_lease = self.lease
+            submitted_generation = submitted_lease.generation
+            submitted_token = caller_token if caller_token is not None else submitted_lease.token
 
         def run():
             try:
                 if getattr(self.core.bridge, "stop_epoch", 0) != epoch:
                     # A job that waited in the queue (all job threads busy) must not start after a STOP.
                     ok, msg = False, "not started: STOP was pressed before it began"
+                elif not self._job_lease_still_matches(submitted_lease, submitted_generation, submitted_token):
+                    ok, msg = False, "not started: control changed"
                 else:
                     ok, msg = fn()
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, ValueError) as e:
@@ -556,6 +627,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 ok, msg = False, f"{type(e).__name__}: {e}"
             if not ok:
                 self.core.last_refusal = msg
+                self._act(ACTIVITY_COMMANDS.get(cmd, "setup"), f"failed {cmd.lower()}", actor, msg)
             self.core.bridge.log(("" if ok else "FAILED: ") + f"{cmd}: {msg}")
             self.results.append({"id": jid, "cmd": cmd, "ok": bool(ok), "msg": msg, "t": time.time()})
             notify = getattr(self, "on_result", None)
@@ -563,6 +635,11 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 notify()
         self._jobs.submit(run)
         return {"ok": True, "job": jid, "msg": "started"}
+
+    def _job_lease_still_matches(self, lease: Lease, generation: int, token: Optional[str]) -> bool:
+        with self._lease_lock:
+            return (self.lease is lease and self.lease.generation == generation and
+                    (not token or self.lease.holds(token)))
 
     @staticmethod
     def _ok(msg="ok", **kw):
@@ -1956,7 +2033,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
     # ----------------------------------------------------------------- policy
     def cmd_policy_requirements(self, name):
         return self._ok(requirements=[{"label": r.label, "state": r.state, "detail": r.detail,
-                                       "fix": self._requirement_fix(name, r) if r.state == "fail" else None}
+                                       "fix": self._requirement_fix(name, r) if r.state in ("fail", "warn") else None}
                                       for r in self.core.policies.requirements(name)])
 
     def _requirement_fix(self, name, r) -> Optional[dict]:
@@ -1973,6 +2050,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                                (" This commands DIRECT TORQUE." if mode.direct_torque else "")}
         if r.label.startswith("Frame "):
             return {"label": "Open SETUP", "page": "SETUP"}
+        if r.label == "F/T axes":
+            return {"label": "Open SETUP", "page": "SETUP", "hint": "SETUP › F/T + payload › Match simulation"}
         if r.label == "Controller gains" and m.controller_gains:
             return {"label": "Apply trained gains", "cmd": "gains_apply_policy", "args": {"name": name},
                     "confirm": f"Set the {m.required_mode} controller to the gains {name} was trained with? "
@@ -2569,6 +2648,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                        if pr else None,
                        "supports_feedback": c.policies.supports_feedback},
             "payload": self.payload_view(),
+            "ftmatch": self.ftmatch_view(),
             "ft_bias": self.core.ft_bias.view(),
             "calibration": self.calibration_view(),
             "keepout": self.keepout_view(),

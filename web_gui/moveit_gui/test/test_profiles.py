@@ -15,6 +15,7 @@ import pytest
 from moveit_gui import setups as setups_mod
 from moveit_gui.setups import Setups
 from moveit_gui.user_profiles import PREFS_MAX, ProfileError, Profiles
+from moveit_gui.worksets import WorkSets
 from moveit_gui.web.service import CommandError
 from moveit_gui.web.workcell import RESTART_STACK
 
@@ -249,12 +250,107 @@ def test_an_old_marker_without_owner_is_a_shared_setup(tmp_path):
 def test_profile_commands_need_no_control_but_delete_and_copy_do(env):
     s, _, _ = env
     s.command("other", "profile_create", {"name": "Cenk"})          # "other" does not hold the lease
-    s.command("other", "profile_prefs_save", {"name": "Cenk", "prefs": {"v3-show": "{}"}})
-    assert s.command("other", "profile_prefs_get", {"name": "Cenk"})["prefs"] == {"v3-show": "{}"}
+    with pytest.raises(CommandError, match="take control"):
+        s.command("other", "profile_prefs_save", {"name": "Cenk", "prefs": {"v3-show": "{}"}})
+    assert s.command("other", "profile_prefs_get", {"name": "Cenk"})["prefs"] == {}
     with pytest.raises(CommandError, match="take control"):
         s.command("other", "setup_copy", {"source_owner": "", "name": "x", "owner": "Cenk"})
     with pytest.raises(CommandError, match="only an Admin"):
         s.command("me", "profile_delete", {"name": "Cenk"}, role="operator")
+
+
+def test_profile_prefs_save_only_writes_the_callers_profile(env):
+    s, _, _ = env
+    run(s, "profile_create", name="Cenk")
+    run(s, "profile_create", name="Ayesha")
+    s.take_lease("me", "Cenk @ 100.64.0.1")
+    run(s, "profile_prefs_save", name="Cenk", prefs={"v3-show": "mine"})
+    with pytest.raises(CommandError, match="your own profile"):
+        run(s, "profile_prefs_save", name="Ayesha", prefs={"v3-show": "not mine"})
+
+
+def test_profile_switch_ignores_faulted_gripper_and_stale_none_mode(env):
+    s, bridge, _ = env
+    run(s, "profile_create", name="alpha")
+    run(s, "profile_create", name="beta")
+    as_(s, "alpha")
+    as_(s, "beta")
+    s.on_restart = lambda: None
+
+    bridge.gripper_fault = 5
+    bridge.gripper_controllers[bridge.profile.gripper["controller"]] = "inactive"
+    s.core.mode = "none"                         # stale cached mode; arm controllers remain in Position
+
+    out = run(s, "profile_activate")
+    assert out["ok"] and s.worksets.active() == "beta"
+
+
+def test_profile_switch_none_mode_requires_fresh_controllers_and_standstill(env, monkeypatch):
+    s, bridge, _ = env
+    run(s, "profile_create", name="alpha")
+    run(s, "profile_create", name="beta")
+    as_(s, "alpha")
+    as_(s, "beta")
+    s.on_restart = lambda: None
+    s.core.mode = "none"
+
+    real = bridge.snapshot
+
+    def stale():
+        snap = real()
+        snap.controllers_age = 10.0
+        return snap
+
+    monkeypatch.setattr(bridge, "snapshot", stale)
+    with pytest.raises(CommandError, match="controller list"):
+        run(s, "profile_activate")
+    monkeypatch.setattr(bridge, "snapshot", real)
+    bridge._qd = [0.1] * len(bridge._qd)
+    with pytest.raises(CommandError, match="moving"):
+        run(s, "profile_activate")
+
+
+def test_profile_switch_is_pinned_to_the_callers_lease(env, monkeypatch):
+    s, _, _ = env
+    for n in ("alpha", "beta", "gamma"):
+        run(s, "profile_create", name=n)
+    as_(s, "alpha")
+    as_(s, "beta")
+    s.on_restart = lambda: None
+    original = s.worksets.save
+
+    def take_over_before_commit(name, *args, **kwargs):
+        if str(name).lower() == "beta":
+            s.take_lease("other", "gamma @ 100.64.0.2")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(s.worksets, "save", take_over_before_commit)
+    with pytest.raises(CommandError, match="control changed"):
+        run(s, "profile_activate")
+
+
+def test_profile_switch_keeps_refusing_a_known_non_moveit_mode(env):
+    s, _, _ = env
+    run(s, "profile_create", name="alpha")
+    run(s, "profile_create", name="beta")
+    as_(s, "alpha")
+    as_(s, "beta")
+    s.on_restart = lambda: None
+    s.core.mode = "impedance"
+    with pytest.raises(CommandError, match="change to Position"):
+        run(s, "profile_activate")
+
+
+def test_refused_commands_are_written_to_the_gui_log(env):
+    s, bridge, _ = env
+    run(s, "profile_create", name="alpha")
+    run(s, "profile_create", name="beta")
+    as_(s, "alpha")
+    as_(s, "beta")
+    with pytest.raises(CommandError, match="launcher"):
+        run(s, "profile_activate")
+    assert any("REFUSED profile_activate:" in line and "launcher" in line
+               for line in bridge.drain_logs())
 
 
 def test_stack_stop_does_not_require_profile_settings_switch(env):
@@ -401,6 +497,54 @@ def test_a_failed_first_switch_puts_the_settings_back(env, monkeypatch):
     assert not list((cfg / "profiles").glob(".switch-*"))
 
 
+def test_settings_switch_recovery_rolls_back_before_publish(tmp_path):
+    cfg = tmp_path / "cfg"
+    p = Profiles(cfg)
+    p.create("old")
+    p.create("new")
+    live = cfg / "calibrations" / "ur7e_lab.yaml"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text("old")
+    ws = WorkSets(cfg, "ur7e_lab", p)
+    ws.set_active("old")
+    target = tmp_path / "target"
+    (target / "calibrations").mkdir(parents=True)
+    (target / "calibrations" / "ur7e_lab.yaml").write_text("new")
+    (target / ".strict").write_text("")
+
+    tx = ws.begin_switch("new")
+    ws.stage_switch(tx, target, {})
+    # A killed process leaves the journal and the old active marker; startup must undo the staged switch.
+    ws.recover()
+    assert live.read_text() == "old" and ws.active() == "old"
+    assert not list((cfg / "profiles").glob(".switch-*"))
+
+
+def test_settings_switch_recovery_finishes_after_active_publish(tmp_path):
+    cfg = tmp_path / "cfg"
+    p = Profiles(cfg)
+    p.create("old")
+    p.create("new")
+    live = cfg / "calibrations" / "ur7e_lab.yaml"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_text("old")
+    ws = WorkSets(cfg, "ur7e_lab", p)
+    ws.set_active("old")
+    target = tmp_path / "target"
+    (target / "calibrations").mkdir(parents=True)
+    (target / "calibrations" / "ur7e_lab.yaml").write_text("new")
+    (target / ".strict").write_text("")
+
+    tx = ws.begin_switch("new")
+    ws.stage_switch(tx, target, {})
+    ws.apply_switch(tx)
+    ws.set_active("new")             # killed after the final rename, before journal cleanup
+    ws = WorkSets(cfg, "ur7e_lab", p)
+    ws.recover()
+    assert live.read_text() == "new" and ws.active() == "new"
+    assert not list((cfg / "profiles").glob(".switch-*"))
+
+
 def test_two_restart_requests_at_once_restart_once(env):
     s, _, _ = env
     calls = []
@@ -449,7 +593,7 @@ def test_the_progress_page_shows_how_far_the_start_is(tmp_path):
         ok = urllib.request.Request(url + "/api/stack_start", data=b"{}", method="POST",
                                     headers={"Content-Type": "application/json"})
         assert "already" in json.loads(urllib.request.urlopen(ok).read())["msg"].lower()
-        p.terminate()
+        (cfg / "stack_progress").write_text("stage=gui\n")             # the launcher starts the GUI next
         assert p.wait(5) == 0
     finally:
         if p.poll() is None:

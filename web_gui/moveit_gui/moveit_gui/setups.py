@@ -1,7 +1,7 @@
 """Named setups: everything that belongs to one physical configuration of the robot, saved and switched as one.
 
 "scraping, spatula" and "pick, gripper + wrist camera" differ in their parts, TCPs, payload, F/T bias, gains,
-camera calibrations, fixtures and keep-out zones. A setup is a copy of those files (config_dir()/setups/<name>/,
+camera calibrations, fixtures, keep-out zones and the F/T match simulation result. A setup is a copy of those files (config_dir()/setups/<name>/,
 with setup.yaml describing it). Loading one puts its files back in place and restarts the GUI, so every store reads
 them fresh; when its parts differ from the running robot model the robot stack restarts too (the GUI offers it).
 Before a load, the current files are kept as an automatic setup ("_before_<name>_<time>", the newest 5 kept).
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import filecmp
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -34,6 +35,107 @@ AUTO_PREFIX = "_before_"
 AUTO_KEEP = 5
 CURRENT = "current.yaml"           # setups/current.yaml: the setup last saved or loaded
 DERIVED = ("parts URDF/SRDF",)     # rebuilt from the parts: copied, but not a change of its own
+
+
+def _fsync_dir(path: Path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write(path: Path, text: str):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                         mode="w", encoding="utf-8", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        _fsync_dir(path.parent)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def _fsync_tree(path: Path):
+    path = Path(path)
+    if path.is_file():
+        with open(path, "rb") as f:
+            os.fsync(f.fileno())
+        return
+    if not path.is_dir():
+        return
+    for p in path.iterdir():
+        _fsync_tree(p)
+    _fsync_dir(path)
+
+
+def _remove_path(path: Path):
+    if not path.exists():
+        return
+    old = Path(tempfile.mkdtemp(prefix=f".{path.name}.old-", dir=path.parent))
+    shutil.rmtree(old)
+    path.rename(old)
+    if old.is_dir():
+        shutil.rmtree(old)
+    else:
+        old.unlink()
+    _fsync_dir(path.parent)
+
+
+def _replace_path(src: Path, dst: Path):
+    """Copy a staged file/tree beside its destination, then publish it with a rename."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    old = None
+    if dst.exists():
+        old = Path(tempfile.mkdtemp(prefix=f".{dst.name}.old-", dir=dst.parent))
+        shutil.rmtree(old)
+        dst.rename(old)
+    if src.is_dir():
+        tmp = Path(tempfile.mkdtemp(prefix=f".{dst.name}.new-", dir=dst.parent))
+        try:
+            shutil.copytree(src, tmp, dirs_exist_ok=True)
+            _fsync_tree(tmp)
+            try:
+                tmp.rename(dst)
+            except Exception:
+                if old is not None:
+                    old.rename(dst)
+                raise
+        except Exception:
+            if old is not None and not dst.exists():
+                old.rename(dst)
+            raise
+        finally:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+    else:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.new-", dir=dst.parent)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            shutil.copy2(src, tmp)
+            _fsync_tree(tmp)
+            os.replace(tmp, dst)
+        except Exception:
+            if old is not None and not dst.exists():
+                old.rename(dst)
+            raise
+        finally:
+            tmp.unlink(missing_ok=True)
+    if old is not None and old.exists():
+        if old.is_dir():
+            shutil.rmtree(old)
+        else:
+            old.unlink()
+    _fsync_dir(dst.parent)
 
 
 class SetupError(ValueError):
@@ -55,11 +157,12 @@ def members(profile: str) -> Dict[str, str]:
         "camera calibrations": f"cameras/{profile}.yaml",
         "F/T limit": "ft_limit.yaml",
         "recording settings": f"recording/{profile}.json",
+        "F/T match simulation": f"ft_match/{profile}.json",
     }
 
 
 # Added later: a setup saved before them does not hold them, and loading it leaves those files as they are
-OPTIONAL = ("F/T limit", "recording settings")
+OPTIONAL = ("F/T limit", "recording settings", "F/T match simulation")
 
 
 def _payload_files(cfg: Path, profile: str) -> List[Path]:
@@ -118,7 +221,8 @@ def copy_files(cfg: Path, profile: str, dest: Path) -> List[str]:
         (dest / "ft_payload").mkdir(parents=True, exist_ok=True)
         shutil.copy2(pf[-1], dest / "ft_payload" / pf[-1].name)
         holds.append("last payload calibration")
-    (dest / ".strict").write_text("")
+    _atomic_write(dest / ".strict", "")
+    _fsync_tree(dest)
     return holds
 
 
@@ -129,21 +233,24 @@ def _put_in_place(cfg: Path, profile: str, files: Path):
         dst, src = cfg / rel.rstrip("/"), files / rel.rstrip("/")
         if key in OPTIONAL and not strict and not src.exists():
             continue
-        if dst.is_dir():
-            shutil.rmtree(dst)
-        elif dst.exists():
-            dst.unlink()
         if src.is_dir():
-            shutil.copytree(src, dst)
+            _replace_path(src, dst)
         elif src.is_file():
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            _replace_path(src, dst)
+        else:
+            _remove_path(dst)
     kept = sorted((files / "ft_payload").glob("*.json")) if (files / "ft_payload").is_dir() else []
     if kept and not (_payload_files(cfg, profile) and
                      filecmp.cmp(_payload_files(cfg, profile)[-1], kept[-1], shallow=False)):
         (cfg / "ft_payload").mkdir(parents=True, exist_ok=True)
         # a new name, so it is the newest file (the one SETUP shows as the last calibration)
-        shutil.copy2(kept[-1], cfg / "ft_payload" / f"{profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+        out = cfg / "ft_payload" / f"{profile}_{stamp}.json"
+        counter = 0
+        while out.exists():
+            counter += 1
+            out = cfg / "ft_payload" / f"{profile}_{stamp}_{counter}.json"
+        _replace_path(kept[-1], out)
 
 
 def put_in_place(cfg: Path, profile: str, files: Path):
@@ -214,7 +321,7 @@ class Setups:
         d = {"name": name, "at": time.strftime("%Y-%m-%d %H:%M")}
         if self.owner:
             d["owner"] = self.owner
-        self.marker.write_text(yaml.safe_dump(d))
+        _atomic_write(self.marker, yaml.safe_dump(d))
 
     def copy_from(self, other: "Setups", name: str, new_name: str = "", replace: bool = False) -> str:
         """Copy setup `name` of another profile (or the shared ones) into this one, as `new_name` (default: the
@@ -230,16 +337,35 @@ class Setups:
         if d.exists() and not replace:
             raise SetupError(f"this profile already has a setup '{d.name}' (copy again to replace it)")
         self.dir.mkdir(parents=True, exist_ok=True)
-        tmp = d.with_name(d.name + ".partial")
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        shutil.copytree(src, tmp)
-        info = yaml.safe_load((tmp / "setup.yaml").read_text()) or {}
-        info["copied_from"] = f"{other.owner or 'Shared'}/{src.name}"
-        (tmp / "setup.yaml").write_text(yaml.safe_dump(info, sort_keys=False))
+        tmp = Path(tempfile.mkdtemp(prefix=f".{d.name}.tmp-", dir=self.dir))
+        try:
+            shutil.copytree(src, tmp, dirs_exist_ok=True)
+            info = yaml.safe_load((tmp / "setup.yaml").read_text()) or {}
+            info["copied_from"] = f"{other.owner or 'Shared'}/{src.name}"
+            _atomic_write(tmp / "setup.yaml", yaml.safe_dump(info, sort_keys=False))
+            _fsync_tree(tmp)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
         if d.exists():
-            shutil.rmtree(d)
-        tmp.rename(d)
+            old = Path(tempfile.mkdtemp(prefix=f".{d.name}.old-", dir=self.dir))
+            shutil.rmtree(old)
+            d.rename(old)
+            try:
+                tmp.rename(d)
+            except Exception:
+                old.rename(d)
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
+            else:
+                shutil.rmtree(old)
+        else:
+            try:
+                tmp.rename(d)
+            except Exception:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
+        _fsync_dir(self.dir)
         return d.name
 
     def present(self) -> List[str]:
@@ -276,27 +402,40 @@ class Setups:
 
     def _copy_in(self, dest: Path, note: str, base: Optional[str] = None,
                  cameras: Optional[List[str]] = None) -> List[str]:
-        tmp = dest.with_name(dest.name + ".partial")
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        tmp.mkdir(parents=True)
-        holds = copy_files(self.cfg, self.profile, tmp / "files")
-        info = {"version": 1, "profile": self.profile, "note": str(note or "")[:300],
-                "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}
-        if base:
-            info["base"] = str(base)
-        if cameras is not None:                          # the camera drivers it runs (SETUP > Drivers & cameras)
-            info["cameras"] = [str(c) for c in cameras]
-        (tmp / "setup.yaml").write_text(yaml.safe_dump(info, sort_keys=False))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix=f".{dest.name}.tmp-", dir=dest.parent))
+        try:
+            holds = copy_files(self.cfg, self.profile, tmp / "files")
+            info = {"version": 1, "profile": self.profile, "note": str(note or "")[:300],
+                    "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}
+            if base:
+                info["base"] = str(base)
+            if cameras is not None:                          # the camera drivers it runs (SETUP > Drivers & cameras)
+                info["cameras"] = [str(c) for c in cameras]
+            _atomic_write(tmp / "setup.yaml", yaml.safe_dump(info, sort_keys=False))
+            _fsync_tree(tmp)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
         if dest.exists():
-            old = dest.with_name(dest.name + ".old")
-            if old.exists():
-                shutil.rmtree(old)
-            dest.rename(old)
-            tmp.rename(dest)
+            old = Path(tempfile.mkdtemp(prefix=f".{dest.name}.old-", dir=dest.parent))
             shutil.rmtree(old)
+            dest.rename(old)
+            try:
+                tmp.rename(dest)
+            except Exception:
+                old.rename(dest)
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
+            else:
+                shutil.rmtree(old)
         else:
-            tmp.rename(dest)
+            try:
+                tmp.rename(dest)
+            except Exception:
+                shutil.rmtree(tmp, ignore_errors=True)
+                raise
+        _fsync_dir(dest.parent)
         return holds
 
     def save(self, name: str, note: str = "", replace: bool = False, base: Optional[str] = None,

@@ -17,6 +17,9 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
   verify_reference_at_current_pose(check) -> (ok, why)  direct torque: reference == measured pose
   servo_ready(route=None) -> bool             selected MoveIt Servo node is ready
   servo_command_type(kind, route=None)        select Twist or JointJog input on that Servo route
+  servo_pause(route, paused) -> (ok, msg)     Servo's ~/pause_servo (servo_pause.py: paused while unused)
+  servo_paused(route) -> Optional[bool]       None: no pause service; else whether this GUI paused it
+  servo_outside_commanders(route) -> Optional[int]   publishers on its command topics other than this GUI
   servo_twist(..., route=None)                publish a stamped Cartesian Servo command
   servo_joint_jog(..., route=None)            publish a JointJog Servo command
   set_node_parameters(node, {name: value}) -> (ok, msg)     rcl_interfaces SetParameters

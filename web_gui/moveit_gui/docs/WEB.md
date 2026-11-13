@@ -128,8 +128,8 @@ independent. Commands take `owner` (`program_list`, `program_open`, `program_sav
 `source_owner`, `owner`, `new_name`, `replace`. Policies, batches and the history refer to a program by its file name.
 
 **Settings per profile** (`worksets.py`). The files in use (setups.py `members()`: TCPs, fixtures, keep-out zones,
-F/T bias and limit, gains + payload, vials, flasks, parts, camera calibrations, recording settings) belong to one
-profile at a time, named in `profiles/active.yaml`. The robot runs the settings of the one in control. Taking control
+F/T bias and limit, gains + payload, vials, flasks, parts, camera calibrations, recording settings, the F/T match
+simulation result) belong to one profile at a time, named in `profiles/active.yaml`. The robot runs the settings of the one in control. Taking control
 while another profile's settings are in use asks to switch (pop-up; `profile_activate`): the files in use are copied
 back to their profile (`profiles/<name>/live/`), the new person's copy is put in place, and the GUI restarts (the
 robot stack too when the parts or the base differ); the page then takes control again by itself. A profile without
@@ -138,6 +138,10 @@ Settings that are nobody's yet (from before profiles) become the first taker's w
 every command that needs control is refused, so nobody changes another person's settings. Setups and programs are
 written only into the profile of the one in control (or Shared); loading someone's setup into your settings keeps the
 backup in your profile. A profile whose settings are in use cannot be deleted.
+
+The settings prompt uses the lease response immediately, even if the live state stream is briefly behind it. A stale
+queued prompt cannot cancel a newly acquired lease by itself; an explicit Cancel still releases control. Refused web
+commands are written to the GUI log as `web: REFUSED <command>: <reason>` so a failed handoff is diagnosable.
 
 ## Pages
 
@@ -438,6 +442,42 @@ Every F/T sample (about 500 Hz) is checked, on a 5-sample average so one noisy s
   above it, or use Zero all.
 * It is a GUI guard for scraping contacts, not a safety function. The robot's own limits and the e-stop stay the
   safety.
+
+## Match simulation (SETUP › F/T + payload)
+
+A trained policy observes the F/T as `[fx, fy, fz, tx, ty, tz]` in the simulation's axes. When the sensor is mounted
+turned (on the UR7e: scraping along base +X is now -Y of the sensor), Match simulation finds how the sensor's axes
+map to the policy's, instead of hand-written sign tables (`moveit_gui/ft_match.py`, `web/ftmatch_cmds.py`).
+
+* Needs control, Position mode (the robot holds still) and a live F/T reading. Nothing is commanded to move.
+* Pick the policy whose sim reference to use and press **Start**. The reference is the manifest's
+  `sim_ft_reference`, else `sim_ft_reference.json` next to its `robot_config` (made by `tools/sim_ft_reference.py`
+  in the policy repo). Without one the card says so and does not start.
+* For base +X, +Y and +Z in turn the 3D view shows an arrow at the spatula tip. Keep hands off the tool for a
+  moment (the no-contact reading), then push the tip along the arrow, about 10 N, and hold 2 s. A push is taken by
+  itself when it is over 5 N and steady for 1 s; **Record** takes it at once. **Again** repeats one push.
+* The fit tries all 48 signed permutations M and picks the one with M s/|s| closest to the sim's r/|r| for the
+  three pushes. It refuses a push under 5 N or more than 15° off M, and names the push to repeat. It also shows how
+  far the best free rotation is from M. M is matched to the simulation, not to physics: MuJoCo reports the
+  reaction, so its signs may be opposite to the push, and that is what the policy saw in training.
+* Torque signs are not assumed to follow the forces (the FR3 needed `ft_obs_scale` [-1,-1,-1, 1,1,1]). A push at
+  the tip also twists the sensor, so tx and ty get their sign from the same pushes: M t compared with the sim's
+  torque (the pushes whose sim torque on that axis is at least 0.3 Nm). A torque change under 0.3 Nm, or pushes
+  that disagree, are refused with the push to repeat. tz is not measured (a push through the tip hardly twists
+  about z): it keeps the robot config's tz sign relative to its forces when they all share one sign, else it
+  takes the tx / ty sign. The card says which.
+* The result: `ft_obs_axes = M` and `ft_obs_scale = [1, 1, 1, s, s, s_z]` (forces 1: their signs are in M),
+  explained in words ("policy fx = sensor fy", "policy tx = -sensor ty"), with each push (force and torque) as the
+  policy sees it now, with the match, and in the simulation, and the torque check. A suggested spatula_tip
+  orientation (tip x = the sensor axis that becomes policy x) is shown, never applied.
+* **Save** (Admin) keeps the result in `config_dir()/ft_match/<robot>.json`, with the no-contact reading at the
+  pose (raw sensor, reading and bias). It is one of each profile's settings, so it switches with control like
+  gains and payload. **Remove** deletes it.
+* Policy runs: with a saved result, each run gets an effective robot config, the manifest's `robot_config` with
+  `observations.ft_obs_axes` and `ft_obs_scale` from the result, written to `config_dir()/policy_runs/` (the newest
+  20 kept). Its path replaces the manifest's on the generated command line and in a hand-written command's
+  `{robot_config}`. The log names the profile whose result was used. Without a result the manifest's file is used
+  as it is and the policy's readiness list shows **F/T axes** as a warning (not a blocker).
 
 ## F/T bias (SETUP › F/T + payload)
 

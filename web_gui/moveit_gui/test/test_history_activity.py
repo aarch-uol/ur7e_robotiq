@@ -128,6 +128,29 @@ def test_activity_rotation_filter_and_read(tmp_path):
     assert a.people() == ["ann", "bo"]
 
 
+def test_activity_write_failure_does_not_advance_sequence(tmp_path, monkeypatch):
+    a = ActivityLog(tmp_path / "a" / "activity.jsonl")
+    before = a.seq
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    said = []
+    a.on_error = said.append
+    monkeypatch.setattr("builtins.open", fail)
+    a.add("setup", "refused setup", {}, "disk full")          # never raises: the action goes on
+    a.add("setup", "refused setup", {}, "disk full")
+    assert a.seq == before
+    assert len(said) == 1 and "disk full" in said[0]          # said once per failure streak
+
+
+def test_failed_async_job_is_in_activity_log(env):
+    s, _, _, _ = env
+    job = s._submit("test job", lambda: (False, "simulated failure"))["job"]
+    assert wait(lambda: any(r["id"] == job for r in s.results))
+    assert any(e["what"] == "failed test job" and "simulated failure" in e["details"] for e in lines(s))
+
+
 def test_activity_command_is_read_only_and_state_has_seq(env):
     s, _, _, _ = env
     s.take_lease("", "alice @ pc", bid="a" * 20)

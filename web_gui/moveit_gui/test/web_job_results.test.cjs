@@ -116,3 +116,36 @@ test("server boot tracking advances to the new boot id after a restart", () => {
   assert.match(source, /if \(S\.boot\) boot = S\.boot;/);
   assert.doesNotMatch(source, /boot = boot \|\| S\.boot/);
 });
+
+test("a successful takeover updates the local lease before the SSE state catches up", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "../moveit_gui/web/static/app.js"), "utf8");
+  const a = source.indexOf("function lostControl(");
+  const b = source.indexOf("// ---- users:", a);
+  assert.ok(a >= 0 && b > a);
+  const context = {
+    post: async () => ({ ok: true, lease: { token: "lease-token", client: "new-client", profile: "alpha",
+      needs_switch: true, settings_owner: "other" } }),
+    operatorName: async () => "alpha",
+    render: () => {},
+    document: { querySelectorAll: () => [] },
+  };
+  vm.runInNewContext(`let S = { lease: { client: "old-client", needs_switch: false } };
+    let holds = false, TOKEN = null, MYID = null, BID = "browser-id", hbFailsSince = 0, leaseAt = 0, gaveAt = 0;
+    ${source.slice(a, b)}
+    this.api = { takeLease, state: () => S, isHolding: () => holds };`, context);
+  await context.api.takeLease();
+  assert.equal(context.api.isHolding(), true);
+  assert.equal(context.api.state().lease.client, "new-client");
+  assert.equal(context.api.state().lease.needs_switch, true);
+});
+
+test("the settings prompt is not auto-cancelled by a stale queued state", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../moveit_gui/web/static/app.js"), "utf8");
+  const a = source.indexOf("async function switchSettings(");
+  const b = source.indexOf("// Heartbeat:", a);
+  assert.ok(a >= 0 && b > a);
+  const body = source.slice(a, b);
+  // the prompt may close when control is lost, but never because the (possibly lagging) state says needs_switch is off
+  assert.doesNotMatch(body, /valid:[^\n]*needs_switch/);
+  assert.doesNotMatch(body, /if \(!v\) \{ if \(holds && S\.lease && S\.lease\.needs_switch\)/);
+});

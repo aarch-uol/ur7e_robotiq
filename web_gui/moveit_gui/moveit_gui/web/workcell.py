@@ -9,6 +9,8 @@ import base64
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -23,7 +25,7 @@ from .. import robots as R
 from .. import services as SV
 from .. import transforms as tf
 from ..calibration import TcpDef, config_dir
-from ..setups import Setups, members as S_members
+from ..setups import SetupError, Setups, members as S_members
 from ..user_profiles import Profiles, ProfileError
 from ..worksets import WorkSets
 
@@ -41,7 +43,11 @@ class WorkcellCommands:
         self.setups = Setups(config_dir(), prof)            # the shared setups (made before profiles existed)
         self.profiles = Profiles(config_dir())
         self.worksets = WorkSets(config_dir(), prof, self.profiles)   # whose settings are in use (worksets.py)
+        self._settings_lock = threading.RLock()             # one durable settings transaction at a time
+        self.worksets.recover(self.core.bridge.log)
+        self.core.settings_owner = self.worksets.active                # named in the policy runs' log
         self.restart_code: Optional[int] = None
+        self._restart_lock = threading.Lock()                # HTTP handlers run in threads: one restart decision
         self.model_rev = 0                                  # +1 when the 3D views must reload the robot model
         self.on_restart = None                              # set by the server's main()
         self.parts_sync = {"state": "waiting", "msg": "waiting for the robot model", "sent": None, "at": 0.0}
@@ -475,20 +481,19 @@ class WorkcellCommands:
 
     # ------------------------------------------------------------------ restart
     def _restart_refusal(self) -> Optional[str]:
-        c = self.core
-        if not c.idle() or c.force_active:
-            return "the robot is busy (motion, program, policy or force): stop it first"
-        if getattr(self, "payload_progress", {}).get("running") or self.he["progress"]["running"]:
-            return "a calibration is running"
+        why = self.verified_standstill()
+        if why:
+            return why + ": stop it first"
         return None
 
     def _restart(self, code: int, why: str) -> bool:
-        if self.restart_code is not None:
-            if code == RESTART_STACK and self.restart_code != RESTART_STACK:
-                self.restart_code = RESTART_STACK            # a stack stop/restart outranks a pending GUI-only restart
-                self.core.bridge.log(f"RESTART upgraded to robot stack + GUI: {why}")
-            return False
-        self.restart_code = code
+        with self._restart_lock:
+            if self.restart_code is not None:
+                if code == RESTART_STACK and self.restart_code != RESTART_STACK:
+                    self.restart_code = RESTART_STACK        # a stack stop/restart outranks a pending GUI-only restart
+                    self.core.bridge.log(f"RESTART upgraded to robot stack + GUI: {why}")
+                return False
+            self.restart_code = code
         self.core.bridge.log(f"RESTART ({'robot stack + GUI' if code == RESTART_STACK else 'GUI'}): {why}")
         cb = self.on_restart
         if cb is not None:
@@ -689,8 +694,10 @@ class WorkcellCommands:
         """Settings that are nobody's yet (from before profiles) become the first taker's, without a restart."""
         me = lease.profile
         if me and not self.worksets.active() and not self.worksets.has(me):
-            self.worksets.set_active(me)
-            self.worksets.save(me, base=self.running_base())
+            with self._settings_lock:
+                if not self.worksets.active() and not self.worksets.has(me):
+                    self.worksets.save(me, base=self.running_base())
+                    self.worksets.set_active(me)
             self.core.bridge.log(f"web: the settings in use are now {me}'s (kept in their profile)")
 
     def _needs_switch(self, owner: Optional[str] = None) -> bool:
@@ -732,7 +739,16 @@ class WorkcellCommands:
         """Put the settings of the one in control in place: the ones in use go back to their profile, the GUI
         restarts (and the robot stack when the parts or the base differ). A profile without settings of its own
         starts from `start`: "" = a copy of the settings in use, "setup" = setup `name` of `owner` ("" = Shared)."""
-        me = self.lease.profile
+        caller_lease = self.lease
+        caller_token = caller_lease.token
+
+        def check_lease():
+            with self._lease_lock:
+                if self.lease is not caller_lease or not self.lease.holds(caller_token):
+                    raise P.PartError("control changed: settings switch refused")
+
+        check_lease()
+        me = caller_lease.profile
         if not me:
             raise ProfileError("pick your profile first (your name in the header)")
         act = self.worksets.active()
@@ -741,7 +757,13 @@ class WorkcellCommands:
         why = self._restart_refusal()
         if why:
             raise P.PartError(why)
-        if self.core.mode not in ("unknown",) and not self.core.modes.mode_supports_moveit(self.core.mode):
+        snap = self.core.bridge.snapshot()
+        if self.core.mode == "none" and (snap.controllers_age is None or
+                                          snap.controllers_age > self.core.CONTROLLERS_STALE_S):
+            raise P.PartError("the controller list is stale: cannot switch settings safely")
+        if self.core.mode == "unknown":
+            raise P.PartError("control mode is unknown: cannot switch settings safely")
+        if self.core.mode != "none" and not self.core.modes.mode_supports_moveit(self.core.mode):
             raise P.PartError(f"change to Position first (now '{self.core.mode}'): the switch changes gains and "
                               "payload")
         if self.on_restart is None:
@@ -755,37 +777,52 @@ class WorkcellCommands:
             if info.get("profile") and info["profile"] != self.core.profile.name:
                 raise ProfileError(f"setup '{name}' is for robot profile {info['profile']}")
             src = (S, str(name), str(info.get("base") or ""))
-        if act:
-            self.worksets.save(act, base=base_now)         # the settings in use go back to their owner first
-        try:
-            if self.worksets.has(me):
-                base = str(self.worksets.load(me).get("base") or "")
-                how = "your settings"
-            elif src is not None:
-                S, n, base = src
-                self.worksets.put_setup(S._path(n) / "files")
-                S._mark(n)
-                how = f"setup '{n}'" + (f" of {S.owner}" if S.owner else " (Shared)")
-            else:
-                base = ""
-                how = f"a copy of {act + chr(39) + 's' if act else 'the'} settings"
-            self.worksets.save(me, base=base or base_now)  # persist the new set before its active marker can change
-            m = self._base_model()
-            stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(self.parts.path), m).values())
-            self.worksets.set_active(me)
-            if base and base in B.BASES and base != base_now:
-                B.write_next(config_dir(), base)
-                stack = True
-        except Exception as e:
-            if act and self.worksets.has(act):
-                try:
-                    self.worksets.load(act)
-                    self.worksets.set_active(act)
-                except Exception as rollback:
-                    self.core.bridge.log(f"profile switch rollback FAILED: {rollback}")
-            if isinstance(e, OSError):
-                raise ProfileError(f"could not switch settings: {e}") from None
-            raise
+        with self._settings_lock:
+            tx = None
+            committed = False
+            try:
+                check_lease()
+                tx = self.worksets.begin_switch(me)
+                if act:
+                    self.worksets.save(act, base=base_now)     # old owner's save is part of the transaction
+                if self.worksets.has(me):
+                    info = self.worksets.info(me)
+                    source, base = self.worksets._dir(me) / "files", str(info.get("base") or "")
+                    setup = info.get("setup") or {}
+                    how = "your settings"
+                    preserve_setup = False
+                elif src is not None:
+                    S, n, base = src
+                    source = S._path(n) / "files"
+                    setup = {"name": n, **({"owner": S.owner} if S.owner else {})}
+                    how = f"setup '{n}'" + (f" of {S.owner}" if S.owner else " (Shared)")
+                    preserve_setup = False
+                else:
+                    source, base = tx / "old" / "files", ""
+                    setup = None
+                    how = f"a copy of {act + chr(39) + 's' if act else 'the'} settings"
+                    preserve_setup = True
+                self.worksets.stage_switch(tx, source, setup, preserve_setup)
+                self.worksets.apply_switch(tx)
+                self.worksets.save(me, base=base or base_now)  # persist before active.yaml can change
+                m = self._base_model()
+                stack = bool(m.get("ok")) and any(st != "in_model" for st in
+                                                   P.status(P.PartStore(self.parts.path), m).values())
+                check_lease()          # a takeover mid-switch rolls it back (before base_next is written)
+                if base and base in B.BASES and base != base_now:
+                    B.write_next(config_dir(), base)
+                    stack = True
+                self.worksets.commit_switch(tx)             # active.yaml is the final publication
+                committed = True
+            except Exception as e:
+                if tx is not None and not committed:
+                    try:
+                        self.worksets.abort_switch(tx)
+                    except Exception as rollback:
+                        self.core.bridge.log(f"profile switch rollback FAILED: {rollback}")
+                if isinstance(e, OSError):
+                    raise ProfileError(f"could not switch settings: {e}") from None
+                raise
         self._restart(RESTART_STACK if stack else RESTART_GUI, f"{me}'s settings in use ({how})")
         kept = f"{act}'s are kept in their profile; " if act else ""
         return self._ok(f"{me}'s settings in use ({how}): {kept}restarting {'the robot stack and ' if stack else ''}"
@@ -815,14 +852,20 @@ class WorkcellCommands:
     cmd_profile_prefs_get.read_only = True
 
     def cmd_profile_prefs_save(self, name, prefs=None):
-        self.profiles.save_prefs(str(name), prefs or {})
+        n = self.profiles.find(str(name))
+        mine = str(self.lease.profile or "").strip()
+        if not mine or n.lower() != mine.lower():
+            raise ProfileError("you can only save your own profile layout")
+        self.profiles.save_prefs(n, prefs or {})
         return self._ok()
-    cmd_profile_prefs_save.read_only = True   # the screen layout, not the robot
 
     def cmd_profile_prefs_copy(self, name, source):
-        d = self.profiles.copy_prefs(str(source), str(name))
+        n = self.profiles.find(str(name))
+        mine = str(self.lease.profile or "").strip()
+        if not mine or n.lower() != mine.lower():
+            raise ProfileError("you can only copy into your own profile layout")
+        d = self.profiles.copy_prefs(str(source), n)
         return self._ok(f"layout copied from {self.profiles.find(str(source))}", prefs=d)
-    cmd_profile_prefs_copy.read_only = True
 
     # ------------------------------------------------------------------ setups
     def setup_current(self) -> dict:
@@ -863,8 +906,9 @@ class WorkcellCommands:
 
     def cmd_setup_copy(self, source_owner, name, owner="", new_name="", replace=False):
         """Copy a setup from another profile (or Shared) into profile `owner` (your own)."""
-        S = self._setups(self._own(owner))
-        n = S.copy_from(self._setups(source_owner), str(name), str(new_name or ""), bool(replace))
+        with self._settings_lock:
+            S = self._setups(self._own(owner))
+            n = S.copy_from(self._setups(source_owner), str(name), str(new_name or ""), bool(replace))
         return self._ok(f"setup '{name}' copied to {S.owner or 'Shared'} as '{n}'", setups=S.list(), owner=S.owner,
                         current=self.setup_current())
 
@@ -889,6 +933,36 @@ class WorkcellCommands:
         return [x["name"] for x in self.drivers.view()["services"]
                 if x["kind"] == "camera" and (x["state"] not in ("stopped", "failed", "missing") or x["autostart"])]
 
+    def _setup_load_snapshot(self) -> Path:
+        snap = self.worksets.snapshot()
+        try:
+            meta = {"base": False, "drivers": False,
+                    "autostart": {n: bool(s.autostart) for n, s in self.drivers.services.items()}}
+            for source, name, key in ((config_dir() / B.FILE, "base", "base"),
+                                      (self.drivers.path, "drivers.yaml", "drivers")):
+                if source.is_file():
+                    shutil.copy2(source, snap / name)
+                    meta[key] = True
+            (snap / "load.json").write_text(json.dumps(meta))
+            return snap
+        except Exception:
+            self.worksets.drop(snap)
+            raise
+
+    def _restore_setup_load(self, snap: Path):
+        self.worksets.restore(snap)
+        meta = json.loads((snap / "load.json").read_text())
+        for target, name, key in ((config_dir() / B.FILE, "base", "base"),
+                                  (self.drivers.path, "drivers.yaml", "drivers")):
+            if (snap / name).is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snap / name, target)
+            elif not meta.get(key) and target.is_file():
+                target.unlink()
+        for n, on in meta.get("autostart", {}).items():
+            if n in self.drivers.services:
+                self.drivers.services[n].autostart = bool(on)
+
     def setup_guide(self) -> dict:
         """What the Setups page's step list shows: the parts, the cameras and their calibrations now."""
         cams = [{"name": x["name"], "label": x["label"], "state": x["state"]}
@@ -897,8 +971,9 @@ class WorkcellCommands:
                 "calibrations": [c["name"] for c in self.cams.view()]}
 
     def cmd_setup_save(self, name, note="", replace=False, owner=""):
-        S = self._setups(self._own(owner))
-        holds = S.save(str(name), str(note or ""), bool(replace), base=self.running_base(), cameras=self._cameras_on())
+        with self._settings_lock:
+            S = self._setups(self._own(owner))
+            holds = S.save(str(name), str(note or ""), bool(replace), base=self.running_base(), cameras=self._cameras_on())
         who = f" in {S.owner}" if S.owner else ""
         self.core.bridge.log(f"setup '{name}'{who} saved: {', '.join(holds) or 'nothing to save yet'}")
         return self._ok(f"setup '{name}' saved{who} ({len(holds)} item(s))", setups=S.list(), owner=S.owner,
@@ -919,32 +994,45 @@ class WorkcellCommands:
         if self.on_restart is None:
             raise P.PartError("loading a setup restarts the GUI, and this GUI was not started by the launcher "
                               "(ur7e_gui.sh)")
-        # anyone's setup can be loaded into your settings; the backup of the files in use goes to your profile
-        mine = self.lease.profile if self.lease.token else ""
-        r = self._setups(owner).load(str(name), base=self.running_base(), cameras=self._cameras_on(),
-                                     backup_to=self._setups(mine) if mine else None)
-        if r.get("cameras") is not None:                  # its cameras start with the GUI, the others stop
-            for x in self.drivers.view()["services"]:
-                if x["kind"] != "camera":
-                    continue
-                on = x["name"] in r["cameras"]
-                self.drivers.set_autostart(x["name"], on)
-                if not on and x["state"] not in ("stopped", "failed", "missing"):
+        with self._settings_lock:
+            snap = None
+            try:
+                snap = self._setup_load_snapshot()
+                # anyone's setup can be loaded into your settings; the backup of the files in use goes to your profile
+                mine = self.lease.profile if self.lease.token else ""
+                r = self._setups(owner).load(str(name), base=self.running_base(), cameras=self._cameras_on(),
+                                             backup_to=self._setups(mine) if mine else None)
+                if r.get("cameras") is not None:              # its cameras start with the GUI, the others stop
+                    for x in self.drivers.view()["services"]:
+                        if x["kind"] != "camera":
+                            continue
+                        on = x["name"] in r["cameras"]
+                        self.drivers.set_autostart(x["name"], on)
+                        if not on and x["state"] not in ("stopped", "failed", "missing"):
+                            self.drivers.stop(x["name"])
+                # the new files are in place: does the running robot model have the setup's parts, on the setup's base?
+                new = P.PartStore(self.parts.path)
+                m = self._base_model()
+                stack = bool(m.get("ok")) and any(s != "in_model" for s in P.status(new, m).values())
+                base = r.get("base")
+                if base and base != self.running_base():
+                    B.write_next(config_dir(), base)
+                    stack = True
+                elif base:
+                    B.write_next(config_dir(), base)             # keep the next start on it too
+                self._restart(RESTART_STACK if stack else RESTART_GUI, f"setup '{name}' loaded")
+            except Exception as e:
+                if snap is not None:
                     try:
-                        self.drivers.stop(x["name"])
-                    except Exception as e:  # noqa: BLE001 - the load is done; say why the camera kept running
-                        self.core.bridge.log(f"setup '{name}': could not stop {x['name']}: {e}")
-        # the new files are in place: does the running robot model have the setup's parts, on the setup's base?
-        new = P.PartStore(self.parts.path)
-        m = self._base_model()
-        stack = bool(m.get("ok")) and any(s != "in_model" for s in P.status(new, m).values())
-        base = r.get("base")
-        if base and base != self.running_base():
-            B.write_next(config_dir(), base)
-            stack = True
-        elif base:
-            B.write_next(config_dir(), base)                 # keep the next start on it too
-        self._restart(RESTART_STACK if stack else RESTART_GUI, f"setup '{name}' loaded")
+                        self._restore_setup_load(snap)
+                    except Exception as rollback:
+                        self.core.bridge.log(f"setup load rollback FAILED: {rollback}")
+                if isinstance(e, OSError):
+                    raise SetupError(f"could not load setup: {e}") from None
+                raise
+            finally:
+                if snap is not None:
+                    self.worksets.drop(snap)
         return self._ok(f"setup '{name}' loaded (the files in use before are kept as '{r['backup']}'): restarting "
                         f"{'the robot stack and ' if stack else ''}the GUI" +
                         (f" on the '{B.BASES[base][0]}' base" if base else ""), restart="stack" if stack else "gui")

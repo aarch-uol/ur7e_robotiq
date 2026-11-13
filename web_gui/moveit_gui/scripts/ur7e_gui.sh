@@ -219,7 +219,7 @@ ROBOT_FILE="$DATA/config/moveit_gui/robot"
 # SETUP > Setups > Robot > Stop robot stack: while this file exists only a small start page runs (no driver, no
 # MoveIt, no ROS), until someone presses Start there
 STACK_OFF_FILE="$DATA/config/moveit_gui/stack_off"
-# what the start page shows while the stack starts (web/idle.py --progress): stage=driver|moveit|slow, log=<file>
+# what the start page shows while the stack starts (web/idle.py --progress): stage=driver|moveit|slow|gui, log=<file>
 STACK_PROGRESS_FILE="$DATA/config/moveit_gui/stack_progress"
 PROGRESS_JOB=""
 IDLE=0
@@ -451,10 +451,13 @@ start_progress_page() {
   docker exec "$NAME" bash -c "$ENV && echo \$\$ > /tmp/stack_progress.pid && exec $IDLE_CMD --progress" >/dev/null 2>&1 &
   PROGRESS_JOB=$!
 }
+# stage=gui: the page exits by itself (it polls the file); SIGINT too, as for the GUI: ros2 run passes SIGINT on to
+# the page (SIGTERM would only end ros2 run and leave the page on the port)
 stop_progress_page() {
   [ -n "$PROGRESS_JOB" ] || return 0
-  docker exec "$NAME" bash -c 'kill -TERM "$(cat /tmp/stack_progress.pid)"' >/dev/null 2>&1 || true
-  for _ in $(seq 1 20); do kill -0 "$PROGRESS_JOB" 2>/dev/null || break; sleep 0.25; done
+  progress gui
+  docker exec "$NAME" bash -c 'kill -INT "$(cat /tmp/stack_progress.pid)"' >/dev/null 2>&1 || true
+  for _ in $(seq 1 40); do kill -0 "$PROGRESS_JOB" 2>/dev/null || break; sleep 0.25; done
   kill "$PROGRESS_JOB" 2>/dev/null || true
   wait "$PROGRESS_JOB" 2>/dev/null || true
   PROGRESS_JOB=""

@@ -42,6 +42,8 @@ class ActivityLog:
         self.rotate_bytes = rotate_bytes
         self._lock = threading.Lock()
         self.seq = 0                                   # +1 per event: the page refetches when it changes
+        self.on_error = None                           # called once per failure streak with the error text
+        self._failing = False
 
     def add(self, kind: str, what: str, who: Optional[Dict[str, str]] = None, details: str = "") -> dict:
         who = who or {}
@@ -56,9 +58,13 @@ class ActivityLog:
                     os.replace(self.path, self.path.with_name(self.path.name + ".1"))
                 with open(self.path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(e) + "\n")
-            except OSError:
-                pass                                   # the log is a convenience: never break an action over it
-            self.seq += 1
+            except OSError as err:                         # never break an action over the log, but say so once
+                if not self._failing and self.on_error:
+                    self.on_error(f"activity log not written ({self.path}): {err}")
+                self._failing = True
+                return e
+            self._failing = False
+            self.seq += 1                                  # only advance when the event was written
         return e
 
     def _read(self, p: Path) -> List[dict]:

@@ -151,6 +151,9 @@ class FakeBridge:
         self.fail_rollback = False             # every switch after the first is rejected
         self.servo_available = False
         self.servo_route_available: Dict[str, bool] = {}
+        self.servo_pause_service = False                  # tests: Servo with ~/pause_servo (servo_pause.py)
+        self.servo_paused_routes: Dict[str, bool] = {}
+        self.servo_outside_pubs: Dict[str, int] = {}       # tests: a policy or script commanding Servo itself
         self.last_route: Optional[str] = None  # controller named in the last execution
         self.ft_noise = 0.01
         self.ft_raw_offset = np.zeros(6)      # test hook: what the bare sensor reads with nothing attached
@@ -255,7 +258,25 @@ class FakeBridge:
         return self.servo_available
 
     def servo_status(self, route: Optional[str] = None) -> Tuple[Optional[int], str]:
+        if self.servo_paused_routes.get(route or self.profile.servo.get("default_route")):
+            return None, ""                              # a paused Servo publishes no status
         return (self.fake_servo_status if self.servo_ready(route) else (None, ""))
+
+    def servo_paused(self, route: Optional[str] = None) -> Optional[bool]:
+        if not self.servo_pause_service or not self.servo_ready(route):
+            return None
+        return bool(self.servo_paused_routes.get(route or self.profile.servo.get("default_route")))
+
+    def servo_pause(self, route: Optional[str], paused: bool) -> Tuple[bool, str]:
+        route = route or self.profile.servo.get("default_route")
+        self.calls.append(("servo_pause", route, bool(paused)))
+        if not self.servo_pause_service:
+            return False, "no pause service"
+        self.servo_paused_routes[route] = bool(paused)
+        return True, "Servoing disabled" if paused else "Servoing enabled"
+
+    def servo_outside_commanders(self, route: Optional[str] = None) -> Optional[int]:
+        return self.servo_outside_pubs.get(route or self.profile.servo.get("default_route"), 0)
 
     def servo_output_count(self, route: Optional[str] = None) -> Optional[int]:
         return self.servo_out_n
@@ -391,7 +412,8 @@ class FakeBridge:
     def servo_twist(self, linear, angular, frame: str, route: Optional[str] = None):
         self.calls.append(("servo_twist", tuple(float(v) for v in linear),
                            tuple(float(v) for v in angular), frame, route))
-        if self.servo_type != "twist" or route != self.servo_route or not self._servo_route_active(route):
+        if self.servo_type != "twist" or route != self.servo_route or not self._servo_route_active(route) \
+                or self.servo_paused_routes.get(route):
             return
         dt = self._servo_dt()
         self.servo_out_n += 1
@@ -410,7 +432,8 @@ class FakeBridge:
 
     def servo_joint_jog(self, velocities, route: Optional[str] = None):
         self.calls.append(("joint_jog", tuple(float(v) for v in velocities), route))
-        if self.servo_type != "joint" or route != self.servo_route or not self._servo_route_active(route):
+        if self.servo_type != "joint" or route != self.servo_route or not self._servo_route_active(route) \
+                or self.servo_paused_routes.get(route):
             return
         dt = self._servo_dt()
         self.servo_out_n += 1

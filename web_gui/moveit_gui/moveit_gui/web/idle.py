@@ -6,6 +6,7 @@ addresses with one page and a Start button. Start removes config_dir()/stack_off
 
 With --progress the launcher runs this page again while the driver starts (nothing else answers on the port then):
 no Start button, and /api/info says how far the start is, from config_dir()/stack_progress (stage=driver|moveit|slow).
+It exits by itself at stage=gui (the GUI takes the port next), so a lost signal cannot leave it holding the port.
 """
 from __future__ import annotations
 
@@ -250,6 +251,16 @@ def main(argv=None) -> int:
         done.set()
     signal.signal(signal.SIGINT, sig)
     signal.signal(signal.SIGTERM, sig)
+    if args.progress:
+        def watch():
+            while not done.is_set():
+                try:
+                    if "stage=gui" in (config_dir() / STACK_PROGRESS).read_text().splitlines():
+                        done.set()
+                except OSError:
+                    pass
+                done.wait(0.3)
+        threading.Thread(target=watch, daemon=True).start()
     done.wait()
     for s in servers:
         s.shutdown()

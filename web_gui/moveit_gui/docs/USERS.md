@@ -10,8 +10,8 @@ Open **http://X.X.X.38:XXXX/** in a browser.
   is the emergency stop.
 * Check that nobody is near the robot before you move it.
 * The first time, pick your **profile** (your name, or *New profile…*). It keeps your own settings (TCPs,
-  keep-out zones, fixtures, vials, gains, F/T bias, limit and payload, parts, camera calibrations), your setups,
-  programs and screen layout. Change it with your name at the top right (*Change my name*).
+  keep-out zones, fixtures, vials, gains, F/T bias, limit and payload, the F/T match to the simulation, parts,
+  camera calibrations), your setups, programs and screen layout. Change it with your name at the top right (*Change my name*).
 * The robot runs the settings of the person in control. When you take control and someone else's settings are in
   use, the GUI asks to switch to yours and restarts (about a minute). Their settings stay in their profile. The first
   time, you choose what yours start from: a copy of the ones in use, or a setup. SETUP › Setups shows whose

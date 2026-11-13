@@ -369,7 +369,7 @@ def test_launcher_shows_the_start_progress_while_the_driver_comes_up(tmp_path):
     gui = [i for i, l in enumerate(log) if "moveit_gui_web" in l]
     kill = [i for i, l in enumerate(log) if "stack_progress.pid" in l and "kill" in l]
     assert len(page) == 1 and kill and page[0] < kill[0] < gui[0]       # stopped before the GUI takes the port
-    assert (cfg / "stack_progress").read_text().startswith("stage=moveit\n")
+    assert (cfg / "stack_progress").read_text().startswith("stage=gui\n")        # told to leave the port
 
 # ------------------------------------------------------------------ the image rebuild and the overlay
 def ur_repo(tmp_path, deps="h1"):

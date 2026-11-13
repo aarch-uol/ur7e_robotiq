@@ -20,10 +20,16 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ------------------------------------------------------------------ header */
 header { background: var(--chrome); color: var(--on-chrome); display: flex; align-items: stretch; min-height: 50px;
          padding: 0 var(--m); gap: var(--l); flex-wrap: wrap; }
-header .grp { display: flex; flex-direction: column; justify-content: center; padding: 6px 0; }
+/* every group: caption on one top line, value on the line under it (a second line, e.g. the robot's state, hangs
+   below without moving the others) */
+header .grp { display: flex; flex-direction: column; justify-content: flex-start; padding: 7px 0 5px; }
+header .h-name { justify-content: center; }
 header .sep { width: 1px; background: var(--chrome-line); margin: 8px 0; }
 header .cap { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: var(--on-chrome2); text-transform: uppercase;
-             white-space: nowrap; }
+             white-space: nowrap; line-height: 14px; height: 14px; margin-bottom: 2px; }
+header .grp > .val, header .grp > .hstat { height: 22px; line-height: 22px; }
+header .grp > select { height: 22px; padding-top: 0; padding-bottom: 0; }
+header .grp > .pill { line-height: 18px; align-self: flex-start; }
 header .cap .capval { color: var(--on-chrome); margin-left: 4px; }
 header .cap .capsub { font-weight: 400; letter-spacing: 0; text-transform: none; }
 header .val { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -43,12 +49,9 @@ header select { background: transparent; border: 0; border-bottom: 1px solid var
 header select option { color: var(--text); }
 header .spacer { flex: 1; }
 header .hmini { min-width: 56px; }
-header .hmini .val { font-size: 12px; }
 header .clickable, header .hstat { cursor: pointer; }
 header .hstat { color: var(--on-chrome2); text-decoration: none; white-space: nowrap; }
 header .hstat.rec { color: #f0827a; font-weight: 700; }
-header .storage-low { color: #e3ae5b; }
-header .storage-critical { color: #f0827a; }
 .mode-dt { color: #e3ae5b; } .mode-bad { color: #f0827a; }
 #lease { display: flex; align-items: center; gap: var(--s); }
 #lease .who { color: var(--on-chrome2); font-size: 12px; }

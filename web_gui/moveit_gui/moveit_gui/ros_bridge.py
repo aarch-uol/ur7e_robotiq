@@ -36,7 +36,7 @@ from lifecycle_msgs.msg import State as LifecycleState
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 import numpy as np
 import yaml
@@ -512,6 +512,12 @@ class RosBridge(CameraTopics):
                     "cli": (n.create_client(ServoCommandType, cfg["command_type_service"], callback_group=self.cb)
                             if cfg.get("command_type_service") else None),
                     "status": (0, "", 0.0),
+                    # ~/pause_servo next to switch_command_type (servo_pause.py); "paused": set by our calls
+                    "pause_cli": (n.create_client(SetBool, cfg.get("pause_service") or
+                                                  cfg["command_type_service"].rsplit("/", 1)[0] + "/pause_servo",
+                                                  callback_group=self.cb)
+                                  if cfg.get("pause_service") or cfg.get("command_type_service") else None),
+                    "paused": False,
                     "twist_pub": (n.create_publisher(TwistStamped, cfg["twist_topic"], 10)
                                   if cfg.get("twist_topic") else None),
                     "joint_pub": (n.create_publisher(JointJog, cfg["joint_topic"], 10)
@@ -1539,6 +1545,7 @@ class RosBridge(CameraTopics):
         ep = self._servos.get(route)
         if ep is not None:
             ep["status"] = (int(msg.code), str(msg.message), time.monotonic())
+            ep["paused"] = False                         # a paused Servo publishes no status: it runs (restarted?)
 
     def servo_status(self, route: Optional[str] = None) -> Tuple[Optional[int], str]:
         """One Servo route's last status; code None if none arrived in the last second."""
@@ -1559,7 +1566,47 @@ class RosBridge(CameraTopics):
         if ep is None or ep["cli"] is None or not ep["cli"].service_is_ready():
             return False
         topic = ep["cfg"].get("twist_topic")
-        return bool(topic) and self.node.count_subscribers(topic) > 0 and self.servo_status(name)[0] is not None
+        return bool(topic) and self.node.count_subscribers(topic) > 0 and (
+            self.servo_status(name)[0] is not None or self.servo_paused(name) is True)   # paused: no status
+
+    def servo_paused(self, route: Optional[str] = None) -> Optional[bool]:
+        _, ep = self._servo_endpoint(route)
+        if ep is None or ep.get("pause_cli") is None or not ep["pause_cli"].service_is_ready():
+            return None
+        return bool(ep["paused"])
+
+    def servo_outside_commanders(self, route: Optional[str] = None) -> Optional[int]:
+        """Publishers on this route's command topics that are not this GUI: a policy or script run without it."""
+        _, ep = self._servo_endpoint(route)
+        if ep is None:
+            return None
+        me = (self.node.get_name(), self.node.get_namespace())
+        n = 0
+        for key in ("twist_topic", "joint_topic"):
+            topic = ep["cfg"].get(key)
+            if not topic:
+                continue
+            try:
+                infos = self.node.get_publishers_info_by_topic(topic)
+            except Exception:
+                return None
+            n += sum(1 for i in infos if (i.node_name, i.node_namespace) != me)
+        return n
+
+    def servo_pause(self, route: Optional[str], paused: bool) -> Tuple[bool, str]:
+        name, ep = self._servo_endpoint(route)
+        if ep is None or ep.get("pause_cli") is None:
+            return False, f"no pause service for MoveIt Servo route '{name}'"
+        req = SetBool.Request()
+        req.data = bool(paused)
+        res = self._call(ep["pause_cli"], req, 2.0)
+        if res is None:
+            return False, f"MoveIt Servo route '{name}' did not answer"
+        if res.success:
+            ep["paused"] = bool(paused)
+            if not paused:
+                ep["status"] = (0, "", time.monotonic())  # running again: ready before its first status arrives
+        return bool(res.success), str(res.message or "")
 
     def servo_command_type(self, kind: str, route: Optional[str] = None) -> Tuple[bool, str]:
         """Tell Servo which command it gets next: 'joint' (JointJog) or 'twist'."""

@@ -198,8 +198,11 @@ const PREF_KEYS = ["ftchart", "op-joints", "op-layouts1", "pg-jog-open", "pg-pat
 const scmd = (name, args = {}) => post("/api/cmd", { cmd: name, args }, true);
 const localPrefs = () => Object.fromEntries(PREF_KEYS.map((k) => [k, localStorage.getItem(k)]).filter(([, v]) => v != null));
 let prefsSynced = null;                     // JSON of the layout as last read from / saved to the profile
+let prefsProfile = null;                    // the profile this tab loaded; never follow another tab's operator key
+let prefsAutosaveStopped = false;
 async function profilePrefs(name, reload) {
   // the profile's layout replaces this browser's; a profile with none yet gets this browser's
+  prefsProfile = name;
   const r = await scmd("profile_prefs_get", { name });
   if (!r.ok) { prefsSynced = null; return; }
   const local = localPrefs();
@@ -220,16 +223,22 @@ async function profilePrefs(name, reload) {
 }
 let prefsSaving = false;
 setInterval(async () => {                    // a changed layout goes to the profile (5 s)
-  const n = localStorage.getItem("operator");
-  if (!n || prefsSynced == null || prefsSaving) return;
+  const n = prefsProfile;
+  if (!holds || prefsAutosaveStopped || !n || prefsSynced == null || prefsSaving) return;
   const prefs = localPrefs(), now = JSON.stringify(prefs);
   if (now === prefsSynced) return;
   prefsSaving = true;
   try {
     const r = await scmd("profile_prefs_save", { name: n, prefs });
-    if (r.ok && localStorage.getItem("operator") === n && JSON.stringify(localPrefs()) === now) prefsSynced = now;
+    if (r.ok && prefsProfile === n && JSON.stringify(localPrefs()) === now) prefsSynced = now;
   } finally { prefsSaving = false; }
 }, 5000);
+window.addEventListener("storage", (e) => {
+  if (e.key !== "operator" || e.newValue === prefsProfile) return;
+  prefsAutosaveStopped = true;
+  prefsSynced = null;
+  location.reload();
+});
 async function operatorName(force) {
   let n = localStorage.getItem("operator") || "";
   if (!n || force) {
@@ -278,7 +287,12 @@ function lostControl(why) {
 async function takeLease() {
   const r = await post("/api/lease", { name: await operatorName(false), bid: BID });
   holds = !!r.ok;
-  if (holds) { TOKEN = r.lease.token; MYID = r.lease.client; hbFailsSince = 0; }
+  if (holds) {
+    TOKEN = r.lease.token; MYID = r.lease.client; hbFailsSince = 0;
+    // The SSE stream can still contain the pre-takeover state when this response arrives. Merge the
+    // authoritative lease response so the new holder can immediately see and answer the settings prompt.
+    if (S && r.lease) S = { ...S, lease: { ...(S.lease || {}), ...r.lease } };
+  }
   if (holds) document.querySelectorAll(".toast").forEach((x) => /lost control/.test(x.dataset.msg) && x.remove());
   leaseAt = Date.now();
   render();
@@ -373,7 +387,17 @@ function batchAsk(s) {
   ask(b.question, { ok: "Run", cancel: "Stop batch", key: "batch", valid: still })
     .then((go) => { if (go != null && still()) cmd("batch_answer", { go: !!go }); });
 }
-async function releaseLease() { await post("/api/release"); holds = false; TOKEN = MYID = null; render(); }
+async function releaseLease() {
+  let r = await post("/api/release", {}, true);
+  if (!r.ok && /release anyway/.test(r.msg || "")) {
+    if (!(await ask(r.msg, { ok: "Release anyway", cancel: "Keep control", danger: true }))) return;
+    if (!(await ask("Release control while the robot is busy?\n\nThe robot keeps running.",
+                    { ok: "Release", cancel: "Keep control", danger: true }))) return;
+    r = await post("/api/release", { confirm: true }, true);
+  }
+  if (!r.ok) { toast(r.msg || "could not release control", false); return; }
+  holds = false; TOKEN = MYID = null; render();
+}
 // ---- whose settings are in use (moveit_gui/worksets.py). The robot runs the settings of the one in control: taking
 // control while someone else's are in use asks to switch to your own (theirs stay in their profile).
 let switchAsked = "";
@@ -405,8 +429,8 @@ async function switchSettings() {
     "when they take control. The GUI restarts (about a minute; the robot stack too when your parts or tool differ)." +
     (sel ? "\n\nYou have no settings of your own yet." : ""),
   { ok: "Use my settings", content: sel ? h("div", { class: "row" }, "Start from", sel) : undefined,
-    result: () => ({ v: sel ? sel.value : "" }), valid: () => holds && S.lease && S.lease.needs_switch });
-  if (!v) { if (holds && S.lease && S.lease.needs_switch) releaseLease(); return; }
+    result: () => ({ v: sel ? sel.value : "" }), valid: () => holds });   // only while holding: the state stream can lag the lease
+  if (!v) { if (holds) releaseLease(); return; }
   const args = {};
   if (v.v) { const i = v.v.indexOf("/"); Object.assign(args, { start: "setup", owner: v.v.slice(0, i), name: v.v.slice(i + 1) }); }
   const r = await cmd("profile_activate", args);
@@ -437,6 +461,7 @@ async function heartbeat() {
 }
 setInterval(heartbeat, 500);
 window.addEventListener("pagehide", () => {
+  // A reload keeps the lease token for takeLease(); closing a page never silently releases a busy robot.
   if (TOKEN) try { sessionStorage.setItem("lease", JSON.stringify({ token: TOKEN, id: MYID })); } catch (e) { /* ignore */ }
 });
 window.addEventListener("pageshow", (e) => { if (e.persisted) try { sessionStorage.removeItem("lease"); } catch (x) { /* ignore */ } });
@@ -2553,8 +2578,9 @@ pages.AUTOMATION = {
         if (q.fix.cmd) fix.dataset.lease = "1";
       }
       return h("div", { class: "row", style: "gap:6px", title: q.state === "runner" ? q.detail : "" },
-        h("span", { class: "dot " + (q.state === "ok" ? "ok" : q.state === "fail" ? "bad" : "") }),
+        h("span", { class: "dot " + (q.state === "ok" ? "ok" : q.state === "fail" ? "bad" : q.state === "warn" ? "warn" : "") }),
         h("span", {}, q.label), q.state === "fail" && q.detail ? h("span", { class: "muted error" }, q.detail) : null,
+        q.state === "warn" && q.detail ? h("span", { class: "muted" }, q.detail) : null,
         q.state === "runner" ? h("span", { class: "muted" }, "(checked when the run starts)") : null, fix);
     }));
   },
@@ -2783,7 +2809,7 @@ pages.SETUP = {
     const pb = this.views["F/T + payload"].querySelectorAll(".card:last-child .btn");
     [this.psave, this.papply] = pb;
     this.pcols = this.views["F/T + payload"];
-    this.views["F/T + payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
+    this.views["F/T + payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols, this.buildMatch());
     this.views["Gains"] = this.buildGains();
     // Drivers & cameras: drivers.js
     this.dr = drivers({ h, btn, note, cmd, toast, ask, lease: (b) => { b.dataset.lease = "1"; return b; } });
@@ -2842,7 +2868,7 @@ pages.SETUP = {
       const p = this.wc.W.parts.draft();
       v.setPartDraft(p, (pose) => this.wc.W.parts.poseFromGizmo(pose));
     } else v.clearPartDraft();
-    if (n !== "F/T + payload") { this.pStop(); v.showGhost(null); } else this.pGhost();
+    if (n !== "F/T + payload") { this.pStop(); v.showGhost(null); v.setCommandedForce(null); } else this.pGhost();
     if (n === "TCPs" || n === "Vial") {
       const r = await cmd("tf_frames").catch(() => null);
       if (r && r.ok && this.sub === n)
@@ -2881,6 +2907,129 @@ pages.SETUP = {
     if (INFO.fake || (await ask(`Move to "${name}" (the blue ghost) and collect it?\n\nCheck that the path ` +
         "from where the arm is now is clear. Keep a hand near STOP.")))
       return cmd("payload_collect", { index: this.pPick });
+  },
+  // ---- Match simulation (ft_match.py): push the tip along base +X, +Y, +Z; the GUI maps sensor axes to the sim's
+  buildMatch() {
+    const lb = (b) => (b.dataset.lease = "1", b);
+    const M = this.fm = {};
+    M.pol = h("select", { id: "su-fm-pol", title: "The policy whose sim reference to match to" });
+    M.start = lb(btn("Start", "primary", () => cmd("ftmatch_start", { policy: M.pol.value }),
+      "Nothing moves. Needs Position mode and a live F/T reading"));
+    M.stop = lb(btn("Stop", "quiet", () => cmd("ftmatch_cancel")));
+    M.rec = lb(btn("Record", "", () => cmd("ftmatch_record"), "Take the push now instead of waiting for it to be steady"));
+    M.save = lb(btn("Save", "primary", () => cmd("ftmatch_save"), "Admin only. Saved in your profile's settings"));
+    M.clear = lb(btn("Remove", "quiet", async () => (await ask("Remove the saved match? Policy runs then use the robot " +
+      "config's own F/T settings.")) && cmd("ftmatch_clear")));
+    M.rows = h("tbody", { id: "su-fm-rows" });
+    this.fmCard = h("div", { class: "card" },
+      h("div", { class: "section" }, "Match simulation"),
+      note("Push the tool tip along each arrow, about 10 N, hold 2 s. The GUI works out how the sensor's axes map to " +
+        "the policy's.", "The robot holds still in Position; nothing is commanded to move. Each push is taken by " +
+        "itself when it is over 5 N and steady for 1 s, or press Record. Before each push, keep hands off the tool for " +
+        "a moment (the no-contact reading). The result is matched to the simulation, not to physics, so its signs are " +
+        "what the policy saw in training. Torque signs come from the same pushes (push at the very tip). It is kept in " +
+        "your profile and every policy run uses it (ft_obs_axes and ft_obs_scale)."),
+      h("div", { class: "row" }, h("span", { class: "k" }, "Sim reference of"), M.pol, M.start, M.stop),
+      h("div", { class: "title", id: "su-fm-msg" }, ""),
+      h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Sensor change N"),
+        h("th", {}, ""), h("th", {}, ""))), M.rows),
+      h("div", { class: "row" }, h("span", { class: "grow mono small", id: "su-fm-now" }, ""), M.rec),
+      h("div", { id: "su-fm-fit" }),
+      h("div", { class: "row" }, h("div", { class: "grow" }), M.save),
+      h("div", { class: "section" }, "Saved (in your profile)"),
+      h("div", { class: "small", id: "su-fm-saved" }, "—"),
+      h("div", { class: "row" }, h("div", { class: "grow" }), M.clear));
+    return this.fmCard;
+  },
+  mUpdate(s) {
+    const f = s.ftmatch, M = this.fm;
+    if (!f || !M) return;
+    const v3 = (a) => "[" + a.slice(0, 3).map((x) => (x >= 0 ? "+" : "") + x.toFixed(1)).join(", ") + "]";
+    const refKey = JSON.stringify(f.refs);
+    if (refKey !== M.refKey) {
+      M.refKey = refKey;
+      const keep = M.pol.value;
+      M.pol.replaceChildren(...f.refs.map((r) => h("option", { value: r.policy }, r.policy + (r.found ? "" : " (no sim reference)"))));
+      const first = f.refs.find((r) => r.found);
+      M.pol.value = f.refs.some((r) => r.policy === keep) ? keep : first ? first.policy : (f.refs[0] || {}).policy || "";
+    }
+    const ref = f.refs.find((r) => r.policy === M.pol.value);
+    gate(M.start, !f.active && !!ref && ref.found && !f.refusal);
+    M.pol.disabled = f.active;
+    M.stop.classList.toggle("hidden", !f.active); M.start.classList.toggle("hidden", f.active);
+    const msg = $("#su-fm-msg");
+    const ax = f.axis, cur = ax && f.pushes ? f.pushes[ax] : null;
+    if (!f.active) {
+      msg.textContent = !f.refs.length ? "No policy: the sim reference comes from a policy manifest." :
+        ref && !ref.found ? `No sim reference for ${ref.policy}: expected ${ref.path}. Make it with tools/sim_ft_reference.py, ` +
+          "or set sim_ft_reference in the manifest." : f.refusal ? `Not ready: ${f.refusal}.` : "Press Start, then follow the arrows.";
+    } else if (f.error) msg.textContent = `Waiting: ${f.error}.`;
+    else if (cur) msg.textContent = cur.state === "baseline" ? `${ax}: hands off the tool…` :
+      `${ax}: push the spatula tip along the arrow, about 10 N, hold 2 s. ${cur.note}`;
+    else msg.textContent = f.fit && f.fit.ok ? "Matched. Check the result and Save." : "Done. See below.";
+    // the arrow at the tip, along base +X / +Y / +Z (10 N long)
+    if (this.view) {
+      const d = ax && f.dirs[ax];
+      this.view.setCommandedForce(f.active && d && f.tip ? d.map((x) => 10 * x) : null, "base", f.tip);
+    }
+    const rk = JSON.stringify([holds, f.active, ax, f.pushes && Object.values(f.pushes).map((p) => p && [p.state, p.delta]),
+      f.fit && f.fit.pushes, f.fit && f.fit.repeat]);
+    if (rk !== M.rowKey) M.rows.replaceChildren(...["+X", "+Y", "+Z"].map((a) => {
+      const p = f.pushes && f.pushes[a], fp = f.fit && f.fit.pushes && f.fit.pushes[a];
+      const bad = f.fit && f.fit.repeat && f.fit.repeat.includes(a);
+      const again = btn(p && p.state === "done" ? "Again" : "Now", "quiet", () => cmd("ftmatch_push", { axis: a }),
+        "Read this push again (a new no-contact reading first)");
+      again.dataset.lease = "1";
+      gate(again, f.active);
+      return h("tr", { class: a === ax ? "pick on" : "" }, h("td", {}, `base ${a}`),
+        h("td", { class: "mono" }, p && p.delta ? v3(p.delta) : p ? p.state === "baseline" ? "baseline…" : "push…" : ""),
+        h("td", { class: bad ? "error" : "muted" }, fp && fp.angle_deg != null ? `${fp.n.toFixed(1)} N, ${fp.angle_deg}° off` : ""),
+        h("td", {}, again));
+    }));
+    M.rowKey = rk;
+    $("#su-fm-now").textContent = cur && cur.state === "push" ? `now ${cur.now_n.toFixed(1)} N (at least ${f.min_n} N)` : "";
+    gate(M.rec, f.active && !!cur && cur.state === "push" && !f.error);
+    const fit = f.fit, box = $("#su-fm-fit");
+    const key = JSON.stringify(fit || null);
+    if (key !== M.fitKey) {
+      M.fitKey = key;
+      if (!fit) box.replaceChildren();
+      else {
+        const kids = [];
+        if (!fit.ok) kids.push(h("div", { class: "error" }, fit.problems.join(" ")));
+        if (fit.M) {
+          kids.push(h("div", { class: "section" }, fit.ok ? "Result" : "Best match (not good enough)"),
+            h("div", {}, fit.explain.slice(0, 3).join(", ") + "."),
+            fit.explain.length > 3 ? h("div", {}, fit.explain.slice(3).join(", ") + ".") : null,
+            h("div", { class: "mono small" }, "ft_obs_axes: " + JSON.stringify(fit.M) + "   ft_obs_scale: " +
+              (fit.scale ? JSON.stringify(fit.scale) : "— (torque signs not matched)")),
+            h("div", { class: "muted small" }, `Best free rotation is ${fit.rotation_deg}° from it.`));
+          const row = (a) => fit.rows[a], t3 = (v) => v3(v.slice(3));
+          const cell = (v) => h("td", { class: "mono" }, "F " + v3(v), h("br"), "T " + t3(v));
+          kids.push(h("table", { class: "su-ptable small" },
+            h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Policy sees now"), h("th", {}, "With the match"), h("th", {}, "Simulation"))),
+            h("tbody", {}, ...["+X", "+Y", "+Z"].map((a) => h("tr", {}, h("td", {}, a),
+              cell(row(a).before), cell(row(a).after), cell(row(a).sim))))));
+          const tq = fit.torque;     // the torque signs, from the same pushes (not assumed from the forces)
+          if (tq) kids.push(h("div", { class: "muted small" }, "Torque check: " + ["tx", "ty"].map((n) => (tq.votes[n] || [])
+            .map((v) => `${n} ${v.push}: ${v.measured >= 0 ? "+" : ""}${v.measured.toFixed(2)} vs sim ${v.sim >= 0 ? "+" : ""}${v.sim.toFixed(2)} Nm` +
+              (v.sign === 1 ? " (same sign)" : v.sign === -1 ? " (opposite: scale -1)" : " (too small)")).join(", ")).filter(Boolean).join("; ") +
+            (tq.tz ? `. ${tq.tz[0].toUpperCase()}${tq.tz.slice(1)}.` : "")));
+          if (fit.old_scale == null) kids.push(h("div", { class: "muted small" }, "Now: the robot config has no ft_obs_scale (the runner's own flags apply)."));
+          const t = fit.suggested_tip;
+          if (t) kids.push(h("div", { class: "muted small" }, `Suggested ${t.tip} orientation (not applied): rpy ` +
+            (t.rpy_deg_parent ? `[${t.rpy_deg_parent.join(", ")}]° in ${t.parent}` : `[${t.rpy_deg_sensor.join(", ")}]° in ${t.sensor_frame}`) +
+            (t.rpy_deg_now ? `, now [${t.rpy_deg_now.join(", ")}]°` : "") +
+            `. Its x is the sensor axis that becomes policy x${t.z_flipped ? "; its z is opposite to policy z (the simulation reports the reaction)" : ""}.`));
+        }
+        box.replaceChildren(...kids);
+      }
+    }
+    gate(M.save, f.active && !!(fit && fit.ok));
+    const sv = f.saved;
+    $("#su-fm-saved").textContent = sv ? `${sv.explain.join(", ")} · ${sv.at}` + (sv.profile ? ` · ${sv.profile}` : "") +
+      (sv.policy ? ` · sim reference of ${sv.policy}` : "") : "None: policy runs use the robot config's own F/T settings.";
+    gate(M.clear, !!sv);
   },
   // F/T limit card (ft_guard.py): soft warns, hard stops the GUI's motion
   ftLimitCard() {
@@ -3560,6 +3709,7 @@ pages.SETUP = {
     if (this.sub === "Setups") this.wc.W.setups.update(s);
     if (this.sub === "F/T + payload") {
       this.biasUpdate(s);
+      this.mUpdate(s);
       const p = s.payload;
       if (!p) { $("#su-pstat").textContent = "This robot profile has no F/T calibration poses."; gate(this.pcollect, false); return; }
       const have = p.samples.filter(Boolean).length, nextOpen = (from) => {
@@ -4007,19 +4157,6 @@ function renderHeader(s) {
   rp.className = "val hstat" + (rec ? " rec" : "");
   rp.title = rec ? `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`
     : "No recording. Click for recording details.";
-  const storage = s.record && s.record.storage;
-  const hs = $("#h-storage");
-  hs.textContent = !storage || storage.free_gb == null ? "—" : `${storage.free_gb.toFixed(1)} GB`;
-  hs.className = "val " + (storage && storage.state === "critical" ? "storage-critical" : storage && storage.state === "low" ? "storage-low" : "");
-  hs.title = !storage ? "Storage status unavailable" : storage.error ? `Storage check failed: ${storage.error}` :
-    `${nice(storage.state)} · recording start needs ${Math.round(storage.start_min_mb / 1000)} GB free; active recording stops below ${(storage.stop_min_mb / 1000).toFixed(1)} GB`;
-  const cameraRows = (s.workcell && s.workcell.drivers || []).filter((d) => d.kind === "camera");
-  const runningCams = cameraRows.filter((d) => d.state === "running").length;
-  const hc = $("#h-camera");
-  hc.textContent = !cameraRows.length ? "None" : runningCams === cameraRows.length ? `${runningCams} ready`
-    : runningCams ? `${runningCams}/${cameraRows.length} ready` : "Off";
-  hc.className = "val " + (cameraRows.length && runningCams === cameraRows.length ? "st-ok" : cameraRows.length ? "st-bad" : "");
-  hc.title = cameraRows.length ? cameraRows.map((d) => `${d.label}: ${d.state}${d.msg ? " — " + d.msg : ""}`).join("\n") : "No camera services configured";
   $("#h-profile").textContent = localStorage.getItem("operator") || "Pick";
   const bad = Object.entries(s.connected || {}).filter(([, v]) => !v).map(([k]) => k);
   $("#h-conn").innerHTML = bad.length ? icon("warn") + `<span class="ell">${bad.join(", ")} off</span>` : "";
@@ -4157,8 +4294,6 @@ async function boot() {
   };
   $("#h-stackstop").onclick = action(stopRobotStack);
   $("#h-rec").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
-  $("#h-storage-grp").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
-  $("#h-camera-grp").onclick = () => { navTo("SETUP"); pages.SETUP.show("Cameras"); };
   $("#h-profile-grp").onclick = () => operatorName(true);
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") post("/api/stop"); });
 

@@ -14,6 +14,8 @@ Each policy is described by a small manifest in policies/<name>.yaml:
     normalization: ~/policies/v4/vec_normalize.pkl
     training_config: ~/policies/v4/config.yaml
     robot_config: ~/ur7e_ws/.../ur7e_policy_deployment.yaml
+    sim_ft_reference: ~/policies/v4/sim_ft_reference.json   # optional (SETUP > F/T + payload > Match simulation);
+                                      # default: sim_ft_reference.json next to robot_config
     entrypoint: run_policy            # or run_scraping_policy
     controller_gains:                 # optional: the gains it was trained with (checked before a run)
       admittance.stiffness: [250, 200, 180, 20, 20, 20]
@@ -25,6 +27,11 @@ with parse_known_args, so anything else on the line (for example `-p model_path:
 ignored and the runner would fall back to selecting a checkpoint itself. A hand-written `command`
 is still accepted for other tools, but ROS-parameter model paths are refused and a declared backend
 must be on the line.
+
+F/T axes: when the profile in use has a Match simulation result (ft_match.py), a run gets an effective
+robot config (the manifest's robot_config with observations.ft_obs_axes / ft_obs_scale from the result,
+written under config_dir()/policy_runs/) in its place, on the generated command line and in a hand-written
+command's {robot_config}. Without a result the manifest's file is used as it is.
 
 The GUI does not load models. PolicyExecutor (policy_executor.py) owns the runtime path; the plan is
 to replace the subprocess underneath it with a RunPolicy ROS action (docs/RunPolicy.action).
@@ -39,7 +46,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import yaml
 
@@ -70,6 +77,7 @@ class PolicyManifest:
     package: str = "my_robot_policy"
     # Controller parameters the policy was trained with ({parameter: value}); checked against the live controller
     controller_gains: Dict[str, object] = field(default_factory=dict)
+    sim_ft_reference: str = ""                 # SETUP > F/T + payload > Match simulation (ft_match.py)
 
     @classmethod
     def load(cls, path: Path) -> "PolicyManifest":
@@ -95,15 +103,17 @@ class PolicyManifest:
                    required_frames=[str(f) for f in d.get("required_frames", []) or []],
                    entrypoint=str(d.get("entrypoint", "run_policy")),
                    package=str(d.get("package", "my_robot_policy")),
-                   controller_gains=dict(d.get("controller_gains") or {}))
+                   controller_gains=dict(d.get("controller_gains") or {}),
+                   sim_ft_reference=str(d.get("sim_ft_reference", "") or ""))
 
     def expanded_files(self) -> Dict[str, str]:
         return {k: os.path.expanduser(v) for k, v in self.files.items()}
 
     def build_command(self, recording: Optional["RecordingOptions"] = None,
-                      duration: Optional[float] = None) -> List[str]:
-        """The exact runner command line. A hand-written `command` only gets its {file} keys filled in."""
-        files = self.expanded_files()
+                      duration: Optional[float] = None, files: Optional[Dict[str, str]] = None) -> List[str]:
+        """The exact runner command line. A hand-written `command` only gets its {file} keys filled in.
+        `files` replaces some of the manifest's files (the effective robot config)."""
+        files = {**self.expanded_files(), **(files or {})}
         if self.command:
             return [c.format(**files) for c in self.command]
         cmd = ["ros2", "run", self.package, ENTRYPOINTS.get(self.entrypoint, self.entrypoint),
@@ -213,6 +223,10 @@ class PolicyLibrary:
         self._proc: Optional[subprocess.Popen] = None
         self._current: Optional[PolicyManifest] = None
         self._lock = threading.Lock()
+        # () -> (profile name, Match simulation result) or None (ft_match.py); set by RobotCore
+        self.ft_axes: Optional[Callable[[], Optional[tuple]]] = None
+        self.effective_dir: Optional[Path] = None      # where effective robot configs go (default: config_dir())
+        self.notify: Callable[[str], None] = lambda _m: None   # the GUI log (run()'s `log` is the result's)
         self.reload()
 
     def reload(self):
@@ -231,6 +245,37 @@ class PolicyLibrary:
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def ft_axes_in_use(self) -> Optional[tuple]:
+        """(profile name, result) of the Match simulation result in use, or None."""
+        try:
+            got = self.ft_axes() if self.ft_axes else None
+        except Exception:
+            return None
+        return got if got and got[1] else None
+
+    def command_for(self, name: str, recording: Optional[RecordingOptions] = None, duration=None,
+                    log=print) -> List[str]:
+        """The command line for a run of `name`, with the effective robot config when there is a result."""
+        m = self.manifests[name]
+        src = m.expanded_files().get("robot_config")
+        got = self.ft_axes_in_use() if src else None
+        files = None
+        if got:
+            from .ft_match import effective_robot_config
+            from .calibration import config_dir
+            owner, res = got
+            path = effective_robot_config(src, res, self.effective_dir or config_dir() / "policy_runs", name, owner)
+            files = {"robot_config": str(path)}
+            msg = (f"policy '{name}': F/T axes from the Match simulation of profile '{owner or '(none)'}' "
+                   f"({res.get('at', '?')}, {', '.join(res.get('explain') or [])}): robot config {path}")
+            log(msg)
+            self.notify(msg)
+        elif src:
+            msg = f"policy '{name}': no Match simulation result in this profile: robot config {src} as it is"
+            log(msg)
+            self.notify(msg)
+        return m.build_command(recording, duration, files)
+
     def run(self, name: str, modes, duration=None, stop_event: Optional[threading.Event] = None,
             log=print, recording: Optional[RecordingOptions] = None) -> bool:
         """Blocking. Returns True if the policy ran to its duration or exited with code 0."""
@@ -243,7 +288,11 @@ class PolicyLibrary:
         if problems:
             log(f"policy '{name}' preflight failed: " + "; ".join(problems))
             return False
-        cmd = m.build_command(recording, duration if duration is not None else m.duration)
+        try:
+            cmd = self.command_for(name, recording, duration if duration is not None else m.duration, log)
+        except Exception as e:
+            log(f"policy '{name}': could not write the effective robot config: {e}")
+            return False
         env = dict(os.environ, **{k: str(v) for k, v in m.env.items()})
         cwd = os.path.expanduser(m.cwd) if m.cwd else None
         duration = float(duration if duration is not None else (m.duration or 0)) or None
