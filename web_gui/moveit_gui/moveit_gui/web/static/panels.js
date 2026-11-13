@@ -3,7 +3,7 @@
 //   jchart Joint chart: joint angles (or speeds) over the last 20 s
 //   prog  Program run: what runs, where it is, Pause / Resume / Stop
 //   log   Log: the last lines of the GUI log, with a filter
-//   drv   Camera drivers: each driver from SETUP › Drivers & cameras with its state and Start / Stop
+//   drv   Camera drivers: each driver from SETUP › Cameras with its state and Start / Stop
 // The server owns every rule: these only show the state and send the same commands as the other pages.
 import { icon } from "/static/icons.js";
 import { axisRange } from "/static/monitors.js";
@@ -173,7 +173,7 @@ export function extraViews({ h, btn, cmd, pcmd, INFO, getS, op, navTo, logs }) {
   const drv = {
     label: "Camera drivers", min: 240,
     el: box("xdrv", dList, h("div", { class: "row" }, h("span", { class: "grow" }),
-      btn("Set up…", "quiet", () => navTo("SETUP", "Drivers & cameras")))),
+      btn("Set up…", "quiet", () => navTo("SETUP", "Cameras")))),
     update(s) {
       const ds = s.workcell?.drivers || [];
       const sig = JSON.stringify(ds);
@@ -188,7 +188,7 @@ export function extraViews({ h, btn, cmd, pcmd, INFO, getS, op, navTo, logs }) {
           h("span", { class: "dot " + (STATE[d.state] || STATE.stopped)[2] }),
           h("span", { class: "grow" }, h("div", {}, d.label || d.name), h("div", { class: "muted small" }, txt.toLowerCase() + (d.msg ? " · " + d.msg : ""))),
           b);
-      }) : [h("div", { class: "muted small" }, "No camera drivers yet. Add one in SETUP › Drivers & cameras.")]));
+      }) : [h("div", { class: "muted small" }, "No camera drivers yet. Add one in SETUP › Cameras.")]));
     },
   };
 

@@ -16,6 +16,24 @@ class ProfileError(ValueError):
     pass
 
 
+class WaypointDict(dict):
+    """The profile's named poses. "home" was renamed "up": either name finds the pose saved under the other
+    (so old programs that say "home" keep working)."""
+    _ALIAS = {"home": "up", "up": "home"}
+
+    def _key(self, k):
+        return k if (dict.__contains__(self, k) or k not in self._ALIAS) else self._ALIAS[k]
+
+    def __getitem__(self, k):
+        return dict.__getitem__(self, self._key(k))
+
+    def __contains__(self, k):
+        return dict.__contains__(self, self._key(k))
+
+    def get(self, k, default=None):
+        return dict.get(self, self._key(k), default)
+
+
 @dataclass
 class ControlMode:
     name: str
@@ -171,7 +189,7 @@ class RobotProfile:
             default_mode = cm.get("default", next(iter(modes), "position"))
             if modes and default_mode not in modes:
                 raise ProfileError(f"default control mode '{default_mode}' is not defined")
-            wps = {}
+            wps = WaypointDict()
             for wname, w in (d.get("waypoints", {}) or {}).items():
                 wps[wname] = Waypoint(
                     name=wname,

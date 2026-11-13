@@ -57,11 +57,18 @@ def test_prefs_keep_only_the_layout_keys(tmp_path):
         p.save_prefs("Cenk", {"op-layouts1": "x" * (PREFS_MAX + 1)})
 
 
+def as_(s, name):
+    """The test browser ("me") takes control as `name` (a profile name, as the page sends it)."""
+    return s.take_lease("me", f"{name} @ 100.64.0.1")
+
+
 def test_setups_per_profile_in_use_marker_and_copy(env):
     s, _, tmp = env
     run(s, "profile_create", name="Cenk")
     run(s, "profile_create", name="Ayesha")
     assert [p["name"] for p in run(s, "profile_list")["profiles"]] == ["Ayesha", "Cenk"]
+    as_(s, "Cenk")                                   # nobody's settings yet: they become Cenk's, no restart
+    assert s.worksets.active() == "Cenk" and s.worksets.has("Cenk")
     run(s, "tcp_save", name="tip_a", parent="tool0", xyz_mm=[0, 0, 200], rpy_deg=[0, 0, 0])
     r = run(s, "setup_save", name="scraping", owner="Cenk")
     assert r["owner"] == "Cenk" and [x["name"] for x in r["setups"]] == ["scraping"]
@@ -69,29 +76,94 @@ def test_setups_per_profile_in_use_marker_and_copy(env):
     assert (tmp / "cfg" / "moveit_gui" / "profiles" / "Cenk" / "setups" / "scraping" / "setup.yaml").is_file()
     assert run(s, "setup_list")["setups"] == [] and run(s, "setup_list", owner="Ayesha")["setups"] == []
     assert s.workcell_state()["setup"]["owner"] == "Cenk"
-    # Ayesha copies it, under another name; the files in use (and the one in use) don't change
+    # nobody writes into another person's profile
+    with pytest.raises(CommandError, match="belongs to Ayesha"):
+        run(s, "setup_copy", source_owner="Cenk", name="scraping", owner="Ayesha", new_name="x")
+    with pytest.raises(CommandError, match="belongs to Ayesha"):
+        run(s, "setup_save", name="x", owner="Ayesha")
+    # Ayesha takes control: Cenk's settings are in use, so she must switch first
+    s.on_restart = lambda: None
+    as_(s, "Ayesha")
+    assert s.state()["lease"]["needs_switch"] and s.state()["lease"]["settings_owner"] == "Cenk"
+    with pytest.raises(CommandError, match="Cenk's settings in use"):
+        run(s, "tcp_save", name="tip_b", parent="tool0", xyz_mm=[0, 0, 100], rpy_deg=[0, 0, 0])
+    with pytest.raises(CommandError, match="Cenk's settings in use"):
+        run(s, "setup_copy", source_owner="Cenk", name="scraping", owner="Ayesha", new_name="ayesha_scrape")
+    run(s, "profile_activate")                       # she has none yet: a copy of Cenk's
+    assert s.worksets.active() == "Ayesha" and not s.state()["lease"]["needs_switch"]
+    assert s.restart_code is not None
     r = run(s, "setup_copy", source_owner="Cenk", name="scraping", owner="Ayesha", new_name="ayesha_scrape")
     assert [x["name"] for x in r["setups"]] == ["ayesha_scrape"]
     assert r["setups"][0]["copied_from"] == "Cenk/scraping"
-    assert r["current"]["owner"] == "Cenk"
     with pytest.raises(CommandError, match="already has"):
         run(s, "setup_copy", source_owner="Cenk", name="scraping", owner="Ayesha", new_name="ayesha_scrape")
     run(s, "setup_copy", source_owner="Cenk", name="scraping", owner="Ayesha", new_name="ayesha_scrape", replace=True)
     with pytest.raises(CommandError, match="no setup"):
-        run(s, "setup_copy", source_owner="Ayesha", name="nope", owner="Cenk")
+        run(s, "setup_copy", source_owner="Ayesha", name="nope", owner="Ayesha")
     with pytest.raises(CommandError, match="no profile"):
         run(s, "setup_list", owner="Bob")
-    # loading Ayesha's: hers is in use now, the backup goes to her profile
-    s.on_restart = lambda: None
-    run(s, "tcp_delete", name="tip_a")
-    run(s, "setup_load", name="ayesha_scrape", owner="Ayesha")
+    # loading Cenk's setup into her settings: the backup goes to her profile, none to his
+    run(s, "setup_load", name="scraping", owner="Cenk")
     cur = run(s, "setup_list")["current"]
-    assert cur["name"] == "ayesha_scrape" and cur["owner"] == "Ayesha" and cur["changed"] == []
+    assert cur["name"] == "scraping" and cur["owner"] == "Cenk" and cur["changed"] == []
     assert any(x["auto"] for x in run(s, "setup_list", owner="Ayesha")["setups"])
+    assert not any(x["auto"] for x in run(s, "setup_list", owner="Cenk")["setups"])
     # a shared setup (saved before profiles) still works, and its marker has no owner
     run(s, "setup_save", name="old")
     assert run(s, "setup_list")["current"]["owner"] == ""
     assert run(s, "setup_preview", name="ayesha_scrape", owner="Ayesha")["changes"] == []
+
+
+def test_a_keepout_box_stays_with_the_one_who_added_it(env):
+    s, _, tmp = env
+    cfg = tmp / "cfg" / "moveit_gui"
+    box = cfg / "calibrations" / "ur7e_lab.keepout.yaml"
+    s.on_restart = lambda: None
+    for n in ("Cenk", "Ayesha"):
+        run(s, "profile_create", name=n)
+    as_(s, "Cenk")
+    assert not box.exists()
+    as_(s, "Ayesha")
+    run(s, "profile_activate")
+    run(s, "keepout_save", name="her_box", frame="base_link", size_mm=[100, 100, 100], xyz_mm=[500, 300, 200],
+        rpy_deg=[0, 0, 0])
+    assert "her_box" in box.read_text()
+    as_(s, "Cenk")                                   # Cenk switches back to his own: her box is not in them
+    run(s, "profile_activate")
+    assert s.worksets.active() == "Cenk" and not box.exists()
+    assert "her_box" in (cfg / "profiles" / "Ayesha" / "live" / "files" / "calibrations" /
+                         "ur7e_lab.keepout.yaml").read_text()
+    as_(s, "Ayesha")                                 # and back: hers again
+    run(s, "profile_activate")
+    assert "her_box" in box.read_text()
+    with pytest.raises(CommandError, match="in use"):
+        run(s, "profile_delete", name="Ayesha")
+    as_(s, "Cenk")
+    with pytest.raises(CommandError, match="Ayesha's settings in use"):
+        run(s, "keepout_delete", name="her_box")
+
+
+def test_a_new_profile_can_start_from_a_setup(env):
+    s, _, tmp = env
+    cfg = tmp / "cfg" / "moveit_gui"
+    s.on_restart = lambda: None
+    for n in ("Cenk", "Bob"):
+        run(s, "profile_create", name=n)
+    as_(s, "Cenk")
+    run(s, "tcp_save", name="tip_a", parent="tool0", xyz_mm=[0, 0, 200], rpy_deg=[0, 0, 0])
+    run(s, "setup_save", name="plain", owner="Cenk")
+    run(s, "tcp_save", name="tip_x", parent="tool0", xyz_mm=[0, 0, 50], rpy_deg=[0, 0, 0])
+    as_(s, "Bob")
+    with pytest.raises(CommandError, match="no setup"):
+        run(s, "profile_activate", start="setup", owner="Cenk", name="nope")
+    assert s.worksets.active() == "Cenk"            # a refused switch changes nothing
+    run(s, "profile_activate", start="setup", owner="Cenk", name="plain")
+    cal = (cfg / "calibrations" / "ur7e_lab.yaml").read_text()
+    assert "tip_a" in cal and "tip_x" not in cal
+    assert "tip_x" in (cfg / "profiles" / "Cenk" / "live" / "files" / "calibrations" / "ur7e_lab.yaml").read_text()
+    as_(s, "nobody")                                 # a name that is no profile cannot control the robot now
+    with pytest.raises(CommandError, match="pick your profile"):
+        run(s, "tcp_save", name="tip_y", parent="tool0", xyz_mm=[0, 0, 50], rpy_deg=[0, 0, 0])
 
 
 def test_an_old_marker_without_owner_is_a_shared_setup(tmp_path):
@@ -167,3 +239,39 @@ def test_the_start_page_removes_the_marker_and_exits_75(tmp_path):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+def test_programs_per_profile(env):
+    s, _, tmp = env
+    a = "me"
+    s.on_restart = lambda: None
+    s.command(a, "profile_create", {"name": "Ayesha"})
+    s.command(a, "profile_create", {"name": "Cenk"})
+    as_(s, "Ayesha")
+    s.command(a, "program_save", {"name": "shared1"})
+    r = s.command(a, "program_save", {"name": "mine", "owner": "ayesha"})
+    assert (tmp / "progs" / "Ayesha" / "mine.yaml").is_file() and r["program"]["owner"] == "Ayesha"
+    assert s.command(a, "program_list", {"owner": "Ayesha"})["files"] == ["mine.yaml"]
+    assert "mine.yaml" not in s.command(a, "program_list", {})["files"]
+    assert "shared1.yaml" in s.command(a, "program_list", {})["files"]
+    s.command(a, "program_save", {})                              # saves where it is open
+    assert not (tmp / "progs" / "mine.yaml").exists()
+    with pytest.raises(CommandError, match="belongs to Cenk"):     # not into another person's programs
+        s.command(a, "program_copy", {"source_owner": "", "name": "shared1.yaml", "owner": "Cenk"})
+    as_(s, "Cenk")
+    s.command(a, "profile_activate", {})
+    with pytest.raises(CommandError, match="belongs to Ayesha"):   # her program is open: he cannot save over it
+        s.command(a, "program_save", {})
+    r = s.command(a, "program_copy", {"source_owner": "", "name": "shared1.yaml", "owner": "Cenk"})
+    assert r["files"] == ["shared1.yaml"] and (tmp / "progs" / "shared1.yaml").is_file()
+    with pytest.raises(CommandError, match="already exists"):
+        s.command(a, "program_copy", {"source_owner": "", "name": "shared1.yaml", "owner": "Cenk"})
+    s.command(a, "program_copy", {"source_owner": "Ayesha", "name": "mine.yaml", "owner": "Cenk", "new_name": "x"})
+    assert (tmp / "progs" / "Cenk" / "x.yaml").is_file()
+    s.command(a, "program_open", {"name": "x.yaml", "owner": "Cenk"})
+    assert s.program_path == (tmp / "progs" / "Cenk" / "x.yaml").resolve()
+    for bad in ("../shared1.yaml", "a/b.yaml"):
+        with pytest.raises(CommandError):
+            s.command(a, "program_open", {"name": bad, "owner": "Cenk"})
+    with pytest.raises(CommandError, match="no profile"):
+        s.command(a, "program_list", {"owner": "../etc"})

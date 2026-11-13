@@ -2,6 +2,7 @@
 import math
 import os
 import re
+import threading
 import time
 
 import numpy as np
@@ -219,6 +220,51 @@ def test_position_servo_stop_restores_scaled_trajectory_controller(core):
     assert core.mode == "position"
     assert core.bridge.controllers["scaled_joint_trajectory_controller"] == "active"
     assert core.bridge.controllers["joint_trajectory_controller"] == "inactive"
+
+
+def test_position_servo_jog_still_shows_position_so_the_page_offers_no_switch(core):
+    """Regression: a Position hold-to-jog borrows the hidden servo_position mode. The page compares its mode
+    pick with state()["mode"]: when that said servo_position, OPERATE > Arm control showed "Switch to Position?"
+    in the middle of every jog."""
+    s = WebService(core)
+    try:
+        core.bridge.servo_available = True
+        s.take_lease("a")
+        seen = []
+        stop = False
+
+        def poll():                                       # what the page sees at its polling rate, start to end
+            while not stop:
+                core.update()
+                st = s.state()
+                seen.append((st["mode"], st["mode_label"], st["jog"]["hold_refusal"]))
+                time.sleep(0.01)
+        t = threading.Thread(target=poll, daemon=True)
+        t.start()
+        r = s.command("a", "jog_start", {"kind": "joint", "axis": 0, "sign": 1, "speed": 0.2})
+        assert r["ok"], r
+        assert core.mode == "servo_position"              # the controllers really are switched
+        _hold(core, 0.2)
+        s.command("a", "jog_stop", {})
+        stop = True
+        t.join()
+        assert core.mode == "position" and not core.busy
+        assert seen and {m for m, _, _ in seen} == {"position"}
+        assert all(label.startswith("Position") for _, label, _ in seen)
+        assert not any(w and "Change to Position" in w for _, _, w in seen)
+    finally:
+        s.shutdown()
+
+
+def test_a_failed_servo_restore_shows_the_mode_the_arm_is_left_in(core):
+    core.bridge.servo_available = True
+    ok, msg = core.jog_start(JogCommand.parse("joint", 0, 1), 0.2)
+    assert ok, msg
+    assert core.shown_mode == "position"
+    core.bridge.fail_next_switch = True
+    core.jog_stop()
+    core.update()
+    assert core.mode == "servo_position" and core.shown_mode == "servo_position"
 
 
 # ---------------------------------------------------------------- web service

@@ -916,7 +916,7 @@ export class View3D {
     this.draw();
   }
   // ------------------------------------------------------------ shapes
-  // Simple overlay in baseLink, mm (SETUP > Flask Geometry: the fitted flask, touches, pivot, scrape poses):
+  // Simple overlay in baseLink, mm (SETUP > Flask: the fitted flask, touches, pivot, scrape poses):
   // {spheres: [{c, r, color, opacity}], cylinders: [{a, b, r, color, opacity}], points: [{p, color, size}],
   //  lines: [{a, b, color}]}. null or {} clears it.
   setShapes(sh) {

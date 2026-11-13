@@ -21,6 +21,22 @@ FLASK_ADMIN = ("flask_capture", "flask_remove", "flask_reset", "flask_fake_touch
                "flask_profile_delete")
 
 
+def _plan_band(plan):
+    """The widest run of the plan's polar angles reached at every angle round (None: none)."""
+    thetas = sorted({p.theta_deg for p in plan.reachable} | {u.theta_deg for u in plan.unreachable})
+    bad = {u.theta_deg for u in plan.unreachable}
+    runs, cur = [], []
+    for t in thetas:
+        if t in bad:
+            cur = []
+            continue
+        if not cur:
+            runs.append(cur)
+        cur.append(t)
+    best = max(runs, key=lambda r: (r[-1] - r[0], len(r)), default=None)
+    return (best[0], best[-1]) if best else None
+
+
 class FlaskCommands:
     def _flask_init(self):
         self.flask_points: Dict[str, List[List[float]]] = {k: [] for k in FS.KINDS}
@@ -155,22 +171,28 @@ class FlaskCommands:
             raise FS.FlaskSetupError("save a flask first (SETUP › Flask Geometry)")
         return FlaskGeometry.from_dict(fx.meta["flask_geometry"])
 
-    def _flask_plan(self, tool=None, tcp=None, theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0,
-                    press_mm=0.5, margin_mm=1.0, pattern="down"):
+    def _flask_plan(self, tool=None, tcp=None, theta_min_deg=0.0, theta_max_deg=15.0, rings=6, step_deg=15.0,
+                    press_mm=0.5, margin_mm=1.0, pattern="down", pitch_top_deg=None, pitch_bottom_deg=None):
         g = self._flask_saved()
         tcp = str(tcp or self.core.store.active_tcp)
         if tcp not in self.core.store.tcps:
             raise FS.FlaskSetupError(f"unknown TCP '{tcp}'")
         t = FS.make_tool(tool, tcp)
-        a = FS.scrape_args(theta_min_deg, theta_max_deg, rings, step_deg, press_mm, margin_mm, pattern)
+        a = FS.scrape_args(theta_min_deg, theta_max_deg, rings, step_deg, press_mm, margin_mm, pattern,
+                           pitch_top_deg, pitch_bottom_deg)
         T = self.core.geo.T_base_frame(FS.FLASK_FIXTURE)
-        try:              # keep the tool's roll as it is held now (only the roll: the axis is set by the pivot)
+        try:              # a bent tool keeps its roll as held now (a straight one: X faces the wall)
             ref = self.core.geo.current_pose(FS.FLASK_FIXTURE, tcp).T()[:3, :3]
         except Exception:                          # noqa: BLE001 - no TF yet: the flask's own axes
             ref = None
-        plan = fs.generate_scrape_poses(g, t, a["theta_min_deg"], a["theta_max_deg"], a["rings"], a["step_deg"],
-                                        press_depth_mm=a["press_depth_mm"], margin_m=a["margin_m"],
-                                        reference_orientation=ref, pattern=a["pattern"])
+        try:
+            plan = fs.generate_scrape_poses(g, t, a["theta_min_deg"], a["theta_max_deg"], a["rings"], a["step_deg"],
+                                            press_depth_mm=a["press_depth_mm"], margin_m=a["margin_m"],
+                                            reference_orientation=ref, pattern=a["pattern"], pitch_deg=a["pitch_deg"])
+        except fs.FlaskScrapeError as e:
+            raise FS.FlaskSetupError(str(e)) from None
+        if a["pitch_deg"] is not None:          # a set pitch: the band is what this plan reaches all the way round
+            return plan, _plan_band(plan), T
         # the bent tool's check is ~100x slower: a coarser band (1°, every 30° around) keeps it to a few seconds
         coarse = isinstance(t, fs.BentTool)
         band = fs.reachable_band(g, t, margin_m=a["margin_m"], resolution_deg=1.0 if coarse else 0.25,
@@ -178,10 +200,11 @@ class FlaskCommands:
         return plan, band, T
 
     def cmd_flask_reach(self, **kw):
-        """Which of the poses the tool reaches through the neck, and the polar band where whole rings do."""
+        """Which of the poses the tool reaches through the neck, and the polar band reached all the way round."""
         plan, band, T = self._flask_plan(**kw)
         r = FS.reach_view(plan, band, T)
-        b = f"whole rings reach {band[0]:.1f}–{band[1]:.1f}° from the bottom" if band else "no whole ring is reachable"
+        b = (f"reached all the way round from {band[0]:.1f} to {band[1]:.1f}° from the bottom" if band
+             else "no polar angle is reached all the way round")
         return self._ok(f"{r['reachable']} of {r['reachable'] + r['unreachable']} poses reachable; {b}", reach=r)
 
     def cmd_flask_suggest_bend(self, shaft_radius_mm=3.0, shaft_length_mm=250.0, theta_min_deg=0.0,

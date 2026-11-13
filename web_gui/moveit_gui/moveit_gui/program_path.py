@@ -22,6 +22,7 @@ from . import transforms as tf
 from .program import MOTION_STEPS, Program, path_label, unroll, unroll_iters
 
 MAX_POINTS = 4000
+REPLAY_PREVIEW_POINTS = 100    # a replay step is drawn through this many of its points (FK of the taught joints)
 
 
 def _rot(axis, angle: float) -> np.ndarray:
@@ -83,7 +84,18 @@ def _assume_missing(program: Program, geometry, T_tcp: np.ndarray, examples: Opt
     parent frame) if there is one, else placed (base axes) so that the first waypoint in it is where the TCP is
     now. Preview only, never saved."""
     extra: Dict[str, np.ndarray] = {}
+    used = set()                                       # only the frames this program uses
+    for _, st in unroll(program.steps):
+        if st.type in ("move_relative", "move_until_contact") and st.params.get("frame"):
+            used.add(st.params["frame"])
+        elif st.type == "move_pose":
+            try:
+                used.add(program.pose_target(st).frame)
+            except Exception:
+                pass
     for name, e in (examples or {}).items():
+        if name not in used:
+            continue
         try:
             geometry.T_base_frame(name)
             continue                                   # taught: the real one wins
@@ -189,6 +201,35 @@ def simulate(program: Program, profile, geometry, model: dict, joints: List[floa
         if st.type not in MOTION_STEPS:
             continue
         p = st.params
+        if st.type == "replay":                # the taught joint motion: FK of (a thinned-out set of) its points
+            try:
+                from .replay import parse
+                _t, Qr = parse(p, len(names))
+            except Exception as e:             # noqa: BLE001 - the program check says so
+                note = f"preview stops at step {path_label(path)}: {e}"
+                break
+            idx = sorted(set(np.linspace(0, len(Qr) - 1, min(len(Qr), REPLAY_PREVIEW_POINTS)).round().astype(int)))
+            stop = False
+            for n_k, k in enumerate(idx):
+                T2 = tcp_of(list(Qr[k]))
+                if T2 is None:
+                    note, stop = f"preview stops at step {path_label(path)}: no forward kinematics", True
+                    break
+                T = T2
+                pts.append(T[:3, 3].tolist())
+                poses.append(_pose7(T))
+                qs.append([float(x) for x in Qr[k]])
+                linear.append(False)
+                labels.append(path_label(path))
+                what.append(f"{st.title}  " + ("MoveJ to its start" if n_k == 0 else
+                                              f"point {k + 1} of {len(Qr)} at {_t[k]:.1f} s as taught"))
+                loops.append([[path_label(lp), kk, nn] for lp, kk, nn in iters])
+            if stop:
+                break
+            if len(pts) >= max_points:
+                note = f"preview shows the first {max_points} moves"
+                break
+            continue
         try:
             if st.type == "movej":
                 q = program.joint_target(st, profile)
@@ -263,7 +304,9 @@ def simulate(program: Program, profile, geometry, model: dict, joints: List[floa
             ("not taught yet, previewed at the profile's example position: " + ", ".join(
                 f"{f} {assumed[f]} mm" for f in ex)) if ex else "",
             ("not taught yet, previewed as if under the tool now: " + ", ".join(under)) if under else "")
-            if x) + " (SETUP > Vial Geometry to teach it)"
+            if x) + " (" + ", ".join(sorted({"SETUP > Flask" if (getattr(profile, "example_fixtures", None) or {})
+                                             .get(f, {}).get("kind") == "flask" or f == "flask"
+                                             else "SETUP > Vial Geometry" for f in assumed})) + " to teach it)"
     zs = [p[2] for p in pts[1:]]
     if zs and min(zs) < 0.0:                   # below the robot base: on a table-mounted arm, into the table
         k = 1 + int(np.argmin(zs))

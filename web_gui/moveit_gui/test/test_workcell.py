@@ -452,3 +452,22 @@ def test_a_setup_brings_its_cameras_back(env):
     assert auto == {"d405": True, "zed": False}
     backup = next(x for x in s.setups.list() if x["auto"])
     assert backup["cameras"] == ["zed"]                             # what ran before the load
+
+
+def test_a_late_tf_takes_the_tcp_pose_from_the_joints(env, monkeypatch):
+    """Camera drivers crowd /tf: the TCP pose comes from the joints and the robot model, not blank or stale."""
+    s, _, _ = env
+    assert s.state()["tcp"]
+    T = s._tcp_from_joints()
+    assert T is not None
+
+    def late(*a, **k):
+        raise RuntimeError("TF is stale")
+    monkeypatch.setattr(s.core.geo, "current_pose", late)
+    s._tcp_last = (0.0, None, None)                    # nothing to hold: only the joints can give it
+    got = s.state()["tcp"]
+    assert got and "stale" not in got
+    xyz, _ = tf.T_to_mm_deg(T)                         # (this test's URDF is not the fake arm's kinematics)
+    assert max(abs(a - b) for a, b in zip(got["xyz_mm"], xyz)) < 0.01
+    s.core.last_snap.joint_state_age = 5.0             # old joints: not used; the last pose is held, marked stale
+    assert s.state()["tcp"]["stale"] is True

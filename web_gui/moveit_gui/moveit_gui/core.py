@@ -122,6 +122,7 @@ class RobotCore:
         self._jog_mode = ""
         self._jog_route = ""
         self._jog_restore_mode = ""
+        self._servo_home_mode = ""             # the user's mode while a Servo jog borrows a hidden mode (shown_mode)
         self._jog_shape = True
         self.jog_cfg = jog.jog_config(profile)
         self._force: Optional[force.ForceStream] = None
@@ -246,16 +247,26 @@ class RobotCore:
             return False, f"cannot save the photo in {folder}: {e}"
         return True, f"photo saved: {path}"
 
-    def mode_label(self) -> str:
-        m = self.profile.modes.get(self.mode)
-        if self.mode == CONTROL_STATE_UNKNOWN:
+    @property
+    def shown_mode(self) -> str:
+        """The mode to show the user. A Position Servo jog switches to a hidden internal mode (servo_position)
+        for as long as it is held and switches back on release: that is still the user's mode, not a mode
+        change, so the GUI must not offer to "switch to Position" meanwhile. If the restore fails, the hidden
+        mode shows (the arm really is left in it)."""
+        home, m = self._servo_home_mode, self.profile.modes.get(self.mode)
+        return home if home and m is not None and m.hidden else self.mode
+
+    def mode_label(self, mode: Optional[str] = None) -> str:
+        mode = self.mode if mode is None else mode
+        m = self.profile.modes.get(mode)
+        if mode == CONTROL_STATE_UNKNOWN:
             return "CONTROL STATE UNKNOWN"
         if m:
             if m.direct_torque:
                 return f"{m.label} · Direct torque"
             ci = (m.command_interface or "").strip().lower()
             return m.label if ci in ("", "none") else f"{m.label} · {ci.capitalize()}"
-        return self.mode.capitalize()
+        return mode.capitalize()
 
     def _gains_refusal(self) -> Optional[str]:
         """Why gains may not change under an active controller right now (None: they may)."""
@@ -448,9 +459,10 @@ class RobotCore:
         robot = self.robot_refusal()
         if robot:
             return robot
-        route, _ = jog.servo_route(self.profile, self.mode)
+        mode = self.shown_mode               # while a Position jog holds, the user's mode is still Position
+        route, _ = jog.servo_route(self.profile, mode)
         if not route:
-            return f"MoveIt Servo has no configured route for {self.mode}. Change to Position or Admittance."
+            return f"MoveIt Servo has no configured route for {mode}. Change to Position or Admittance."
         if not self.bridge.servo_ready(route):
             return ("Continuous jog is off (MoveIt Servo is not running): use the step jog, or turn on Continuous "
                     "jog in SETUP › Setups › Hardware…. If Servo is running, one step jog wakes it up.")
@@ -491,9 +503,11 @@ class RobotCore:
             # with the same fail-closed transactional mode switching as every other controller transition.
             stream_mode = str(route_cfg.get("control_mode") or start_mode)
             if stream_mode != start_mode:
+                self._servo_home_mode = start_mode       # before the switch: a state poll must not see a change
                 ok, msg = self.modes.switch_to(stream_mode)
                 if not ok:
                     self.update()
+                    self._servo_home_mode = ""
                     self.end_motion()
                     return False, f"Servo controller switch: {msg}"
                 restore_mode = start_mode
@@ -501,6 +515,7 @@ class RobotCore:
                 if self.mode != stream_mode:
                     self.modes.switch_to(restore_mode)
                     self.update()
+                    self._servo_home_mode = ""
                     self.end_motion()
                     return False, f"Servo controller switch succeeded but mode is {self.mode}"
 
@@ -525,6 +540,7 @@ class RobotCore:
                 if not ok:
                     self.bridge.log(f"Servo cleanup could not restore {restore_mode}: {msg}")
                 self.update()
+            self._servo_home_mode = ""
             self.end_motion()
             raise
         return True, f"jogging {velocity.describe()}"
@@ -646,6 +662,7 @@ class RobotCore:
             if not ok:
                 self.bridge.log(f"Servo jog stopped but could not restore {restore_mode}: {msg}")
             self.update()
+        self._servo_home_mode = ""
         self.end_motion()
         if reason != "released":
             self.bridge.log(f"jog ended: {reason}")
@@ -729,6 +746,32 @@ class RobotCore:
         if dev > self.PLAN_START_TOL_RAD:
             return False, f"the arm moved since planning ({math.degrees(dev):.1f}° off the start): plan again"
         return self.run_motion(lambda: self.bridge.execute_trajectory(p["traj"]), f"execute plan ({p['what']})")
+
+    # ---------------------------------------------------------------- replay
+    def robot_model(self) -> Optional[dict]:
+        """The parsed URDF from robot_description (cached per description), None without one."""
+        xml = self.bridge.robot_description() if hasattr(self.bridge, "robot_description") else None
+        if xml != getattr(self, "_model_xml", None):
+            from .robot_model import model_or_error
+            m = model_or_error(xml)
+            self._model_xml, self._model_parsed = xml, (m if m.get("ok") else None)
+        return getattr(self, "_model_parsed", None)
+
+    def replay_check(self, names, Q):
+        """A taught replay (replay.py) against the joint limits and the keep-out zones now: (problems, velocity
+        limits, acceleration limits)."""
+        from . import replay
+        model = self.robot_model()
+        if model is None:
+            self.bridge.log("replay: no robot model (robot_description): joint position limits not checked, "
+                            "default velocity limits")
+        desired, _problems = self.keepout.resolved()
+        boxes = [(b.name, T, b.size_m()) for b, T in desired.values()]
+        try:
+            link, _, T_link_tcp = self.geo.tcp_anchor(self.store.active_tcp)
+        except Exception:   # noqa: BLE001 - the flange then stands for the TCP
+            link, T_link_tcp = self.profile.planning_link, np.eye(4)
+        return replay.check(model, self.profile, names, Q, link, T_link_tcp, boxes)
 
     # ----------------------------------------------------------------- force
     def force_refusal(self) -> Optional[str]:
@@ -1176,3 +1219,6 @@ class _CoreProgramHooks(ProgramHooks):
 
     def photo(self, topic, label):
         return self.core.take_photo(topic, label)
+
+    def replay_check(self, names, Q):
+        return self.core.replay_check(names, Q)

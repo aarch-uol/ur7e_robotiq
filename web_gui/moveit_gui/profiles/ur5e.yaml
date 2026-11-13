@@ -61,5 +61,5 @@ freedrive:
 gripper:
   enabled: false
 waypoints:
-  home:  {joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]}
+  up:    {joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]}
   ready: {joints: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]}

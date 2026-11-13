@@ -48,9 +48,12 @@ cp ~/ws/src/moveit_gui/scripts/ur7e_gui.sh ~/ur7e_gui.sh     # the launcher uses
 ~/ur7e_gui.sh --fake
 ```
 
-The first run builds the image (`~/ur7e_robotiq/docker/build.sh`). That takes a while, and the launcher rebuilds
-it by itself whenever `~/ur7e_robotiq` changes. Then it builds `~/ws` inside the image (log:
-`~/ur7e_data/logs/ws_build.log`) and prints the address, e.g. `http://100.x.y.z:8180/`. In the browser press
+The first run builds the image (`~/ur7e_robotiq/docker/build.sh`). That takes a while. The image holds only what
+the robot packages need; the launcher rebuilds it by itself only when those dependencies change in `~/ur7e_robotiq`
+(`docker/`, `scripts/setup_workspace.sh`, `patches/`, a `package.xml`: `docker/deps_hash.sh`). The packages
+themselves are built from `~/ur7e_robotiq` at each start into `~/ur7e_data/overlay` (seconds; log:
+`~/ur7e_data/logs/overlay_build.log`), so a changed launch file, yaml or script just needs a restart. Then it builds
+`~/ws` inside the image (log: `~/ur7e_data/logs/ws_build.log`) and prints the address, e.g. `http://100.x.y.z:8180/`. In the browser press
 **Take control** (top right) to command anything; other browsers watch until you release. Ctrl-C in the terminal
 stops everything.
 
@@ -106,7 +109,7 @@ terminal too.
 
 ## Cameras
 
-Plug the cameras in (RealSense on USB, ZED X on the Jetson's GMSL port), then in SETUP › Drivers & cameras press
+Plug the cameras in (RealSense on USB, ZED X on the Jetson's GMSL port), then in SETUP › Cameras press
 **+ Add…**, pick the camera, give it a name and save. **Start** / **Stop** run its driver; tick **start with the
 GUI** to start it every time. The picture and the topics show when you select it. This works with `--fake` too.
 In OPERATE, layout 3 (Cameras) has a **Camera drivers** window with the same Start / Stop buttons.
@@ -152,7 +155,7 @@ container, so some files belong to root: `sudo cp -a ~/ur7e_data <dest>`.
 ## 7. Update
 
 ```bash
-cd ~/ur7e_robotiq && git pull          # the launcher rebuilds the image on the next start
+cd ~/ur7e_robotiq && git pull          # built on the next start (the image only if its dependencies changed)
 cd ~/ws/src/moveit_gui && git pull     # rebuilt in the image on every start
 ```
 

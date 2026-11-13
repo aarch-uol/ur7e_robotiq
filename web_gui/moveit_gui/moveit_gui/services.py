@@ -83,6 +83,10 @@ ZED_MODES = {   # resolution -> frame rates
     "usb": {"AUTO": (15, 30), "HD2K": (15,), "HD1080": (15, 30), "HD720": (15, 30, 60), "VGA": (15, 30, 60, 100)},
 }
 ZED_PUB = (("1", "full size"), ("2", "half size (less to send)"), ("4", "quarter size"))
+# pictures published per second: the camera still grabs at its frame rate (depth quality), but every subscriber
+# (the GUI's camera window, recorders) gets only this many. At 60 fps a full-size ZED picture stream alone kept
+# most of a Jetson core busy copying.
+ZED_PUB_FPS = (("5", "5"), ("10", "10"), ("15", "15"), ("30", "30"), ("0", "as grabbed"))
 TYPES: Dict[str, Type] = {
     "realsense": Type("Intel RealSense", "camera", "realsense2_camera",
                       "add ros-jazzy-realsense2-camera to the robot image (docker/Dockerfile) and rebuild; "
@@ -115,6 +119,8 @@ TYPES: Dict[str, Type] = {
                  Field("resolution", "Resolution", "AUTO", "ZED X: 1920 × 1200, 1920 × 1080 or 960 × 600", ZED_RES),
                  Field("fps", "Frame rate", "30", "960 × 600 up to 120 fps; 1920 × 1200 up to 60", ZED_FPS),
                  Field("publish", "Pictures sent", "1", "smaller = less load on the network and the GUI", ZED_PUB),
+                 Field("pub_fps", "Pictures per second", "15", "sent to the GUI and others; the camera still runs "
+                       "at its frame rate", ZED_PUB_FPS),
                  Field("depth", "Depth", "NEURAL_LIGHT", choices=(
                      ("NEURAL_LIGHT", "Neural light (fast)"), ("NEURAL", "Neural"), ("NEURAL_PLUS", "Neural plus (best, slow)"),
                      ("NONE", "Off (pictures only)")))],
@@ -233,6 +239,9 @@ class Service:
              "general.grab_frame_rate": p["fps"]}
         if p["resolution"] != "AUTO":
             o["general.grab_resolution"] = p["resolution"]
+        pf = str(p.get("pub_fps") or "15")
+        if pf != "0" and float(pf) < float(p["fps"]):
+            o["general.pub_frame_rate"] = f"{float(pf):.1f}"
         if p["publish"] != "1":
             o.update({"general.pub_resolution": "CUSTOM", "general.pub_downscale_factor": f"{float(p['publish']):.1f}"})
         return o

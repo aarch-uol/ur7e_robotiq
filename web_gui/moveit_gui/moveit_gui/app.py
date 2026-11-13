@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import signal
 import sys
 from pathlib import Path
+from typing import List
 
 
 def data_dir() -> Path:
@@ -29,21 +32,60 @@ def resolve_profile(arg: str, profiles_dir: Path) -> Path:
     sys.exit(f"profile '{arg}' not found (looked for {p} and {cand})")
 
 
+EXAMPLES_SEEN = ".examples.json"     # example file name -> sha256 of the version last copied in
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def copy_examples(d: Path, src: Path, first: bool = False) -> List[str]:
+    """Copy the examples (example_*, or every file on a first start) from src into d. An example already there is
+    replaced by a newer shipped version only while it is the copy put there before (nobody edited it): a changed
+    copy is someone's work and stays. Returns the names copied or updated."""
+    seen_f = d / EXAMPLES_SEEN
+    try:
+        seen = json.loads(seen_f.read_text())
+        seen = seen if isinstance(seen, dict) else {}
+    except (OSError, ValueError):
+        seen = {}
+    done = []
+    for f in sorted(src.glob("*")):
+        if not f.is_file() or not (first or f.name.startswith("example_")):
+            continue
+        dst = d / f.name
+        try:
+            new = f.read_bytes()
+            if dst.exists():
+                old = dst.read_bytes()
+                if old == new:
+                    seen[f.name] = _sha(new)
+                    continue
+                if seen.get(f.name) != _sha(old):
+                    continue                 # edited here (or copied before this was kept track of): keep it
+            dst.write_bytes(new)
+            seen[f.name] = _sha(new)
+            done.append(f.name)
+        except OSError:
+            pass                             # a read-only folder: the examples stay in the package
+    try:
+        seen_f.write_text(json.dumps(seen, indent=1, sort_keys=True))
+    except OSError:
+        pass
+    return done
+
+
 def prepare_dirs(args, root: Path):
-    """Programs and policies live in the user's home. Examples are copied there on first start, and an example
-    added by a later version is copied on the next start; a file already there is never overwritten."""
+    """Programs and policies live in the user's home. Examples are copied there on first start, an example added
+    by a later version on the next start, and a newer version of an example nobody edited replaces it
+    (copy_examples)."""
     profiles_dir = Path(args.profiles_dir)
     programs_dir = Path(args.programs_dir).expanduser()
     policies_dir = Path(args.policies_dir).expanduser()
     for d, src in ((programs_dir, root / "programs"), (policies_dir, root / "policies")):
         first = not d.exists()
         d.mkdir(parents=True, exist_ok=True)
-        for f in src.glob("*"):
-            if f.is_file() and (first or f.name.startswith("example_")) and not (d / f.name).exists():
-                try:
-                    (d / f.name).write_bytes(f.read_bytes())
-                except OSError:
-                    pass                     # a read-only folder: the examples stay in the package
+        copy_examples(d, src, first)
     return profiles_dir, programs_dir, policies_dir
 
 

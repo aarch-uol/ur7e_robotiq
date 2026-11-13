@@ -21,7 +21,7 @@ from .theme import SPACE, T, mono_font
 from .widgets import Card, button, hline, label, muted, page_widget, repolish, section_label
 
 STEP_TEMPLATES = {
-    "movej": {"target": "home", "velocity": 0.1},
+    "movej": {"target": "up", "velocity": 0.1},
     "move_pose": {"pose": {"frame": "base_link", "tcp": "tool0", "position": [0.4, 0.0, 0.3],
                            "quat_xyzw": [1.0, 0.0, 0.0, 0.0]}, "cartesian": False, "velocity": 0.1},
     "gripper": {"command": "close", "effort": 40},

@@ -4,8 +4,11 @@ Two ways (PROGRAMS > Teach & more > Teach by hand; the web side is web/teaching.
 
 * Waypoints: every Mark (or, optionally, every time the arm stood still for about a second after it moved) adds a
   waypoint and a move step.
-* Path: the TCP pose is sampled (20 Hz) while recording; afterwards the path is simplified into a few MoveL
-  waypoints with Ramer-Douglas-Peucker (RDP) on the position, with an orientation tolerance as well.
+* Path: the joint states are sampled at JOINT_HZ (100 Hz, with their own time stamps) and the TCP pose at SAMPLE_HZ
+  (20 Hz) while recording. Inserted as a Replay (default) the joint samples become one `replay` step that runs the
+  motion back as it was taught (replay.py). Inserted as MoveL points (and for a pressed path) the TCP path is
+  simplified into a few MoveL waypoints with Ramer-Douglas-Peucker (RDP) on the position, with an orientation
+  tolerance as well.
 
 Nothing here moves the robot. Replaying is an ordinary program run.
 
@@ -36,8 +39,10 @@ import numpy as np
 
 from . import transforms as tf
 
-SAMPLE_HZ = 20.0
+SAMPLE_HZ = 20.0                            # TCP poses (review, MoveL points)
+JOINT_HZ = 100.0                            # joint states (replay); the TCP every JOINT_HZ / SAMPLE_HZ samples
 MAX_SAMPLES = int(SAMPLE_HZ * 600)          # 10 minutes of path
+MAX_JOINT_SAMPLES = int(JOINT_HZ * 600)
 POS_TOL_MM = (0.1, 50.0)                    # allowed tolerance ranges
 ROT_TOL_DEG = (0.1, 45.0)
 TURN_IN_PLACE_M = 0.0005                    # a segment shorter than this is a turn in place: s by time
@@ -228,8 +233,8 @@ class StillDetector:
 
 
 class Sampler:
-    """Calls get_T() at `hz` in its own thread and passes (t, T) to on_sample. A failing get_T (no TF) skips that
-    sample. Stops by itself after max_samples (on_full is called once)."""
+    """Calls get_T() at `hz` in its own thread and passes (t, its result) to on_sample. A failing get_T (no TF)
+    skips that sample. Stops by itself after max_samples (on_full is called once)."""
 
     def __init__(self, get_T: Callable[[], np.ndarray], on_sample: Callable[[float, np.ndarray], None],
                  hz: float = SAMPLE_HZ, max_samples: int = MAX_SAMPLES, on_full: Callable[[], None] = lambda: None,
@@ -258,7 +263,7 @@ class Sampler:
         nxt = self.clock()
         while not self._stop.is_set():
             try:
-                T = np.asarray(self.get_T(), float)
+                T = self.get_T()
             except Exception as e:                     # noqa: BLE001 - TF gone for a moment: skip the sample
                 self.missed += 1
                 self.last_error = str(e)

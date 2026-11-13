@@ -138,18 +138,29 @@ def test_ros_domain_and_network_restart_the_stack(env, monkeypatch):
 # ------------------------------------------------------------------ the launcher, with a stub docker
 STUB = r"""#!/usr/bin/env bash
 # a stand-in for docker: logs what the launcher asks, starts nothing
-echo "$*" >> "$STUB_LOG"
+printf '%s\n' "$*" | tr '\n' ' ' >> "$STUB_LOG"; echo >> "$STUB_LOG"     # one line per call
 case "$1" in
-  image) echo "2099-01-01T00:00:00Z" ;;
+  image)                                    # the robot image: STUB_CREATED, STUB_LABEL (deps hash), STUB_IMAGE_ID
+    [ -n "$STUB_NO_IMAGE" ] && exit 1
+    case "$*" in
+      *Labels*) echo "${STUB_LABEL-<no value>}" ;;
+      *.Id*)    echo "sha256:${STUB_IMAGE_ID:-1}" ;;
+      *)        echo "${STUB_CREATED:-2099-01-01T00:00:00Z}" ;;
+    esac ;;
   ps)    [ "$2" = "-a" ] || { [ -f "$STUB_DIR/up" ] && echo ur7e_robotiq; } ;;
-  run)   [ "$2" = "-d" ] && touch "$STUB_DIR/up" ;;
+  run)   [ "$2" = "-d" ] && touch "$STUB_DIR/up"
+         case "$*" in                       # the overlay build: leaves its stamp, as the real one does
+           *"--base-paths /ur7e_robotiq"*)
+             for a in "$@"; do case "$a" in ID=*) id=${a#ID=} ;; esac; done
+             mkdir -p "$HOME/ur7e_data/overlay"; printf '%s' "$id" > "$HOME/ur7e_data/overlay/.built_for" ;;
+         esac ;;
   stop)  rm -f "$STUB_DIR/up" ;;
   exec)
     case "$*" in
       *list_controllers*) echo "joint_state_broadcaster  joint_state_broadcaster/JointStateBroadcaster  active" ;;
       *moveit_gui_web*)                     # the GUI: the first one asks for a restart (after STUB_GUI_FIRST)
         n=$(cat "$STUB_DIR/guis" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB_DIR/guis"
-        if [ "$n" = 0 ]; then eval "$STUB_GUI_FIRST"; exit 75; fi
+        if [ "$n" = 0 ]; then eval "$STUB_GUI_FIRST"; exit ${STUB_GUI_CODE:-75}; fi
         exit 0 ;;
     esac ;;
 esac
@@ -344,3 +355,151 @@ def test_launcher_runs_only_the_start_page_while_the_stack_is_stopped(tmp_path):
     assert len(starts) == 2 and "ros2 launch ur7e_robotiq_bringup" in starts[0]
     assert "sleep infinity" in starts[1] and "ros2 launch" not in starts[1]          # nothing of the robot runs
     assert len(guis) == 1 and "moveit_gui_idle" in log and "Robot stack stopped" in p.stdout
+
+
+# ------------------------------------------------------------------ the image rebuild and the overlay
+def ur_repo(tmp_path, deps="h1"):
+    """A ~/ur7e_robotiq with docker/deps_hash.sh (prints `deps`), a build.sh that only logs, and one package."""
+    repo = tmp_path / "home" / "ur7e_robotiq"
+    (repo / "docker").mkdir(parents=True, exist_ok=True)
+    (repo / "pkg_a" / "launch").mkdir(parents=True, exist_ok=True)
+    (repo / "docker" / "Dockerfile").write_text("FROM x\n")
+    (repo / "docker" / "deps_hash.sh").write_text(
+        f'#!/bin/sh\n[ "$1" = --files ] && {{ echo docker/Dockerfile; echo pkg_a/package.xml; exit 0; }}\necho {deps}\n')
+    (repo / "docker" / "build.sh").write_text('#!/bin/sh\necho "BUILD $UR7E_IMAGE" >> "$STUB_LOG"\n')
+    for n in ("deps_hash.sh", "build.sh"):
+        (repo / "docker" / n).chmod(0o755)
+    (repo / "pkg_a" / "package.xml").write_text("<package><name>pkg_a</name></package>\n")
+    (repo / "pkg_a" / "launch" / "a.launch.py").write_text("")
+    return repo
+
+
+def builds(tmp_path):
+    return [l for l in (tmp_path / "docker.log").read_text().splitlines() if l.startswith("BUILD")]
+
+
+def overlay_builds(tmp_path):
+    return [l for l in (tmp_path / "docker.log").read_text().splitlines() if "--base-paths /ur7e_robotiq" in l]
+
+
+def fresh(tmp_path):
+    for f in (tmp_path / "docker.log", tmp_path / "stub" / "guis"):
+        f.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("label,created,rebuild", [
+    ("h1", None, False),                              # the image was built from these dependencies
+    ("h0", None, True),                               # a package.xml / the Dockerfile / a patch changed
+    ("<no value>", None, False),                      # built before the labels, and nothing it needs is newer
+    ("<no value>", "2000-01-01T00:00:00Z", True),     # built before the labels, and the Dockerfile is newer
+])
+def test_launcher_rebuilds_the_image_only_for_its_dependencies(tmp_path, label, created, rebuild):
+    ur_repo(tmp_path)
+    extra = {"STUB_LABEL": label, **({"STUB_CREATED": created} if created else {})}
+    p, starts, guis, _ = launch(tmp_path, ["--fake"], env_extra=extra)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert builds(tmp_path) == (["BUILD stub:img"] if rebuild else [])
+
+
+def test_launcher_does_not_rebuild_for_a_launch_file(tmp_path):
+    # an image from before the labels, older than a launch file but not than the dependency files
+    repo = ur_repo(tmp_path)
+    for f in ("docker/Dockerfile", "pkg_a/package.xml"):
+        os.utime(repo / f, (946684800, 946684800))                  # 2000-01-01
+    p, *_ = launch(tmp_path, ["--fake"], env_extra={"STUB_CREATED": "2010-01-01T00:00:00Z"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert builds(tmp_path) == [] and len(overlay_builds(tmp_path)) == 1
+
+
+def test_launcher_builds_a_missing_image(tmp_path):
+    ur_repo(tmp_path)
+    p, *_ = launch(tmp_path, ["--fake"], env_extra={"STUB_NO_IMAGE": "1"})
+    assert builds(tmp_path) == ["BUILD stub:img"]
+
+
+def test_launcher_keeps_the_old_rule_for_an_old_checkout(tmp_path):
+    # ~/ur7e_robotiq without docker/deps_hash.sh: any newer file rebuilds the image, and its packages come from
+    # the image (no overlay)
+    repo = tmp_path / "home" / "ur7e_robotiq"
+    (repo / "docker").mkdir(parents=True)
+    (repo / "docker" / "build.sh").write_text('#!/bin/sh\necho "BUILD $UR7E_IMAGE" >> "$STUB_LOG"\n')
+    (repo / "docker" / "build.sh").chmod(0o755)
+    (repo / "x.yaml").write_text("")
+    p, starts, guis, _ = launch(tmp_path, ["--fake"], env_extra={"STUB_CREATED": "2000-01-01T00:00:00Z"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert builds(tmp_path) == ["BUILD stub:img"] and not overlay_builds(tmp_path)
+    assert "/data/overlay" not in starts[0] and "/ur7e_robotiq" not in starts[0]
+
+
+def test_launcher_runs_the_stack_on_the_overlay(tmp_path):
+    repo = ur_repo(tmp_path)
+    p, starts, guis, _ = launch(tmp_path, [], gui_first="")                   # real robot, restarts the stack once
+    assert p.returncode == 0, p.stdout + p.stderr
+    ov = overlay_builds(tmp_path)
+    assert len(ov) == 1                               # the restart finds it current
+    assert f"{repo}:/ur7e_robotiq:ro" in ov[0] and "--network none" in ov[0] and "ID=sha256:1" in ov[0]
+    assert "--symlink-install" in ov[0] and "--packages-select pkg_a" in ov[0] and "--allow-overriding pkg_a" in ov[0]
+    data = tmp_path / "home" / "ur7e_data"
+    assert (data / "overlay" / ".built_for").read_text() == "sha256:1"
+    for st in starts:                                 # sourced after the image's workspace, the source mounted
+        assert "source /opt/ur7e_ws/install/setup.bash && source /data/overlay/install/setup.bash" in st
+        assert f"{repo}:/ur7e_robotiq:ro" in st
+    assert all("source /data/overlay/install/setup.bash" in g for g in guis)
+    # nothing changed: no build; an edited launch file or a new image: built again
+    fresh(tmp_path)
+    old = 946684800
+    os.utime(data / "overlay" / ".built_for", (old + 100, old + 100))
+    for f in [repo, *repo.rglob("*")]:            # (a new or deleted file changes its directory)
+        os.utime(f, (old, old))
+    launch(tmp_path, ["--fake"])
+    assert overlay_builds(tmp_path) == []
+    fresh(tmp_path)
+    (repo / "pkg_a" / "launch" / "a.launch.py").write_text("# edited")
+    launch(tmp_path, ["--fake"])
+    assert len(overlay_builds(tmp_path)) == 1 and builds(tmp_path) == []
+    fresh(tmp_path)
+    launch(tmp_path, ["--fake"], env_extra={"STUB_IMAGE_ID": "2"})
+    assert len(overlay_builds(tmp_path)) == 1
+
+
+def test_launcher_stops_when_the_overlay_does_not_build(tmp_path):
+    ur_repo(tmp_path)
+    stub = tmp_path / "stub"
+    stub.mkdir(parents=True)
+    real = stub / "docker"
+    # a docker whose overlay build fails (the stub, renamed, does the rest)
+    p, *_ = launch(tmp_path, ["--fake"])                               # writes the stub
+    real.rename(stub / "docker_stub")
+    real.write_text('#!/bin/bash\ncase "$*" in *"--base-paths /ur7e_robotiq"*) echo "CMake Error: boom"; exit 2 ;; esac\n'
+                    'exec "$(dirname "$0")/docker_stub" "$@"\n')
+    real.chmod(0o755)
+    (tmp_path / "home" / "ur7e_data" / "overlay" / ".built_for").unlink()
+    fresh(tmp_path)
+    env = {"HOME": str(tmp_path / "home"), "PATH": f"{stub}:/usr/bin:/bin", "STUB_LOG": str(tmp_path / "docker.log"),
+           "STUB_DIR": str(stub), "STUB_GUI_FIRST": "", "UR7E_IMAGE": "stub:img"}
+    p = subprocess.run(["bash", str(ROOT / "scripts" / "ur7e_gui.sh"), "--fake"], env=env, capture_output=True,
+                       text=True, timeout=60)
+    assert p.returncode != 0 and "boom" in p.stdout and "overlay_build.log" in p.stdout
+    assert not [l for l in (tmp_path / "docker.log").read_text().splitlines() if l.startswith("run -d")]
+
+
+def test_launcher_builds_no_overlay_for_the_fr3(tmp_path):
+    ur_repo(tmp_path)
+    f = tmp_path / "home" / "ur7e_data" / "config" / "moveit_gui" / "robot"
+    f.parent.mkdir(parents=True)
+    f.write_text("robot=fr3\nmode=fake\n")
+    fr3ws = tmp_path / "fr3ws"
+    (fr3ws / "install").mkdir(parents=True)
+    (fr3ws / "install" / "setup.bash").write_text("")
+    p, starts, guis, _ = launch(tmp_path, [], env_extra={"UR7E_FR3_WS": str(fr3ws), "UR7E_FR3_IMAGE": "fr3:img"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert not overlay_builds(tmp_path) and "/data/overlay" not in starts[0]
+
+
+def test_a_gui_restart_builds_the_gui_workspace_again(tmp_path):
+    # the GUI asks for a GUI-only restart (76): ~/ws is built again, so pulled code runs
+    p, starts, guis, _ = launch(tmp_path, ["--fake"], env_extra={"STUB_GUI_CODE": "76"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    log = (tmp_path / "docker.log").read_text()
+    assert len(starts) == 1 and len(guis) == 2
+    assert log.count("colcon build --packages-select pymoveit2 moveit_gui") == 2

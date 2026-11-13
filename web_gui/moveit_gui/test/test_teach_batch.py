@@ -255,8 +255,8 @@ def test_a_taught_path_becomes_a_folder_of_movel_steps_and_replays(s):
     with pytest.raises(CommandError, match="tolerance"):
         cmd(s, "teach_simplify", pos_tol_mm=0)
     with pytest.raises(CommandError, match="speed"):
-        cmd(s, "teach_insert", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=9999)
-    r = cmd(s, "teach_insert", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=40, path=[0], where="after")
+        cmd(s, "teach_insert", kind="movel", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=9999)
+    r = cmd(s, "teach_insert", kind="movel", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=40, path=[0], where="after")
     assert r["selected"] == [1] and s.teach is None
     folder = prog(s).steps[1]
     assert folder.type == "folder" and len(folder.children) == 3
@@ -531,10 +531,10 @@ def test_a_taught_path_can_be_replayed_pressing_with_a_force(s):
     cmd(s, "teach_finish")
     start_mm = cmd(s, "teach_simplify", pos_tol_mm=1, rot_tol_deg=2)["teach"]["result"]["kept"][0]["xyz_mm"]
     with pytest.raises(CommandError, match="profile limit"):
-        cmd(s, "teach_insert", press_n=500)
+        cmd(s, "teach_insert", kind="movel", press_n=500)
     with pytest.raises(CommandError, match="direction"):
-        cmd(s, "teach_insert", press_n=5, press_dir="sideways")
-    r = cmd(s, "teach_insert", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=20, press_n=5)
+        cmd(s, "teach_insert", kind="movel", press_n=5, press_dir="sideways")
+    r = cmd(s, "teach_insert", kind="movel", pos_tol_mm=1, rot_tol_deg=2, speed_mm_s=20, press_n=5)
     folder = prog(s).steps[r["selected"][0]]
     assert "pressing 5 N" in folder.params["name"]
     kinds = [c.type for c in folder.children]
@@ -561,7 +561,7 @@ def test_press_straight_down(s):
     _drive_l_path(s)
     cmd(s, "teach_finish")
     start_mm = cmd(s, "teach_simplify", pos_tol_mm=1, rot_tol_deg=2)["teach"]["result"]["kept"][0]["xyz_mm"]
-    r = cmd(s, "teach_insert", press_n=4, press_dir="down")
+    r = cmd(s, "teach_insert", kind="movel", press_n=4, press_dir="down")
     folder = prog(s).steps[r["selected"][0]]
     touch, force = folder.children[2:4]
     assert touch.params["frame"] == "base" and touch.params["direction"] == [0.0, 0.0, -1.0]

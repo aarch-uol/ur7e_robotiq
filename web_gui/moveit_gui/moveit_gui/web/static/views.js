@@ -6,8 +6,8 @@
 // Windows always fill their space; resize by the lines between them. A camera "fits to the picture" (default):
 // its row / stack / window size follows the picture's shape, and that line is off; turn it off in its bar.
 // Layouts: "Main" is built in and fixed (nothing moves, resizes or minimises). Your own layouts are made in
-// SETUP › Layouts; in them you can resize (drag the lines) and minimise (a window becomes its title bar, in place;
-// nothing else moves). "Edit" (from SETUP › Layouts) moves, adds and closes windows: drag ⠿ above / below a window,
+// SETTINGS › Layouts; in them you can resize (drag the lines) and minimise (a window becomes its title bar, in place;
+// nothing else moves). "Edit" (from SETTINGS › Layouts) moves, adds and closes windows: drag ⠿ above / below a window,
 // or onto the right or bottom edge of the 3D view. The switcher (numbers) is in the top bar when there are two or
 // more layouts. Kept per browser (localStorage "op-layouts1").
 import { icon } from "/static/icons.js";
@@ -30,7 +30,7 @@ const base = (o) => Object.assign({ name: "", fixed: false, l: ["manual", "fts"]
 // 1 Main (the page as it always was): what you command left with the F/T chart, the 3D view, the robot right.
 // The chart "att"ached to the F/T sensor card: it sits right under it, moves with it, never minimises.
 const MAIN = base({ name: "Main", fixed: true, l: ["manual", "fts", "chart"], tiles: { chart: { type: "ft", att: true } }, h: { chart: 300 } });
-// 2 and 3: ready-made layouts of your own (edit, rename or delete them in SETUP › Layouts)
+// 2 and 3: ready-made layouts of your own (edit, rename or delete them in SETTINGS › Layouts)
 const PRESETS = [
   base({ name: "Force", l: ["manual", "fts", "chart"], r: ["robot", "arm", "joints", "grip"], right: ["c1"], rw: [1], f: 0.66,
     tiles: { chart: { type: "ft", att: true }, c1: { type: "cam", pick: 0 } }, h: { chart: 320 }, min: ["grip"] }),
@@ -129,7 +129,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
     const r = await cmd("camera_status").catch(() => null);
     if (!r || !r.ok) return;
     const known = new Set(r.cameras.map((c) => c.topic));
-    // first what publishes, then the cameras of SETUP › Drivers & cameras, then the profile's list: "Camera 1" is a live one
+    // first what publishes, then the cameras of SETUP › Cameras, then the profile's list: "Camera 1" is a live one
     const rank = (c) => (c.publishers > 0 ? 0 : c.driver ? 1 : 2);
     const next = [...r.cameras, ...(r.topics || []).filter((t) => !known.has(t) && !/\/(compressed|compressedDepth|zstd|theora)$/.test(t))
       .map((t) => ({ name: t, topic: t, publishers: 1 }))].map((c, i) => [rank(c), i, c]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map((x) => x[2]);
@@ -162,7 +162,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
     T.topic = h("select", { class: "ltopic", title: "Camera topic", onchange: () => { L().tiles[id].topic = T.topic.value; save(); render(); } });
     T.topic.addEventListener("mousedown", () => refreshCams());
     T.q = h("select", { class: "lq", title: "Picture in this window: Low 640 px, 10 fps · Med 960 px, 15 fps · High 1280 px, 30 fps " +
-      "(more data over the network). The camera itself is set in SETUP › Drivers & cameras.",
+      "(more data over the network). The camera itself is set in SETUP › Cameras.",
       onchange: () => { L().tiles[id].q = T.q.value; save(); render(); } },
       QUALITY.map(([k, n, d]) => h("option", { value: k, title: d }, n)));
     T.title = h("span", { class: "ltitle" });
@@ -229,7 +229,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
       T.img = h("img", { class: "vcam", alt: "", draggable: "false",
         src: on ? "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&q=" + q + "&t=" + Date.now() : "" });
       T.msg = h("div", { class: "vmsg" }, "");
-      T.img.onerror = () => { if (T.img && W.shown) { T.msg.textContent = "No picture"; T.msg.title = "Is the camera running? SETUP › Drivers & cameras"; } };
+      T.img.onerror = () => { if (T.img && W.shown) { T.msg.textContent = "No picture"; T.msg.title = "Is the camera running? SETUP › Cameras"; } };
       T.img.onload = () => { T.msg.textContent = ""; aspect(T, topic); };
       T.recLbl = h("span", { class: "vrec" });
       T.body.replaceChildren(T.img, T.msg);
@@ -242,9 +242,9 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
     } else if (extra[t.type]) {
       T.body.replaceChildren(extra[t.type].el);
     } else if (t.type === "cam") {
-      T.body.replaceChildren(h("div", { class: "vempty" }, "No camera yet. Start one in SETUP › Drivers & cameras."));
+      T.body.replaceChildren(h("div", { class: "vempty" }, "No camera yet. Start one in SETUP › Cameras."));
     } else {
-      T.body.replaceChildren(h("div", { class: "vempty" }, "Empty. Pick what it shows in SETUP › Layouts › Edit."));
+      T.body.replaceChildren(h("div", { class: "vempty" }, "Empty. Pick what it shows in SETTINGS › Layouts › Edit."));
     }
   }
   // the picture's shape (width / height), per topic; a change redraws (an MJPEG stream may change size)
@@ -702,7 +702,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
     render();
   }
 
-  // ---- SETUP › Layouts
+  // ---- SETTINGS › Layouts
   function newLayout(from, name) {
     if (W.list.length >= MAX_LAYOUTS) { toast(`At most ${MAX_LAYOUTS} layouts`); return null; }
     const c = sane(Object.assign(clone(from), { fixed: false }));

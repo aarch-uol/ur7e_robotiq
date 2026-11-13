@@ -1,4 +1,4 @@
-// SETUP > Drivers & cameras: start / stop camera drivers and (later) vision pipelines, see their pictures and logs.
+// SETUP > Cameras: start / stop camera drivers and (later) vision pipelines, see their pictures and logs.
 // Built by app.js with its helpers (ctx). The server (services.py) owns every rule; this only shows and asks.
 
 export const STATE = {   // state -> [chip text, chip class, dot class]

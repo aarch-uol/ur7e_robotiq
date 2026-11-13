@@ -118,9 +118,9 @@ const modeLabel = (n) => INFO.modes.find((m) => m.name === n)?.label || n;
 function gate(el, cond = true) { el.disabled = !(holds && cond); }
 
 // ------------------------------------------------------------------- lease
-// The profile: who you are (Cenk, Ayesha, ...), asked once per browser. The others see the name, and who has control.
-// Your setups (SETUP › Setups) and your screen layout are kept under it on the robot PC (moveit_gui/user_profiles.py).
-const PREF_KEYS = ["op-joints", "op-layouts1", "pg-jog-open", "pg-path", "v3-frames", "v3-pose", "v3-show", "v3-zones"];   // sorted
+// The profile: who you are, asked once per browser. The others see the name, and who has control.
+// Your settings, setups, programs and screen layout are kept under it on the robot PC (user_profiles.py, worksets.py).
+const PREF_KEYS = ["ftchart", "op-joints", "op-layouts1", "pg-jog-open", "pg-path", "v3-frames", "v3-pose", "v3-show", "v3-zones"];   // sorted
 const scmd = (name, args = {}) => post("/api/cmd", { cmd: name, args }, true);
 const localPrefs = () => Object.fromEntries(PREF_KEYS.map((k) => [k, localStorage.getItem(k)]).filter(([, v]) => v != null));
 let prefsSynced = null;                     // JSON of the layout as last read from / saved to the profile
@@ -139,7 +139,9 @@ async function profilePrefs(name, reload) {
   if (sorted(local) === prefsSynced) return;
   for (const k of PREF_KEYS) if (!(k in r.prefs)) localStorage.removeItem(k);
   for (const [k, v] of Object.entries(r.prefs)) localStorage.setItem(k, v);
-  if (reload) location.reload();
+  if (!reload) return false;
+  location.reload();                        // the navigation is not at once: the caller must stop here
+  return true;
 }
 setInterval(() => {                         // a changed layout goes to the profile (5 s)
   const n = localStorage.getItem("operator");
@@ -155,17 +157,14 @@ async function operatorName(force) {
     const sel = h("select", { style: "min-width:160px" }, ...names.map((x) => h("option", { value: x }, x)),
       h("option", { value: "+" }, "New profile…"));
     sel.value = names.find((x) => x.toLowerCase() === n.toLowerCase()) || names[0] || "+";
-    const nw = h("input", { type: "text", maxLength: 24, placeholder: "your name, e.g. Cenk", style: "width:180px" });
+    const nw = h("input", { type: "text", maxLength: 24, placeholder: "your name", style: "width:180px" });
     const nwRow = h("div", { class: "row" }, "Name", nw);
-    const others = h("select", {}, h("option", { value: "" }, "keep the layout it has"),
-      ...names.map((x) => h("option", { value: x }, `copy ${x}'s layout`)));
-    const paint = () => { nwRow.hidden = sel.value !== "+"; others.hidden = !names.length; };
+    const paint = () => { nwRow.hidden = sel.value !== "+"; };
     sel.onchange = paint;
     paint();
-    const form = h("div", { style: "display:flex;flex-direction:column;gap:8px" }, h("div", { class: "row" }, "Profile", sel), nwRow,
-      h("div", { class: "row" }, "Layout", others));
-    const v = await ask("Who are you?\nYour profile keeps your setups (SETUP › Setups) and your screen layout. The others see the name, " +
-      "and who has control.", { content: form, result: () => ({ name: sel.value === "+" ? nw.value.trim() : sel.value, copy: others.value }) });
+    const form = h("div", { style: "display:flex;flex-direction:column;gap:8px" }, h("div", { class: "row" }, "Profile", sel), nwRow);
+    const v = await ask("Who are you?\nYour profile keeps your own settings (TCPs, keep-out zones, gains, ...), setups, programs " +
+      "and screen layout. The robot runs the settings of the one in control. The others see the name.", { content: form, result: () => ({ name: sel.value === "+" ? nw.value.trim() : sel.value }) });
     if (v && v.name) {
       let name = v.name;
       if (sel.value === "+") {
@@ -173,11 +172,7 @@ async function operatorName(force) {
         if (!c.ok) return n;
         name = c.name;
       }
-      if (v.copy && v.copy.toLowerCase() !== name.toLowerCase()) {
-        const c = await cmd("profile_prefs_copy", { name, source: v.copy });
-        if (!c.ok) return n;
-      }
-      const changed = name !== n || v.copy;
+      const changed = name !== n;
       n = name;
       localStorage.setItem("operator", n);
       post("/api/hello", { bid: BID, name: n }, true);
@@ -217,7 +212,7 @@ function usersFill() {
       h("span", { class: "up-dot" + (u.control ? " on" : "") }),
       h("span", { class: "up-name" }, u.name + (u.id === MYUID ? " (you)" : "")),
       u.control ? h("span", { class: "chip ok" }, S && S.lease && S.lease.away ? "control · away" : "control") : "",
-      u.role ? h("span", { class: "chip", title: "Role (SETUP › Roles)" }, u.role) : "",
+      u.role ? h("span", { class: "chip", title: "Role (SETTINGS › Roles)" }, u.role) : "",
       h("span", { class: "up-where muted small", title: "Where it connects from (Tailscale user or IP)" },
         u.where + (u.tabs > 1 ? ` · ${u.tabs} tabs` : "")))),
     h("div", { class: "up-foot" },
@@ -298,6 +293,45 @@ function batchAsk(s) {
     .then((go) => { if (go != null && still()) cmd("batch_answer", { go: !!go }); });
 }
 async function releaseLease() { await post("/api/release"); holds = false; TOKEN = MYID = null; render(); }
+// ---- whose settings are in use (moveit_gui/worksets.py). The robot runs the settings of the one in control: taking
+// control while someone else's are in use asks to switch to your own (theirs stay in their profile).
+let switchAsked = "";
+async function switchSettings() {
+  const L = S && S.lease;
+  if (!holds || !L || !L.needs_switch) return;
+  const key = `${L.client}|${L.settings_owner}`;
+  if (switchAsked === key) return;
+  switchAsked = key;
+  const me = L.profile, act = L.settings_owner || "someone else";
+  if (!me) {
+    const v = await ask(`Who are you?\n\nThe robot has ${act}'s settings in use. To control it, pick your profile: ` +
+      "you then switch to your own settings.", { ok: "Pick my profile", result: () => true });
+    if (v) { await operatorName(true); takeLease(); } else releaseLease();
+    return;
+  }
+  const list = await scmd("profile_list");
+  const have = list.ok && list.settings.have.some((n) => n.toLowerCase() === me.toLowerCase());
+  let sel = null;
+  if (!have) {
+    const [mine, shared] = await Promise.all([scmd("setup_list", { owner: me }), scmd("setup_list", { owner: "" })]);
+    const opts = (r, who, label) => (r.ok ? r.setups.filter((x) => !x.auto)
+      .map((x) => h("option", { value: `${who}/${x.name}` }, `${label}: ${x.name}`)) : []);
+    sel = h("select", { style: "min-width:260px" }, h("option", { value: "" }, `A copy of ${act}'s settings`),
+      ...opts(mine, me, "My setup"), ...opts(shared, "", "Shared setup"));
+  }
+  const v = await ask(`${act}'s settings are in use\n\nTo control the robot, switch to your own settings (TCPs, ` +
+    `keep-out zones, fixtures, gains, F/T bias and payload, parts, ...). ${act}'s stay in their profile and come back ` +
+    "when they take control. The GUI restarts (about a minute; the robot stack too when your parts or tool differ)." +
+    (sel ? "\n\nYou have no settings of your own yet." : ""),
+  { ok: "Use my settings", content: sel ? h("div", { class: "row" }, "Start from", sel) : undefined,
+    result: () => ({ v: sel ? sel.value : "" }), valid: () => holds && S.lease && S.lease.needs_switch });
+  if (!v) { if (holds && S.lease && S.lease.needs_switch) releaseLease(); return; }
+  const args = {};
+  if (v.v) { const i = v.v.indexOf("/"); Object.assign(args, { start: "setup", owner: v.v.slice(0, i), name: v.v.slice(i + 1) }); }
+  const r = await cmd("profile_activate", args);
+  if (r.ok) sessionStorage.setItem("retake", "1");          // after the restart: reload and take control again
+  else switchAsked = "";
+}
 // Heartbeat: every 500 ms, never two at once, with a timeout. Control is lost ONLY when the server answers
 // holds:false. A failed or slow request is a connection problem (banner, keeps trying), not a lost lease: the server
 // decides after LEASE_TIMEOUT_S, and any answer that arrives in time keeps it.
@@ -418,13 +452,14 @@ pages.OPERATE = {
         h("input", { type: "number", step: "0.5", id: `op-j${i}`, value: "0",
           oninput: (e) => e.target.classList.add("edited") }),
         h("span", { class: "cur", id: `op-jc${i}` }, "—")));
-    const wp = h("select", { id: "op-wp", title: "Fill in a saved waypoint", onchange: (e) => {
+    const wp = h("select", { id: "op-wp", title: "Fill in the joints from a saved pose", onchange: (e) => {
       const w = INFO.waypoints.find((x) => x.name === e.target.value);
       if (w) w.joints_deg.forEach((v, i) => setField(`#op-j${i}`, v, true));
       this.loadedWp = w ? w.name : "";
       $("#op-wp-name").textContent = w ? w.name : "";
       e.target.value = "";
-    } }, h("option", { value: "" }, "Waypoint"), INFO.waypoints.map((w) => h("option", { value: w.name }, w.name)));
+      if (S) this.wpGhost(S);
+    } }, h("option", { value: "" }, "Go to pose…"), INFO.waypoints.map((w) => h("option", { value: w.name }, w.name)));
     const cfield = (i, n) => h("label", { class: "cfield" }, h("span", { class: "k" }, n),
       h("input", { type: "number", step: "1", id: `op-c${i}`, value: "0",
         oninput: (e) => { e.target.classList.add("edited"); this.fieldsToGoal(); } }));
@@ -561,8 +596,8 @@ pages.OPERATE = {
     this.ftc = ftChart();
     const ft = h("div", { class: "card" },
       h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: `Frame: ${INFO.ft_frame || "sensor frame"}` }, "F/T sensor"),
-        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + Payload)" }, "Biased"),
-        h("span", { class: "chip hidden", id: "op-ft-lim", title: "F/T limit (SETUP › F/T + Payload): amber over the soft limit, red over the hard one" }, ""),
+        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + payload)" }, "Biased"),
+        h("span", { class: "chip hidden", id: "op-ft-lim", title: "F/T limit (SETUP › F/T + payload): amber over the soft limit, red over the hard one" }, ""),
         h("button", { class: "btn quiet ibtn", type: "button", id: "op-ft-show", title: "Show the F/T chart under this card",
           html: icon("chart") + "<span>Chart</span>", onclick: () => this.vg.toggleChart() })),
       h("div", { class: "ft3" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(ftCell),
@@ -782,6 +817,20 @@ pages.OPERATE = {
     const id = S.plan.id, r = await post("/api/cmd", { cmd: "plan_get", args: {} }, true);
     if (r.ok && r.plan && S.plan.id === id && S.plan.what) this.view.playPreview(r.plan, INFO.joint_names, this.extraJoints(S));
   },
+  // The saved pose picked in the Joints tab, as a ghost arm: while the fields still hold it and the arm is not there
+  // yet. A plan preview uses the same ghost, so it gives way to one; Use current or a finished MoveJ clears it.
+  wpGhost(s) {
+    if (!this.view || !this.view.ghost) return;             // the robot model is not loaded yet
+    const w = this.loadedWp && INFO.waypoints.find((x) => x.name === this.loadedWp);
+    const held = !!w && w.joints_deg.every((v, i) => Math.abs(+$(`#op-j${i}`).value - v) < 0.051);
+    const there = held && !!s.joints_deg && w.joints_deg.every((v, i) => Math.abs(s.joints_deg[i] - v) < 0.2);
+    const key = held && !there && !s.plan.what ? w.name : "";
+    if (key === this.ghostWp && this.view.ghost === this.ghostOf) return;   // (a model reload makes a new ghost)
+    this.ghostWp = key; this.ghostOf = this.view.ghost;
+    const q = {};
+    if (key) w.joints_deg.forEach((v, i) => (q[INFO.joint_names[i]] = v * Math.PI / 180));
+    this.view.showGhost(key ? { ...this.extraJoints(s), ...q } : null);
+  },
   extraJoints(s) {
     return s.gripper_joint && s.gripper_position != null ? { [s.gripper_joint]: s.gripper_position } : {};
   },
@@ -997,6 +1046,7 @@ pages.OPERATE = {
       this.view.setZones(s.keepout.boxes, $("#v3-zones").checked);
       this.view.setCommandedForce(s.force.active ? s.force.current : null, s.force.frame, s.tcp);
       this.refreshPlan(s);
+      this.wpGhost(s);
     }
     (s.joints_deg || []).forEach((v, i) => ($(`#op-jc${i}`).textContent = v.toFixed(1) + "°"));
     $("#op-tcpname").textContent = `TCP ${s.calibration.active_tcp} in ${INFO.base_link}`;
@@ -1013,7 +1063,9 @@ pages.OPERATE = {
     $("#op-pose").title = p && p.stale ? "TF is late: the last pose, held for up to 2 s" : "";
     $("#op-pose").innerHTML = p ? [0, 1, 2].map((i) =>
       `<span class="k">${"XYZ"[i]}</span><span class="v">${fmt(p.xyz_mm[i])} mm</span>` +
-      `<span class="k">${["Roll", "Pitch", "Yaw"][i]}</span><span class="v">${fmt(p.rpy_deg[i])} °</span>`).join("") : "<span class='muted'>no pose</span>";
+      `<span class="k">${["Roll", "Pitch", "Yaw"][i]}</span><span class="v">${fmt(p.rpy_deg[i])} °</span>`).join("")
+      : [0, 1, 2].map((i) => `<span class="k">${"XYZ"[i]}</span><span class="v muted">— mm</span>` +
+        `<span class="k">${["Roll", "Pitch", "Yaw"][i]}</span><span class="v muted">— °</span>`).join("");   // same size, no jump
     const m = INFO.modes.find((x) => x.name === s.mode);
     $("#op-mode-title").textContent = m ? m.label : (!s.mode_label || /^(none|unknown)$/i.test(s.mode_label) ?
       "No arm controller active" : s.mode_label);
@@ -1303,7 +1355,7 @@ function forcePanel() {
     h("div", { class: "muted", id: "op-f-note" }),
     note(`Max ${f.max_force_n} N · ${f.max_torque_nm} Nm`,
       `The tool pushes with this wrench at the active TCP. In free air the arm moves until the controller's ` +
-      `stiffness balances it (≈ force / stiffness, see SETUP › Controller gains); on a surface it presses. ` +
+      `stiffness balances it (≈ force / stiffness, see SETUP › Gains); on a surface it presses. ` +
       `Ramps at ${f.ramp_force_nps} N/s. ` +
       `Zeroed at once on STOP, losing control, or if this page stops renewing ` +
       `(keep it in front: hidden tabs are throttled). Ends after ${f.max_duration_s} s.`));
@@ -1350,7 +1402,7 @@ function forceUpdate(s) {
 const PG_ICON = { movej: "MoveJ", move_pose: "Move", gripper: "Grip", wait: "Wait", set_io: "I/O", speed: "Spd",
   controller: "Mode", policy: "Pol", loop: "Loop", folder: "Dir", comment: "//", move_relative: "Rel",
   move_until_contact: "Touch", force: "Force", force_off: "F off", zero_ft: "Zero",
-  photo: "Photo", record_start: "Rec", record_stop: "Rec off" };
+  photo: "Photo", record_start: "Rec", record_stop: "Rec off", replay: "Play" };
 // direction pickers for force work: the six axis directions, plus whatever the step already has
 const AXIS_DIRS = [["+x", [1, 0, 0]], ["-x", [-1, 0, 0]], ["+y", [0, 1, 0]], ["-y", [0, -1, 0]], ["+z", [0, 0, 1]], ["-z", [0, 0, -1]]];
 const dirKey = (v) => (AXIS_DIRS.find(([, d]) => d.every((x, i) => Math.abs(x - (v || [])[i]) < 1e-9)) || [null])[0];
@@ -1362,14 +1414,21 @@ pages.PROGRAMS = {
   path: null, where: "after", tab: "insert", prog: null, lastExec: null,
   build(el) {
     const files = h("select", { id: "pg-files" });
+    // whose programs the list shows: a person's profile, or "" = Shared (the programs that were here before profiles)
+    this.owner = null; this.profiles = [];
+    const ownerSel = h("select", { id: "pg-owner", title: "Whose programs to show. Save and New put the program here." });
+    ownerSel.onchange = () => { this.owner = ownerSel.value; this.files(); };
+    this.ownerSel = ownerSel;
     const policySel = h("select", { id: "pg-sc-policy" }, INFO.policies.map((p) => h("option", { value: p.name }, p.name)));
     const top = h("div", { class: "row" },
       h("span", { class: "title", id: "pg-title" }, "untitled"), h("span", { class: "muted", id: "pg-file" }),
-      h("div", { class: "grow" }), files,
-      btn("Open", "", async () => (await this.guard("open " + files.value)) && this.apply(pcmd("program_open", { name: files.value }))),
+      h("div", { class: "grow" }), ownerSel, files,
+      btn("Open", "", async () => (await this.guard("open " + files.value)) && files.value &&
+        this.apply(pcmd("program_open", { name: files.value, owner: this.owner || "" }))),
+      btn("Copy from…", "quiet", () => this.copyFrom(), "Copy a program of another profile (or Shared) into the profile shown"),
       btn("New", "quiet", async () => (await this.guard("start a new program")) && this.apply(pcmd("program_new"))),
       h("input", { type: "text", id: "pg-name", placeholder: "file name", style: "width:140px" }),
-      btn("Save", "", async () => { await this.apply(pcmd("program_save", { name: $("#pg-name").value || null })); this.files(); }),
+      btn("Save", "", async () => { await this.apply(pcmd("program_save", { name: $("#pg-name").value || null, owner: this.owner || "" })); this.files(); }),
       btn("Check", "quiet", async () => {
         const r = await pcmd("program_check");
         if (r.ok) toast(r.problems.length ? "Program check found problems:\n• " + r.problems.join("\n• ") : "Program OK: preflight passed.",
@@ -1378,7 +1437,20 @@ pages.PROGRAMS = {
     top.querySelectorAll(".btn").forEach((b) => b.textContent !== "Check" && (b.dataset.lease = "1"));
     this.undoBtn = btn("↶ Undo", "quiet", () => this.undo(false), "Undo the last program edit (Ctrl+Z)");
     this.redoBtn = btn("↷ Redo", "quiet", () => this.undo(true), "Redo (Ctrl+Y)");
-    top.insertBefore(this.redoBtn, top.children[2]);
+    // run controls beside the program name: state chip, Run, Pause, Stop; Step / From selected / Loop in the menu
+    this.stateChip = h("span", { class: "chip", id: "pg-state" }, "READY");
+    this.runBtn = btn("▶ Run", "primary", () => this.run(false), "Run the program");
+    this.pauseBtn = btn("Pause", "", () => (S.runner.state === "PAUSED" ? pcmd("program_resume") : pcmd("program_pause")));
+    this.stopBtn = btn("■ Stop", "stopo", () => pcmd("program_stop"), "Stop this program run (the red STOP in the top bar stops everything)");
+    this.stepBtn = btn("Step", "", () => this.run(true), "Run one command at a time");
+    const runMenu = h("details", { class: "pg-runmenu" }, h("summary", { class: "btn quiet", title: "Run options" }, "⋯"),
+      h("div", { class: "pg-runpop" }, this.stepBtn,
+        h("label", { class: "chk" }, h("input", { type: "checkbox", id: "pg-from" }), "From selected"),
+        h("label", { class: "chk" }, h("input", { type: "checkbox", id: "pg-loop" }), "Loop")));
+    const runGroup = h("div", { class: "row pg-run" }, this.stateChip, this.runBtn, this.pauseBtn, this.stopBtn, runMenu,
+      h("span", { class: "badge hidden", id: "pg-loops" }), h("span", { class: "muted small", id: "pg-pause-why" }));
+    top.insertBefore(runGroup, top.children[2]);
+    top.insertBefore(this.redoBtn, runGroup);
     top.insertBefore(this.undoBtn, this.redoBtn);
     document.addEventListener("keydown", (e) => {
       if (current !== "PROGRAMS" || !(e.ctrlKey || e.metaKey) || /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) return;
@@ -1526,18 +1598,7 @@ pages.PROGRAMS = {
     }));
     const right = h("div", { class: "card pg-right" }, tabs,
       h("div", { id: "pg-t-cmd", class: "col" }), insertTab, teachTab, batchTab);
-    const run = h("div", { class: "runbar" },
-      h("span", { class: "state", id: "pg-state" }, "READY"),
-      btn("▶ RUN", "primary", () => this.run(false)), btn("Step", "", () => this.run(true)),
-      btn("Pause", "", () => (S.runner.state === "PAUSED" ? pcmd("program_resume") : pcmd("program_pause"))),
-      btn("■ Stop program", "stopo", () => pcmd("program_stop"), "Stop this program run (the red STOP in the top bar stops everything)"),
-      h("span", { class: "badge hidden", id: "pg-loops" }),
-      h("span", { class: "muted small", id: "pg-pause-why" }),
-      h("div", { class: "grow" }),
-      h("label", { class: "chk" }, h("input", { type: "checkbox", id: "pg-from" }), "From selected"),
-      h("label", { class: "chk" }, h("input", { type: "checkbox", id: "pg-loop" }), "Loop"));
-    [this.runBtn, this.stepBtn, this.pauseBtn, this.stopBtn] = run.querySelectorAll(".btn");
-    el.append(h("div", { class: "col" }, top, h("div", { class: "cols pg-cols" }, left, mid, right), run));
+    el.append(h("div", { class: "col" }, top, h("div", { class: "cols pg-cols" }, left, mid, right)));
     this.setTab("insert");
     this.files();
     cmd("program_get").then((r) => r.ok && this.display(r.program));
@@ -1552,8 +1613,44 @@ pages.PROGRAMS = {
     [...g.children].slice(2, 6).forEach((e) => e.classList.toggle("hidden", base));
   },
   async files() {
-    const r = await cmd("program_list");
-    if (r.ok) $("#pg-files").replaceChildren(...r.files.map((f) => h("option", { value: f }, f)));
+    if (this.owner == null) {             // first time: this browser's profile (top right), else Shared
+      const p = await cmd("profile_list");
+      const me = (localStorage.getItem("operator") || "").toLowerCase();
+      this.profiles = p.ok ? p.profiles : [];
+      this.owner = this.profiles.find((x) => x.name.toLowerCase() === me)?.name || "";
+    }
+    const r = await cmd("program_list", { owner: this.owner });
+    if (!r.ok && this.owner) { this.owner = ""; return this.files(); }       // the profile was deleted
+    if (!r.ok) return;
+    this.profiles = r.profiles.map((name) => ({ name }));
+    this.ownerSel.replaceChildren(...["", ...r.profiles].map((o) => h("option", { value: o }, o || "Shared")));
+    this.ownerSel.value = this.owner = r.owner;
+    $("#pg-files").replaceChildren(...(r.files.length ? r.files.map((f) => h("option", { value: f }, f)) : [h("option", { value: "" }, "no programs")]));
+    if (this.prog?.file && (this.prog.owner || "") === this.owner) $("#pg-files").value = this.prog.file;
+  },
+  // copy a program of another profile (or Shared) into the profile shown
+  async copyFrom() {
+    const mine = this.owner || "", name = (o) => o || "Shared";
+    const others = ["", ...this.profiles.map((p) => p.name)].filter((o) => o !== mine);
+    const from = h("select", {}, ...others.map((o) => h("option", { value: o }, name(o))));
+    const pick = h("select", { style: "min-width:200px" });
+    const as = h("input", { type: "text", placeholder: "same name", maxlength: 60, style: "width:200px" });
+    const fillPick = async () => {
+      const r = await cmd("program_list", { owner: from.value });
+      const l = r.ok ? r.files : [];
+      pick.replaceChildren(...(l.length ? l.map((f) => h("option", { value: f }, f)) : [h("option", { value: "" }, "no programs")]));
+    };
+    from.onchange = fillPick;
+    await fillPick();
+    const form = h("div", { style: "display:flex;flex-direction:column;gap:8px" }, h("div", { class: "row" }, "From", from),
+      h("div", { class: "row" }, "Program", pick), h("div", { class: "row" }, "Save as", as));
+    const c = await ask(`Copy a program into ${name(mine)}\nA copy: later changes in either one don't touch the other.`,
+      { content: form, ok: "Copy", result: () => ({ from: from.value, name: pick.value, as: as.value.trim() }) });
+    if (!c || !c.name) return;
+    const go = (replace) => cmd("program_copy", { source_owner: c.from, name: c.name, owner: mine, new_name: c.as, replace });
+    let r = await go(false);
+    if (!r.ok && /already exists/.test(r.msg || "") && (await ask(`Replace "${c.as || c.name}" in ${name(mine)} with the copy?`))) r = await go(true);
+    if (r.ok) { toast(r.msg, true); this.files(); }
   },
   // unsaved changes: ask before replacing the program
   async guard(what) {
@@ -1722,7 +1819,7 @@ pages.PROGRAMS = {
     $("#pg-title").title = p.dirty ? "Unsaved changes" : "";
     this.undoBtn.dataset.can = p.can_undo ? "1" : "";
     this.redoBtn.dataset.can = p.can_redo ? "1" : "";
-    $("#pg-file").textContent = p.file || "unsaved";
+    $("#pg-file").textContent = p.file ? (p.owner ? p.owner + " / " : "Shared / ") + p.file : "unsaved";
     if (p.file) $("#pg-name").value = p.file;
     if (document.activeElement !== $("#pg-yaml")) $("#pg-yaml").value = p.yaml;
     const tree = $("#pg-tree");
@@ -1879,12 +1976,21 @@ pages.PROGRAMS = {
     } else if (T === "record_stop") {
       lines.push(h("span"), h("span", { class: "muted small" }, "Finishes the recording that is running."));
       this.get = () => ({});
+    } else if (T === "replay") {
+      f.n = h("input", { type: "text", value: p.name ?? "" }); f.s = num(Math.round(100 * (p.speed ?? 1)), "5");
+      f.s.min = "5"; f.s.max = "200"; f.v = pctIn(p.velocity ?? 0.1);
+      field("Name", f.n); field("Speed % of taught", f.s); field("MoveJ to start %", f.v);
+      lines.push(h("span"), h("span", { class: "muted small" }, "Runs the motion taught by hand back with its timing, as one " +
+        "trajectory. First a planned MoveJ to its start. Refused if it enters a keep-out zone or leaves the joint limits; " +
+        "slowed down (never sped up) if it would exceed a joint speed or acceleration limit. The GUI speed scales it too."));
+      this.get = () => ({ name: f.n.value.trim() || null, speed: Math.min(2, Math.max(0.05, +f.s.value / 100)),
+        velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)) });
     } else if (T === "zero_ft") {
       lines.push(h("span"), h("span", { class: "muted small" }, "Averages the F/T reading for 1 s with the arm still and makes it " +
-        "read zero (software bias, SETUP › F/T + Payload). Refused in Admittance or with a force applied: put it before them."));
+        "read zero (software bias, SETUP › F/T + payload). Refused in Admittance or with a force applied: put it before them."));
       this.get = () => ({});
     } else this.get = () => ({});
-    if (["movej", "move_pose", "move_relative", "move_until_contact"].includes(T)) {
+    if (["movej", "move_pose", "move_relative", "move_until_contact", "replay"].includes(T)) {
       f.of = sel([["stop", "stop the program"], ["continue", "skip it and continue"]], p.on_fail || "stop");
       field("If it fails", f.of);
       const get = this.get;
@@ -1927,7 +2033,7 @@ pages.PROGRAMS = {
           h("span", { class: "muted small" }, "numbers are in this frame (typing them keeps the frame)")),
           h("span", { class: "k" }, "TCP"), tc);
       }
-      // point the step at another waypoint (e.g. back to "home"): the program's waypoints of the same kind
+      // point the step at another waypoint (e.g. back to "up"): the program's waypoints of the same kind
       const kind = wp.kind, mine = new Map();
       (this.prog?.rows || []).forEach((x) => x.waypoint && !x.waypoint.profile && x.waypoint.kind === kind && mine.set(x.waypoint.name, 1));
       const choices = [...mine.keys(), ...(kind === "joints" ? INFO.waypoints.map((x) => x.name).filter((n) => !mine.has(n)) : [])];
@@ -1986,6 +2092,7 @@ pages.PROGRAMS = {
     if (this.lastSt !== st) { if (st === "IDLE") this.pathKey = null; this.lastSt = st; if (st === "IDLE") this.paint3d(); }
     if (s.tcp_sig !== this.lastTcp) { const was = this.lastTcp; this.lastTcp = s.tcp_sig; if (was !== undefined) this.paint3d(); }
     $("#pg-state").textContent = { IDLE: "READY", RUNNING: "RUNNING", PAUSED: "PAUSED", STOPPING: "STOPPING" }[st] || st;
+    $("#pg-state").className = "chip " + ({ RUNNING: "ok", PAUSED: "warn", STOPPING: "err" }[st] || "");
     gate(this.runBtn, (idle && s.idle) || st === "PAUSED");
     gate(this.stepBtn, (idle && s.idle) || st === "PAUSED");
     gate(this.pauseBtn, st === "RUNNING" || st === "PAUSED");
@@ -2031,12 +2138,13 @@ pages.PROGRAMS = {
       mark: btn("Mark", "", () => this.apply(cmd("teach_mark")), "Add the current pose as a waypoint and a move step"),
       fin: btn("Finish", "", () => cmd("teach_finish"), "End the recording"),
       cancel: btn("Cancel", "quiet", () => cmd("teach_cancel"), "End teaching; marks already made stay (Undo removes them)"),
-      ins: btn("Insert", "primary", () => this.teachInsert(), "Add the path as a folder of MoveL steps"),
+      ins: btn("Insert", "primary", () => this.teachInsert(), "Add the path to the program (as a Replay step, or a folder of MoveL steps)"),
       discard: btn("Discard", "quiet", () => cmd("teach_cancel"), "Throw the taught path away"),
     };
     return h("div", { class: "card", id: "pg-tc" }, h("div", { class: "section" }, "Teach by hand"),
       h("div", { class: "muted" }, "Press Record, then move the arm by hand (freedrive). Nothing moves by itself. " +
-        "Waypoints: each Mark adds a waypoint and a move. Path: the motion is recorded and turned into a few MoveL steps. " +
+        "Waypoints: each Mark adds a waypoint and a move. Path: the motion is recorded; Insert it as a Replay (the arm " +
+        "moves exactly as you moved it, with your timing) or as a few MoveL points. " +
         "Waypoints are named taught_001, taught_002, … in the frame above. Placed at the selection (Insert tab: Place)."),
       h("div", { class: "row" }, h("span", { class: "muted" }, "Teach"),
         sel("pg-tc-mode", [["waypoints", "Waypoints"], ["path", "Path"]], () => this.teachForm()),
@@ -2051,11 +2159,19 @@ pages.PROGRAMS = {
       h("div", { class: "mono small", id: "pg-tc-status" }),
       h("div", { class: "col hidden", id: "pg-tc-review" },
         h("div", { class: "secondary", id: "pg-tc-res" }),
-        h("div", { class: "row" }, h("span", { class: "muted" }, "Max mm/s"),
-          h("input", { type: "number", id: "pg-tc-speed", step: "1", min: "0", style: "width:72px",
-            title: "TCP speed limit for the MoveL steps (empty: no limit). Suggested: your average speed while teaching" }),
+        h("div", { class: "row", title: "Replay: one step that runs the recorded joint motion back with its timing " +
+            "(a MoveJ to its start first; slowed down if it would exceed a joint limit). MoveL points: a few straight " +
+            "moves within the tolerance (needed for pressing with a force)" },
+          h("span", { class: "muted" }, "Insert as"),
+          sel("pg-tc-kind", [["replay", "Replay (as taught)"], ["movel", "MoveL points"]], () => this.teachKind()),
+          h("span", { class: "muted", id: "pg-tc-rsl" }, "Speed %"),
+          h("input", { type: "number", id: "pg-tc-rspeed", step: "5", min: "5", max: "200", value: "100", style: "width:64px",
+            title: "Of the taught timing: 100 = as taught, 50 = half as fast" }),
           h("div", { class: "grow" }), this.tc.ins, this.tc.discard),
-        h("div", { class: "row", title: "Replay the path pressing with this force (Admittance): it starts 10 mm off, " +
+        h("div", { class: "row", id: "pg-tc-mms" }, h("span", { class: "muted" }, "Max mm/s"),
+          h("input", { type: "number", id: "pg-tc-speed", step: "1", min: "0", style: "width:72px",
+            title: "TCP speed limit for the MoveL steps (empty: no limit). Suggested: your average speed while teaching" })),
+        h("div", { class: "row", id: "pg-tc-pressrow", title: "Replay the path pressing with this force (Admittance): it starts 10 mm off, " +
             "moves until contact, applies the force, follows the path, lets go and backs off. Empty: no force" },
           h("span", { class: "muted" }, "Press N"),
           h("input", { type: "number", id: "pg-tc-press", step: "0.5", min: "0", placeholder: "off", style: "width:72px" }),
@@ -2064,7 +2180,14 @@ pages.PROGRAMS = {
   teachForm() {
     const path = $("#pg-tc-mode").value === "path";
     for (const id of ["#pg-tc-as", "#pg-tc-move", "#pg-tc-autol"]) $(id).classList.toggle("hidden", path);
-    $("#pg-tc-tol").classList.toggle("hidden", !path);
+    this.teachKind();
+  },
+  teachKind() {                                  // Replay: Speed %; MoveL points: tolerance, Max mm/s, Press
+    const path = $("#pg-tc-mode").value === "path", rep = $("#pg-tc-kind").value === "replay";
+    const review = !!(S && S.teach && S.teach.phase === "review");
+    $("#pg-tc-tol").classList.toggle("hidden", !path || (review && rep));
+    for (const id of ["#pg-tc-mms", "#pg-tc-pressrow"]) $(id).classList.toggle("hidden", rep);
+    for (const id of ["#pg-tc-rsl", "#pg-tc-rspeed"]) $(id).classList.toggle("hidden", !rep);
   },
   teachTol() { return { pos_tol_mm: +$("#pg-tc-mm").value, rot_tol_deg: +$("#pg-tc-deg").value }; },
   teachStart() {
@@ -2074,9 +2197,13 @@ pages.PROGRAMS = {
   },
   teachSimplify() { if (S && S.teach && S.teach.phase === "review") cmd("teach_simplify", this.teachTol()); },
   teachInsert() {
+    if ($("#pg-tc-kind").value === "replay") {
+      const sp = $("#pg-tc-rspeed").value.trim();
+      return this.apply(cmd("teach_insert", { kind: "replay", speed_pct: sp === "" ? null : +sp, path: this.path, where: this.where }));
+    }
     const v = $("#pg-tc-speed").value.trim();
     const f = $("#pg-tc-press").value.trim();
-    this.apply(cmd("teach_insert", { ...this.teachTol(), speed_mm_s: v === "" ? null : +v, path: this.path, where: this.where,
+    this.apply(cmd("teach_insert", { kind: "movel", ...this.teachTol(), speed_mm_s: v === "" ? null : +v, path: this.path, where: this.where,
       press_n: f === "" || +f === 0 ? null : +f, press_dir: $("#pg-tc-pdir").value }));
   },
   teachUpdate(s) {
@@ -2104,10 +2231,15 @@ pages.PROGRAMS = {
     if (t && t.error) line += ` · ${t.error}`;
     $("#pg-tc-status").textContent = line;
     $("#pg-tc-review").classList.toggle("hidden", !review);
+    if (review !== !!this.tcWasReview) { this.tcWasReview = review; this.teachKind(); }
     if (review) {
-      $("#pg-tc-res").textContent = `${r.points} points from ${r.samples} samples · max ${r.max_mm.toFixed(1)} mm / ` +
+      const rp = r.replay || {};
+      $("#pg-tc-res").textContent = (rp.points ? `Replay: ${rp.points} points, ${rp.duration_s.toFixed(1)} s of motion ` +
+        `(${rp.samples} joint samples). ` : `Replay not possible: ${rp.error || "no joint states"}. `) +
+        `MoveL: ${r.points} points from ${r.samples} samples · max ${r.max_mm.toFixed(1)} mm / ` +
         `${r.max_deg.toFixed(1)}° off the taught path · ${r.length_mm.toFixed(0)} mm in ${r.duration_s.toFixed(1)} s · ` +
         `average ${r.avg_mm_s.toFixed(0)} mm/s while moving`;
+      if (!this.tcFilled) { $("#pg-tc-kind").value = rp.points ? "replay" : "movel"; this.teachKind(); }
       if (!this.tcFilled) $("#pg-tc-speed").value = r.speed_mm_s ?? "";    // suggest the taught speed once per review
       this.tcFilled = true;
     } else this.tcFilled = false;
@@ -2170,7 +2302,7 @@ pages.PROGRAMS = {
     this.bWant = null;
     $("#pg-b-vlist").replaceChildren(...(r.vials.length ? r.vials.map((v) => h("label", { class: "chk" },
       h("input", { type: "checkbox", value: v.name, checked: was.has(v.name) }), v.name))
-      : [h("span", { class: "muted" }, "No vial profiles yet (SETUP › Vial Geometry).")]));
+      : [h("span", { class: "muted" }, "No vial profiles yet (SETUP › Vial).")]));
   },
   batchSteps() {
     if (!this.prog) return;
@@ -2382,8 +2514,8 @@ pages.AUTOMATION = {
 pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
-  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry", "Flask Geometry"]],
-    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]], ["GUI", ["Layouts", "Roles"]]],
+  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibration", ["Camera", "F/T + payload", "Vial", "Flask"]],
+    ["Cell", ["Cameras", "Keep-out zones", "Gains"]]],
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
       ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
@@ -2444,7 +2576,7 @@ pages.SETUP = {
       h("span", { class: "mono muted grow", id: `su-vv-${k}` }, "—"),
       btn("Capture", "", () => cmd("vial_capture", { point: n }).then((r) => r.ok && this.vial(r.vial)))));
     vrows.forEach((r) => (r.lastChild.dataset.lease = "1"));
-    this.views["Vial Geometry"] = h("div", { class: "col su-main" },
+    this.views["Vial"] = h("div", { class: "col su-main" },
       h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow" }, "Touch points"), freedriveButton()),
         h("div", { class: "muted" }, "In freedrive, touch the TCP to the rim at three points spread around it and capture each. Optionally touch the bottom."),
         vrows, h("div", {}, btn("Reset", "quiet", () => cmd("vial_reset").then((r) => r.ok && this.vial(r.vial))))),
@@ -2485,8 +2617,8 @@ pages.SETUP = {
         note("Use makes a profile the fixture (\"vial\") that programs, keep-out boxes and the preview use.",
           "Centre of the vial bottom in the robot base frame, base axes. baseline is built in: scraping.py's target_xyz " +
           "(only right if your vial is really there). Saved profiles are kept per robot; Use is refused while a program runs.")));
-    this.vsave = this.views["Vial Geometry"].querySelector(".btn.primary");
-    this.views["Vial Geometry"].querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
+    this.vsave = this.views["Vial"].querySelector(".btn.primary");
+    this.views["Vial"].querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
     // Keep-out zones: MoveIt collision boxes (planning scene objects gui_keepout/<name>)
     const v3 = (id, step) => h("div", { class: "row" }, [0, 1, 2].map((i) =>
       h("input", { type: "number", id: `${id}${i}`, value: "0", step, style: "width:80px" })));
@@ -2519,7 +2651,7 @@ pages.SETUP = {
     for (const i of [0, 1, 2]) $(`#su-ko-s${i}`, this.views["Keep-out zones"]).value = ["1200", "800", "20"][i];
     this.views["Keep-out zones"].querySelector("#su-ko-apply").dataset.lease = "1";
     // Payload
-    this.views["F/T + Payload"] = h("div", { class: "cols" },
+    this.views["F/T + payload"] = h("div", { class: "cols" },
       h("div", { class: "card", style: "flex:0 0 330px" }, h("div", { class: "section" }, "Calibration poses"),
         h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Pose"), h("th", {}, "Fx N"), h("th", {}, "Fy N"), h("th", {}, "Fz N"))),
           h("tbody", { id: "su-ptab" })),
@@ -2559,15 +2691,15 @@ pages.SETUP = {
           "The GUI puts saved values back by itself after a controller restart and before switching to Admittance."),
         h("div", { class: "row" }, btn("Save result", "", () => cmd("payload_save")),
           h("div", { class: "grow" }), btn("Apply to admittance", "primary", () => this.applyPayload()))));
-    this.pcollect = $("#su-pcollect", this.views["F/T + Payload"]);
-    const pb = this.views["F/T + Payload"].querySelectorAll(".card:last-child .btn");
+    this.pcollect = $("#su-pcollect", this.views["F/T + payload"]);
+    const pb = this.views["F/T + payload"].querySelectorAll(".card:last-child .btn");
     [this.psave, this.papply] = pb;
-    this.pcols = this.views["F/T + Payload"];
-    this.views["F/T + Payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
-    this.views["Controller gains"] = this.buildGains();
+    this.pcols = this.views["F/T + payload"];
+    this.views["F/T + payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
+    this.views["Gains"] = this.buildGains();
     // Drivers & cameras: drivers.js
     this.dr = drivers({ h, btn, note, cmd, toast, ask, lease: (b) => { b.dataset.lease = "1"; return b; } });
-    this.views["Drivers & cameras"] = this.dr.view;
+    this.views["Cameras"] = this.dr.view;
     // one 3D view for the pages that place things in space: the live robot and what the page edits
     this.sv = h("div", { class: "card su-v3card" },
       h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3D view"),
@@ -2578,20 +2710,20 @@ pages.SETUP = {
     this.wc = workcell({ h, btn, note, cmd, post, $, toast, ask, askText, lease, freedriveButton, navTo, fake: () => INFO.fake });
     const pt = this.wc.buildParts(() => this.svPaint(true)), hc = this.wc.buildCalib(), st = this.wc.buildSetups();
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
-    this.views["Camera calibration"] = h("div", { class: "cols" }, hc.left, hc.right);
+    this.views["Camera"] = h("div", { class: "cols" }, hc.left, hc.right);
     this.views["Setups"] = h("div", { class: "cols" }, st.card, st.side);
     // Flask Geometry + flask scrape: flask.js
     this.fl = flaskPage({ h, btn, note, cmd, pcmd, toast, ask, askText, lease, freedriveButton, gate, fake: () => INFO.fake,
-      repaint: () => this.sub === "Flask Geometry" && this.svPaint(true),
+      repaint: () => this.sub === "Flask" && this.svPaint(true),
       guardProgram: (what) => pages.PROGRAMS.guard(what),
       openProgram: (r) => { pages.PROGRAMS.display(r.program, r.selected); navTo("PROGRAMS"); } });
-    this.views["Flask Geometry"] = this.fl.view;
+    this.views["Flask"] = this.fl.view;
     this.show("TCPs");
   },
-  SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Parts": "the robot with its parts (saved ones)", "Vial Geometry": "touched points and the fitted rim",
-    "Flask Geometry": "the flask, touches (blue rim, violet bulb, teal neck), next touch and pivot (orange), poses (green/red)",
+  SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Parts": "the robot with its parts (saved ones)", "Vial": "touched points and the fitted rim",
+    "Flask": "the flask, touches (blue rim, violet bulb, teal neck), next touch and pivot (orange), poses (green/red)",
     "Keep-out zones": "keep-out boxes (red = enabled)",
-    "F/T + Payload": "calibration poses: the blue ghost is the selected pose" },
+    "F/T + payload": "calibration poses: the blue ghost is the selected pose" },
   async svInit() {
     if (this.svv) return;
     this.svv = true;
@@ -2617,18 +2749,18 @@ pages.SETUP = {
     }
     this.zKey = null;
     if (!full) return;
-    v.setMarkers([]); v.setPathMm(null); v.setFrames([]); v.setShapes(n === "Flask Geometry" ? this.fl.shapes() : null);
+    v.setMarkers([]); v.setPathMm(null); v.setFrames([]); v.setShapes(n === "Flask" ? this.fl.shapes() : null);
     if (n === "Parts") {
       const p = this.wc.W.parts.draft();
       v.setPartDraft(p, (pose) => this.wc.W.parts.poseFromGizmo(pose));
     } else v.clearPartDraft();
-    if (n !== "F/T + Payload") { this.pStop(); v.showGhost(null); } else this.pGhost();
-    if (n === "TCPs" || n === "Vial Geometry") {
+    if (n !== "F/T + payload") { this.pStop(); v.showGhost(null); } else this.pGhost();
+    if (n === "TCPs" || n === "Vial") {
       const r = await cmd("tf_frames").catch(() => null);
       if (r && r.ok && this.sub === n)
         v.setFrames(r.frames.filter((f) => !f.error && (n === "TCPs" ? f.kind === "tcp" : f.kind === "fixture")));
     }
-    if (n === "Vial Geometry" && this.vialData) {
+    if (n === "Vial" && this.vialData) {
       const vd = this.vialData;
       v.setMarkers(Object.values(vd.points || {}).filter(Boolean).map((p) => ({ xyz_mm: p.map((x) => x * 1000), rpy_deg: [0, 0, 0] })), false);
       const r = vd.result;
@@ -2641,7 +2773,7 @@ pages.SETUP = {
   },
   pGhost() {
     const p = S && S.payload, v = this.view;
-    if (!v || this.sub !== "F/T + Payload") return;
+    if (!v || this.sub !== "F/T + payload") return;
     const q = p && p.joints && this.pPick != null ? p.joints[this.pPick] : null;
     v.showGhost(q ? Object.fromEntries(q.map((x, i) => [INFO.joint_names[i], x])) : null);
   },
@@ -2701,27 +2833,21 @@ pages.SETUP = {
     this.sub = n;
     this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
     if (this.SV_PAGES[n]) {
-      if (n === "F/T + Payload") {            // the poses, their ghost, the result side by side under the bias
+      if (n === "F/T + payload") {            // the poses, their ghost, the result side by side under the bias
         this.pcols.insertBefore(this.sv, this.pcols.lastChild);
         this.body.replaceChildren(this.views[n]);
         this.views[n].insertBefore(this.ftLimitCard(), this.pcols);
       } else this.body.replaceChildren(h("div", { class: "cols" }, this.views[n], this.sv));
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
-    } else if (n === "Roles") {
-      this.body.replaceChildren(this.rolesView());
-    } else if (n === "Layouts") {          // made by OPERATE's workspace (views.js)
-      this.lay = this.lay || pages.OPERATE.vg.setupView();
-      this.lay.refresh();
-      this.body.replaceChildren(h("div", { class: "col su-main" }, this.lay.el));
     } else this.body.replaceChildren(this.views[n]);
-    if (n === "Drivers & cameras") this.dr.load(); else this.dr.leave();
-    if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
-    if (n === "Flask Geometry") this.fl.load();
-    if (n === "Controller gains") this.gLoad(true);
+    if (n === "Cameras") this.dr.load(); else this.dr.leave();
+    if (n === "Vial") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
+    if (n === "Flask") this.fl.load();
+    if (n === "Gains") this.gLoad(true);
     if (n === "Parts") this.wc.W.parts.load();
     if (n === "TCPs") this.pivotCmd("pivot_get");
-    if (n === "Camera calibration") this.wc.W.he.load();
+    if (n === "Camera") this.wc.W.he.load();
     if (n === "Setups") this.wc.W.setups.load();
   },
   // ---- roles (roles.py): Viewer watches, Operator runs the robot, Admin also changes the setup
@@ -2936,7 +3062,7 @@ pages.SETUP = {
   },
   vial(v) {
     this.vialData = v;
-    if (this.sub === "Vial Geometry") this.svPaint(true);
+    if (this.sub === "Vial") this.svPaint(true);
     for (const [k, n] of INFO.vial_points.entries()) {
       const p = v.points[n];
       $(`#su-vd-${k}`).className = "dot" + (p ? " ok" : "");
@@ -3280,12 +3406,12 @@ pages.SETUP = {
       "Parts": w.restart_for?.length ? [String(w.parts_n), "warn", "Some parts are not in the robot model yet (restart the robot stack)"]
         : w.parts_n ? [String(w.parts_n), "", "parts"] : null,
       "TCPs": own ? [String(own), "", "your own TCPs"] : null,
-      "Camera calibration": w.cams_n ? ["✓ " + w.cams_n, "ok", "saved camera calibrations"] : ["—", "", "No camera calibrated"],
-      "F/T + Payload": s.payload?.saved?.file ? ["✓", "ok", "a payload calibration is saved"] : ["—", "", "No payload calibration saved"],
-      "Vial Geometry": vial ? ["✓", "ok", "the vial is taught"] : null,
-      "Flask Geometry": flask ? ["✓", "ok", "the flask is saved"] : null,
+      "Camera": w.cams_n ? ["✓ " + w.cams_n, "ok", "saved camera calibrations"] : ["—", "", "No camera calibrated"],
+      "F/T + payload": s.payload?.saved?.file ? ["✓", "ok", "a payload calibration is saved"] : ["—", "", "No payload calibration saved"],
+      "Vial": vial ? ["✓", "ok", "the vial is taught"] : null,
+      "Flask": flask ? ["✓", "ok", "the flask is saved"] : null,
       "Keep-out zones": ko ? [String(ko), "", "enabled keep-out boxes"] : null,
-      "Drivers & cameras": driversBadge(w.drivers),
+      "Cameras": driversBadge(w.drivers),
     };
     this.nav.querySelectorAll(".item").forEach((it) => {
       const v = nb[it.dataset.name], b = it.querySelector(".nb");
@@ -3300,8 +3426,8 @@ pages.SETUP = {
   },
   update(s) {
     this.navStatus(s);
-    if (this.sub === "F/T + Payload" && this.fbChart) this.fbChart.push(s);
-    if (this.sub === "F/T + Payload") this.ftlLive(s.ft_guard);
+    if (this.sub === "F/T + payload" && this.fbChart) this.fbChart.push(s);
+    if (this.sub === "F/T + payload") this.ftlLive(s.ft_guard);
     if (this.view && this.SV_PAGES[this.sub]) {          // the shared 3D view follows the arm; zones when they change
       const q = {};
       (s.joints_deg || []).forEach((x, i) => (q[INFO.joint_names[i]] = x * Math.PI / 180));
@@ -3330,9 +3456,9 @@ pages.SETUP = {
         if (this.tcpHow === "pivot" && this.pivot?.samples.length && c.tcp_parents.includes(this.pivot.parent)) sel.value = this.pivot.parent;
       }
     }
-    if (this.sub === "Vial Geometry") gate(this.vsave, this.vialOk);
-    if (this.sub === "Flask Geometry") this.fl.update(s);
-    if (this.sub === "Controller gains" && this.gData) {
+    if (this.sub === "Vial") gate(this.vsave, this.vialOk);
+    if (this.sub === "Flask") this.fl.update(s);
+    if (this.sub === "Gains" && this.gData) {
       if (this.gWasApplying && !s.gains_applying) this.gLoad(true);
       this.gWasApplying = !!s.gains_applying;
       if (s.mode !== this.gSeenMode) { this.gSeenMode = s.mode; this.gLoad(false); }
@@ -3341,9 +3467,9 @@ pages.SETUP = {
     }
     if (this.sub === "Keep-out zones") this.koUpdate(s);
     if (this.sub === "Parts") this.wc.W.parts.update(s);
-    if (this.sub === "Camera calibration") this.wc.W.he.update(s);
+    if (this.sub === "Camera") this.wc.W.he.update(s);
     if (this.sub === "Setups") this.wc.W.setups.update(s);
-    if (this.sub === "F/T + Payload") {
+    if (this.sub === "F/T + payload") {
       this.biasUpdate(s);
       const p = s.payload;
       if (!p) { $("#su-pstat").textContent = "This robot profile has no F/T calibration poses."; gate(this.pcollect, false); return; }
@@ -3384,7 +3510,7 @@ pages.SETUP = {
       gate(this.papply, !!(r && r.can_apply) && s.mode !== "admittance");
       this.papply.textContent = s.mode === "admittance" ? "Apply (leave Admittance first)" : "Apply to admittance";
     }
-    if (this.sub === "Drivers & cameras") this.dr.update(s);
+    if (this.sub === "Cameras") this.dr.update(s);
   },
 };
 
@@ -3610,8 +3736,79 @@ pages.DIAGNOSTICS = {
   },
 };
 
+// ================================================================== SETTINGS
+// The GUI itself (not the robot): screen layouts, who you are (profiles), who may do what (roles).
+pages.SETTINGS = {
+  sub: "Layouts",
+  ITEMS: ["Layouts", "Profiles", "Roles"],
+  build(el) {
+    this.nav = h("div", { class: "list subnav" }, this.ITEMS.map((n) =>
+      h("div", { class: "item", "data-name": n, onclick: () => this.show(n) }, h("span", { class: "grow" }, n))));
+    this.body = h("div", { class: "grow col" });
+    el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), this.body));
+    this.show("Layouts");
+  },
+  show(n) {
+    if (!this.ITEMS.includes(n)) n = "Layouts";
+    this.sub = n;
+    this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
+    if (n === "Roles") this.body.replaceChildren(pages.SETUP.rolesView());
+    else if (n === "Profiles") this.profiles();
+    else {                                  // made by OPERATE's workspace (views.js)
+      this.lay = this.lay || pages.OPERATE.vg.setupView();
+      this.lay.refresh();
+      this.body.replaceChildren(h("div", { class: "col su-main" }, this.lay.el));
+    }
+  },
+  // ---- Profiles: one per person; it keeps your setups and your screen layout
+  async profiles() {
+    const box = h("div", { class: "col su-main" });
+    this.body.replaceChildren(box);
+    const draw = (r) => {
+      if (this.sub !== "Profiles") return;
+      const me = localStorage.getItem("operator") || "";
+      const list = r.profiles || [];
+      const mine = list.find((p) => p.name.toLowerCase() === me.toLowerCase());
+      const others = list.filter((p) => p !== mine && p.layout);
+      const src = h("select", {}, others.map((p) => h("option", { value: p.name }, p.name)));
+      const redraw = async () => { const q = await cmd("profile_list"); if (q.ok) draw(q); };
+      box.replaceChildren(
+        h("div", { class: "card" },
+          h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Profiles"),
+            btn("+ New profile", "", async () => {
+              const name = await askText("Name of the new profile (your name):", "");
+              if (name && name.trim()) { const c = await cmd("profile_create", { name: name.trim() }); if (c.ok) draw(c); }
+            })),
+          note("A profile keeps one person's setups and screen layout.",
+            "Pick who you are with the name in the header. A profile can be deleted only when it has no setups."),
+          h("div", { class: "list" }, ...list.map((p) => h("div", { class: "item" },
+            h("span", { class: "grow" }, p.name + (p === mine ? " (you)" : "")),
+            h("span", { class: "muted small" }, `${p.setups} setup${p.setups === 1 ? "" : "s"}${p.layout ? " · layout" : ""}`),
+            btn("Delete", "quiet", async () => {
+              if (!(await ask(`Delete profile ${p.name}?`))) return;
+              const c = await cmd("profile_delete", { name: p.name });
+              if (c.ok) { if (p === mine) localStorage.removeItem("operator"); redraw(); }
+            }, p.setups ? "Has setups: not empty" : "Delete this empty profile")))),
+          list.length ? "" : h("div", { class: "muted" }, "No profiles yet.")),
+        h("div", { class: "card" },
+          h("div", { class: "section" }, "Copy a layout"),
+          !mine ? h("div", { class: "muted" }, "Pick your profile first (the name in the header).")
+            : !others.length ? h("div", { class: "muted" }, "No other profile has a saved layout.")
+              : [note(`Replaces the layout of ${mine.name} with a copy of another one. The page reloads.`),
+                h("div", { class: "row" }, "From", src,
+                  btn("Copy", "primary", async () => {
+                    if (!(await ask(`Replace the layout of ${mine.name} with ${src.value}'s?`))) return;
+                    const c = await cmd("profile_prefs_copy", { name: mine.name, source: src.value });
+                    if (c.ok) await profilePrefs(mine.name, true);
+                  }))]));
+    };
+    const r = await cmd("profile_list");
+    if (r.ok) draw(r);
+  },
+};
+
 // ===================================================================== shell
-function navTo(name, sub) {                  // sub: a SETUP item, e.g. "Drivers & cameras"
+function navTo(name, sub) {                  // sub: a SETUP item, e.g. "Cameras"
   if (pages[current] && pages[current].hide) pages[current].hide();
   if (typeof sub === "string" && pages[name]) pages[name].sub = sub;
   current = name;
@@ -3749,7 +3946,7 @@ function renderHeader(s) {
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
   const viewer = INFO && INFO.role === "viewer";
   $("#lease-btn").disabled = viewer && !holds;
-  $("#lease-btn").title = viewer ? "You are a Viewer: an Admin can make you an Operator (SETUP › Roles)" : "";
+  $("#lease-btn").title = viewer ? "You are a Viewer: an Admin can make you an Operator (SETTINGS › Roles)" : "";
   $("#lease-btn").className = "btn " + (holds ? "quiet" : "primary");
   $("#lease-btn").style.color = holds ? "var(--on-chrome2)" : "";
   document.querySelectorAll("[data-freedrive]").forEach((b) => {
@@ -3792,13 +3989,16 @@ async function modelWatch(s) {
 function render() {
   if (!S || !INFO) return;
   renderHeader(S);
+  if (holds && S.lease && S.lease.needs_switch) switchSettings();
   if (pages[current].update) pages[current].update(S);
 }
 
 async function boot() {
   INFO = await (await fetch("/api/info")).json();
   const me = localStorage.getItem("operator");
-  if (me) await profilePrefs(me, true);       // this profile's layout (changed in another browser: reload once)
+  // this profile's layout (changed in another browser: reload once). Stop here when reloading: building the pages
+  // writes some of these keys (the F/T chart's open state), and the next load would differ again: a reload loop
+  if (me && await profilePrefs(me, true)) return;
   $("#h-robot").replaceChildren(INFO.robot, ...(INFO.fake ? [" ", h("span", { class: "hchip fake", title: "Fake robot: no driver, nothing is sent to a robot" }, "FAKE")] : []));
   document.body.classList.toggle("fake", !!INFO.fake);
   $("#h-robot").title = `${INFO.ur_type} · ${INFO.robot_ip} · profile ${INFO.profile}`;
@@ -3836,6 +4036,7 @@ async function boot() {
     const next = JSON.parse(e.data);
     if (next.error) { srvError = String(next.error); if (S) render(); return; }   // keep the last good state
     srvError = ""; S = next;
+    if (S.boot && boot && S.boot !== boot && sessionStorage.getItem("retake")) { location.reload(); return; }
     if (S.boot && boot && S.boot !== boot && !$("#reload-bar")) {     // the GUI restarted: this page is old code
       document.body.prepend(h("div", { id: "reload-bar", class: "reload-bar" },
         "The GUI was restarted (maybe updated). This page still runs the old version. ",
@@ -3881,5 +4082,9 @@ async function boot() {
     setTimeout(() => { probing = false; }, 3000);
   };
   navTo(Object.keys(pages).includes(location.hash.slice(1)) ? location.hash.slice(1) : "OPERATE");
+  if (sessionStorage.getItem("retake")) {                 // back after switching to your settings: control again
+    sessionStorage.removeItem("retake");
+    takeLease();
+  }
 }
 boot();

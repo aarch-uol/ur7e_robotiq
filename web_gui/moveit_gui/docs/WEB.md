@@ -43,7 +43,7 @@ program runner and lease, and they do not know about each other.
   by itself after 45 s, and the question ends after 60 s). Give hands control straight to the one who asked, only
   while the robot is idle. For 15 s nobody else can take it. Keep tells the one who asked, who can ask again
   after 20 s. **Take over** still works without asking, but only while the robot is idle.
-- **Roles** (`web/roles.py`, SETUP › Roles). **Viewer** watches only and cannot take control. **Operator** runs the
+- **Roles** (`web/roles.py`, SETTINGS › Roles). **Viewer** watches only and cannot take control. **Operator** runs the
   robot: moves, programs, gripper, force, policies, recording. **Admin** also changes the setup: TCPs, calibrations,
   keep-out zones, gains, parts, drivers, hand-eye, setups and roles. A person is their Tailscale login when the page
   comes through `tailscale serve`, else their IP address. A browser on the robot PC is always Admin, so the lab can
@@ -117,16 +117,36 @@ program runner and lease, and they do not know about each other.
   with their change, and a joint move above 30° always asks, even with Confirm moves off. **Reset to current**
   drops your edits.
 - Requests must be JSON POSTs, so another website open in the same browser cannot send commands. Program
-  files can only be plain names in the programs folder.
+  files can only be plain names in the programs folder (or in a profile's folder inside it).
+
+**Programs per profile.** PROGRAMS shows the programs of the profile selected next to the file list (at first
+your browser's profile, else *Shared*). A profile's programs are plain files in `<programs dir>/<profile>/`
+(batch files beside them). *Shared* is the programs folder itself: the programs that were here before
+profiles, and the examples. Everyone can open and run them. Save and Save as put the program into your own profile
+(or Shared): another person's programs cannot be changed. **Copy from…** copies a program of another profile (or Shared) into the shown one; the copy is
+independent. Commands take `owner` (`program_list`, `program_open`, `program_save`) and `program_copy` takes
+`source_owner`, `owner`, `new_name`, `replace`. Policies, batches and the history refer to a program by its file name.
+
+**Settings per profile** (`worksets.py`). The files in use (setups.py `members()`: TCPs, fixtures, keep-out zones,
+F/T bias and limit, gains + payload, vials, flasks, parts, camera calibrations, recording settings) belong to one
+profile at a time, named in `profiles/active.yaml`. The robot runs the settings of the one in control. Taking control
+while another profile's settings are in use asks to switch (pop-up; `profile_activate`): the files in use are copied
+back to their profile (`profiles/<name>/live/`), the new person's copy is put in place, and the GUI restarts (the
+robot stack too when the parts or the base differ); the page then takes control again by itself. A profile without
+settings of its own starts from a copy of the ones in use or from a setup (`start: "setup"`, `owner`, `name`).
+Settings that are nobody's yet (from before profiles) become the first taker's without a restart. Until the switch,
+every command that needs control is refused, so nobody changes another person's settings. Setups and programs are
+written only into the profile of the one in control (or Shared); loading someone's setup into your settings keeps the
+backup in your profile. A profile whose settings are in use cannot be deleted.
 
 ## Pages
 
 | Page | In the browser |
 |---|---|
 | OPERATE | MoveJ (joints, waypoints), MovePose (any frame, linear), Plan → preview → Execute, Jog (step, or hold-to-jog through Servo), Force (Admittance / Impedance), 3D view (robot, goal gizmo, plan preview, F/T and force arrows, TF Frames overlay (checklist in localStorage, polled at 2 Hz via `tf_frames`), planned TCP path line, 10 s TCP Trail, Top/Front/Side/Iso and Follow TCP camera controls), control mode switch, freedrive, gripper, ATI F/T, Joint monitor (bar per joint across its URDF limits, amber within 10°, red within 3°), live F/T chart (last 20 s, Pause/Clear, torque toggle, commanded-force line) | With **Goal** on, an **orange goal-state arm** follows the goal marker live (as in RViz MotionPlanning): IK in the page from the robot model, seeded from the current joints, within joint limits, retried from other seeds near singular poses; nothing is sent to the robot and nothing is collision-checked (Plan does that). A goal it cannot reach says so and keeps the last pose that worked. Screenshot: `docs/ux/web_operate_goal_state.png`.
-| PROGRAMS | Insert tab with the **jog panel and gripper** in a drawer, closed at first so the commands start at the top (it stays as you leave it; jog, then MoveJ/MoveL (here)); the tree fills the page height; waypoint rename and coordinates; **3D preview** beside the tree: the program's TCP path (loops and relative moves included) and its waypoints (selected one orange, joint targets as a ghost arm); typed waypoints and a Go to list; loop progress in the run bar; UR-style tree (Loop, Folder, Comment, …); Insert / Command / Teach & more / **Batch** tabs; **Teach by hand** (waypoints or a simplified path) and **batch runs** (see below); edits apply when you leave a field; **Undo / Redo** (also Ctrl+Z / Ctrl+Y); unsaved changes are marked `*` and New/Open ask first; Set waypoint here, Move here; run from a selected step, step, pause, stop; The 3D preview's **▶ Play** runs a ghost arm through the whole program from where the robot is (loops included; MoveJ / non-linear MovePose in joint space, linear moves in <= 10 mm steps with IK); nothing moves, no planning, no contact. A **Move until contact** is drawn to where it meets the wall or floor of a vial of known size (a fixture with a radius: taught by touch, a vial profile, Use example vial, or the example vial while assumed), else to its full distance; the step line says which. A fixture the program uses but that is not taught yet is previewed at the profile's `example_fixtures` position (`vial` = scraping.py's target_xyz [525, 16, 40] mm in base_link, what `robot_demo` runs), else under the tool now; the note says which. SETUP > Vial Geometry > **Use example vial** saves the example as the real fixture on request. **Step through** under the view: |◀ ◀ slider ▶ ▶| picks one move (loops unrolled); the ghost repeats only that move, it is orange on the path, and the line under it says which step and loop turn it is (e.g. `Move 6 / 79 · step 8.5 · Loop 8 · 2/37 · Move relative [0, 0, -41] mm in vial`). The path is drawn for the **active TCP**: a taught pose puts its own TCP at the target (as the runner does) and the line shows where the active one goes; changing or editing the active TCP redraws it. A pose's TCP can be `active` (whichever TCP is selected when it runs; the Franka baseline example uses it) or a named TCP (TCP dropdown in the waypoint editor). A path that goes below the robot base (z < 0) is flagged in red under the preview. Screenshots: `docs/ux/web_programs_play.png`, `docs/ux/web_programs_step.png`. |
+| PROGRAMS | Insert tab with the **jog panel and gripper** in a drawer, closed at first so the commands start at the top (it stays as you leave it; jog, then MoveJ/MoveL (here)); the tree fills the page height; waypoint rename and coordinates; **3D preview** beside the tree: the program's TCP path (loops and relative moves included) and its waypoints (selected one orange, joint targets as a ghost arm); typed waypoints and a Go to list; loop progress next to the run controls; UR-style tree (Loop, Folder, Comment, …); Insert / Command / Teach & more / **Batch** tabs; **Teach by hand** (waypoints, or a path replayed as taught or as MoveL points) and **batch runs** (see below); edits apply when you leave a field; **Undo / Redo** (also Ctrl+Z / Ctrl+Y); unsaved changes are marked `*` and New/Open ask first; Set waypoint here, Move here; run from a selected step, step, pause, stop; The 3D preview's **▶ Play** runs a ghost arm through the whole program from where the robot is (loops included; MoveJ / non-linear MovePose in joint space, linear moves in <= 10 mm steps with IK); nothing moves, no planning, no contact. A **Move until contact** is drawn to where it meets the wall or floor of a vial of known size (a fixture with a radius: taught by touch, a vial profile, Use example vial, or the example vial while assumed), else to its full distance; the step line says which. A fixture the program uses but that is not taught yet is previewed at the profile's `example_fixtures` position (`vial` = scraping.py's target_xyz [525, 16, 40] mm in base_link, what `robot_demo` runs), else under the tool now; the note says which. SETUP > Vial > **Use example vial** saves the example as the real fixture on request. **Step through** under the view: |◀ ◀ slider ▶ ▶| picks one move (loops unrolled); the ghost repeats only that move, it is orange on the path, and the line under it says which step and loop turn it is (e.g. `Move 6 / 79 · step 8.5 · Loop 8 · 2/37 · Move relative [0, 0, -41] mm in vial`). The path is drawn for the **active TCP**: a taught pose puts its own TCP at the target (as the runner does) and the line shows where the active one goes; changing or editing the active TCP redraws it. A pose's TCP can be `active` (whichever TCP is selected when it runs; the Franka baseline example uses it) or a named TCP (TCP dropdown in the waypoint editor). A path that goes below the robot base (z < 0) is flagged in red under the preview. Screenshots: `docs/ux/web_programs_play.png`, `docs/ux/web_programs_step.png`. |
 | AUTOMATION | policy list, readiness with **Fix** buttons (use the TCP, switch mode, apply the trained gains, open SETUP/DIAGNOSTICS), Prepare (shows PREPARING…, Cancel), Run, ■ Stop policy, recording on/off, live feedback (when the runner gives it) |
-| SETUP | TCPs, Parts, Vial Geometry, Flask Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is a reminder to press Zero now after Apply, not a FAIL. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial Geometry): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), **Drivers & cameras** (start / stop camera drivers and pipelines, live picture, log; see below) |
+| SETUP | TCPs, Parts, Vial Geometry, Flask Geometry and Keep-out zones share a **3D view** beside their forms (TCP frames; touched points and the fitted rim; boxes, with the box being typed drawn dashed before it is saved); F/T + Payload has a live F/T chart beside the bias table. F/T + Payload calibrates **one pose at a time**: select a pose (click it or ◀ ▶; the blue ghost shows it, nothing moves), **Move & collect** goes to that pose only and samples it, then the next uncollected pose is selected. **Collect all poses** still does the whole set in one go (starts over, visits every pose in order, then evaluates). Skip any pose that is not safe; **Evaluate** fits from the poses collected so far (3 or more), **Start over** clears them. A bias change between poses is refused (Start over). The ghost is the target, not MoveIt's path. The F/T bias **survives a robot stack restart**: the broadcaster starts with no offset, and the GUI puts the last bias back by itself within a few seconds, once nothing uses the reading (logged; `ft_bias.auto_restore: false` turns this off). With a payload applied, **Admittance (and any F/T mode, so also a program's controller step and a policy that needs it) is refused** while the F/T bias does not match it: bias lost after a stack restart, no bias (raw), or the last zero was Zero all / taken before the payload was applied. Re-apply the bias or press Zero now. A zero taken with the tool on (bias ~ the tool weight) does not bend the fit: the constant bias is estimated linearly first, then calibration_math fits the rest; a large bias is a reminder to press Zero now after Apply, not a FAIL. The fit uses ~/franka_ros2's calibration_math when it is there, else the copy shipped in moveit_gui/vendor. **Zero now** keeps the payload loaded on the admittance controller in the reading and removes only the drift; **Zero all** zeroes the tool weight too (Admittance would then subtract it twice). A **Saved (kept across restarts)** block shows what survives a restart even when nothing was evaluated this session: the payload the GUI restores on the admittance controller (mass, CoG, when, and whether the controller differs), the last calibration file (`ft_payload/<profile>_<date>.json`: PASS/FAIL, mass, poses) and the last F/T bias (in use or not, how and when, restored when). Screenshots: `docs/ux/web_setup_payload_ghost.png`, `docs/ux/web_setup_payload_saved.png`. **Vial profiles** (SETUP › Vial): several named vials (centre of the bottom in base_link, radius, height), kept in `config_dir()/vials/<profile>.yaml`; **baseline** is built in (scraping.py's target_xyz, from the profile's `example_fixtures`). **Use** makes one the fixture programs use (`vial` by default, or e.g. `vial_2` via *Use as*; refused while a program runs); add one typed, from the touched rim (*Save as vial profile…*) or from the current fixture. Screenshot: `docs/ux/web_setup_vial_profiles.png`. An untaught fixture is one preflight line saying what to do. TCPs (set active; **create / edit / delete virtual TCPs** as an offset from a TCP or link), Vial Geometry, **Keep-out zones** (named boxes MoveIt plans around: list with enable / edit / delete, form for name, frame (base or a fixture such as `vial`), size, centre, rotation, **Under TCP** helper, Re-apply; applied to MoveIt's planning scene as `gui_keepout/<name>` at startup, on every change, when move_group comes back and when a fixture they hang on moves; a box around the current TCP / flange / base is refused; stored in `~/.config/moveit_gui/calibrations/<profile>.keepout.yaml`; drawn red in the 3D views with a **Zones** toggle; apply result on DIAGNOSTICS › State), F/T + Payload (Apply to admittance: set, read back and saved), **Controller gains** (see below), **Drivers & cameras** (start / stop camera drivers and pipelines, live picture, log; see below) |
 | DIAGNOSTICS | controllers, state, **recording** (rosbag2/MCAP, see below), **run history**, **activity** (see below), log with filter, "problems only" and download |
 
 Still desktop-only: pivot calibration of TCPs, the fixture wizard, the detailed control-stack
@@ -149,12 +169,17 @@ red button named after it.
   Switch, Freedrive), **Gripper** (status chip; Reactivate only appears with a fault; **⟳ Reconnect gripper** appears when the gripper is not connected: the Robotiq gets its power from the robot's tool flange, so if the stack started while the robot was powered off its hardware failed to configure and its controllers never started. With the robot powered on, Reconnect activates the `robotiq_2f85` hardware and loads / configures / starts the four gripper controllers, the same as the launch does; parts that are already up are left alone. Refused while the robot is powered off. Screenshot: `docs/ux/web_operate_gripper_reconnect.png`), **Joints**.
 * A plan is shown only while it can still be executed: running any other motion, or the arm moving away from the
   plan's start (program, jog, pendant), drops it and its preview. **▶ Execute plan** sits right under Plan / MoveJ.
+* A saved pose picked in the Joints tab shows as a **ghost arm** in the 3D view before you move. It stays while
+  the fields hold that pose, gives way to a plan preview, and goes when the arm gets there, after the MoveJ, or on
+  Use current.
+* A Position hold-to-jog runs on its own controller (the hidden `servo_position` mode) and switches back on release.
+  Arm control keeps showing Position meanwhile and offers no switch. If switching back fails, the real mode shows.
 * PENDANT SPEED in the header is the UR speed slider. The driver publishes it in percent; it was shown ×100
   (100 % read "10000%").
 * **Layouts** (`static/views.js`). Layout **1 Main** is the page above and is fixed: Manual, F/T sensor and its
   chart on the left, the 3D view in the middle, the robot cards on the right. Nothing in it moves or resizes.
   In every layout, **−** in a card's title folds it to its title. The chart's own button moves it under the 3D view
-  and back (kept per browser). Make your own layouts in SETUP › Layouts (New, Duplicate, rename, Edit, Delete). Two ready-made ones
+  and back (kept per browser). Make your own layouts in SETTINGS › Layouts (New, Duplicate, rename, Edit, Delete). Two ready-made ones
   come with it: **2 Force** (chart, one camera, Gripper minimised) and **3 Cameras** (two cameras under the
   3D view).
   * With two or more layouts, their numbers show in the left menu under OPERATE (only on OPERATE) to switch. In your
@@ -220,7 +245,7 @@ Screenshots: `docs/ux/web_operate_v24_running.png`, `docs/ux/web_operate_v24_pow
   request to dashboard server. Are you connected to the Dashboard Server?"). The GUI now reconnects it (quit,
   connect, retry once) when a command or the 3 s poll finds it lost.
 
-## Controller gains (SETUP › Controller gains)
+## Controller gains (SETUP › Gains)
 
 One table per mode that the profile lists under `gains:` (UR7e: Admittance and Impedance). The values are read from
 the running controller node (`/admittance_controller`, `/cartesian_impedance_controller`). Edited cells are
@@ -283,19 +308,34 @@ tab's Place says, at the selected step.
 - **Waypoints**: every **Mark** adds a waypoint and a move to it (MoveL, MoveJ or MoveJ to pose, picked before
   Record). With **Mark when still 1 s** it also marks by itself when the arm has stood still for about a second
   after moving (not at the start). Each mark is one ordinary edit: Undo takes it back. **Finish** ends teaching.
-- **Path**: the TCP pose is sampled 20 times a second while you move the arm (at most 10 minutes). **Finish** turns
-  the motion into a few points: no sample of the taught path is further than the **Tolerance** (mm, and degrees of
-  tool rotation) from the straight MoveL line between two points, and the panel shows the point count and the
-  largest deviation. The 3D view shows the taught motion (blue) and the points (grey). Change the tolerance to get
-  fewer or more points. **Insert** adds a folder "Taught path HH:MM": first a MoveJ to pose to the start of the
-  path, then one MoveL per point. **Max mm/s** sets the MoveL speed (suggested: your average speed while moving;
-  empty: no limit). **Discard** throws the path away.
-- **Press N** (path, optional): replay the path pressing on the surface with this force. The folder then switches to
-  Admittance, goes to 10 mm before the start, moves until contact, applies the force (along the tool's Z or straight
-  down), follows the path, lets go, backs off 10 mm and goes back to the default mode. The force is limited by the
-  profile's `max_force_n`.
+- **Path**: while you move the arm the joint states are recorded about every 10 ms, with their time stamps (and
+  the TCP pose 20 times a second, for the view; at most 10 minutes). **Finish** shows the taught motion in the 3D
+  view (blue). **Insert as** then offers:
+  - **Replay (as taught)**, the default: one **Replay** step that runs the recorded joint motion back as it was
+    moved, with its timing (**Speed %** of the taught timing, 100 = as taught; the GUI speed scales it too). The
+    samples are smoothed a little (20 ms) against time-stamp jitter, the standstill before and after the motion is
+    cut off, and samples are left out only where every recorded sample stays within 0.03° per joint of the replayed
+    line, so pauses keep their length. The points are stored in the step (`points: [[t, q1..q6], ...]`, s and rad).
+    When it runs, the arm first goes to the first point with an ordinary planned MoveJ (the step's MoveJ %), then
+    the whole motion is sent as one trajectory to the active mode's controller, the same way a planned move is.
+    Before anything moves it is refused if a point leaves the URDF joint limits or the TCP or a joint origin enters
+    an enabled keep-out zone (the same check runs again when the step starts). If the motion would exceed a joint
+    speed (URDF) or acceleration limit (`moveit.joint_accel_limit_rad_s2`), it is slowed down as a whole until it
+    does not, and the log says by how much. STOP stops it; Pause stops it and Resume carries on from about where it
+    stopped (a short MoveJ back onto the path first). The 3D preview draws the replayed TCP path from the joints.
+  - **MoveL points**: the path as a few points: no TCP sample is further than the **Tolerance** (mm, and degrees
+    of tool rotation) from the straight MoveL line between two points (the panel shows the point count and the
+    largest deviation; the grey markers). Insert adds a folder "Taught path HH:MM": a MoveJ to pose to the start,
+    then one MoveL per point. **Max mm/s** sets the MoveL speed (suggested: your average speed while moving; empty:
+    no limit). This is what taught paths were before Replay existed; such programs load and run unchanged.
 
-Replay is a normal program run, with the usual checks.
+  **Discard** throws the path away.
+- **Press N** (MoveL points only, optional): replay the path pressing on the surface with this force. The folder
+  then switches to Admittance, goes to 10 mm before the start, moves until contact, applies the force (along the
+  tool's Z or straight down), follows the path, lets go, backs off 10 mm and goes back to the default mode. The force
+  is limited by the profile's `max_force_n`.
+
+A taught path runs as a normal program run, with the usual checks.
 
 ## Batch runs (PROGRAMS › Batch)
 
@@ -357,8 +397,8 @@ a program); **Load saved** reads it back.
   cycles; after: under 2 mm.
 * **Typed waypoints**: the editor of a MoveJ / Move to pose step shows its waypoint's numbers as fields (joints in
   degrees; or frame + XYZ mm + RPY ° of the TCP, e.g. in the vial frame) and a **Go to** list to point the step at
-  another waypoint (e.g. back to `home`). Teaching (Set waypoint here) still works.
-* The run bar shows the **loop iteration** ("Loop 9 · 3 / 37") and how many steps were skipped.
+  another waypoint (e.g. back to `up`). Teaching (Set waypoint here) still works.
+* The run controls in the PROGRAMS toolbar (state chip, **Run**, **Pause**, **Stop**, and a **⋯** menu with Step, From selected and Loop) show the **loop iteration** ("Loop 9 · 3 / 37") and how many steps were skipped.
 * **3D preview** beside the program: the TCP path of the whole program from where the robot is now, loops and
   relative moves included (kinematics from the URDF; no planning, no forces: Move until contact stops at the wall / floor of a
   vial of known size, else it is drawn to its full distance), and the waypoints.
@@ -369,14 +409,20 @@ a program); **Load saved** reads it back.
 * `programs/example_vial_scrape_speed.yaml` is that baseline with a set TCP speed on every straight move: to the rim
   15 mm/s, scrape down 5 mm/s, back up and orbit 15 mm/s, final lift 30 mm/s.
 * `programs/example_rbf_scrape_speed.yaml` scrapes a round-bottom flask (fixture `flask`, saved in SETUP › Flask)
-  top to bottom, like the vial: 12 strokes 30° apart, each from 17° down to 6° from the bottom, with 3 N along the
-  tool. Down the wall 5 mm/s; into the neck, between strokes and out 15 mm/s. Its poses fit a 250 ml flask
-  and a straight spatula; for another flask or tool, use Make program in SETUP › Flask.
+  like the vial: 24 strokes 15° apart all the way round, each following the round wall from 75° (as high as a
+  straight tool reaches through its 40 mm neck) down to the bottom in 5° steps; per stroke: onto the wall, press 3 N, scrape
+  down, release, out. The press is along the wall's normal at each point, so it follows the curve. Onto and down the
+  wall 5 mm/s; into the neck, between strokes and out 15 mm/s. Its poses fit a flask with an 82 mm bulb and a 40 mm
+  bore, and a 300 mm straight spatula; for another flask or tool, use Make program in SETUP › Flask.
+  Until a flask is saved, the PROGRAMS preview shows it on the profile's example flask (`example_fixtures: flask`,
+  500 mm out, 200 mm right of the example vial; preview only, never saved as the fixture).
+* The examples are copied into the programs folder on first start. A newer shipped version replaces a copy nobody
+  edited (`.examples.json` there keeps what was copied); an edited copy is kept.
 
 Screenshots: `docs/ux/web_programs_scrape_baseline.png`, `docs/ux/web_programs_force_step.png`,
 `docs/ux/web_programs_franka_baseline.png`, `docs/ux/web_programs_orbit_step.png`.
 
-## Force limit (SETUP › F/T + Payload)
+## Force limit (SETUP › F/T + payload)
 
 A soft and a hard limit on |F| (N) and |T| (Nm) of the F/T reading as the GUI shows it (after the bias), kept in
 `~/.config/moveit_gui/ft_limit.yaml` (`moveit_gui/ft_guard.py`). Off by default; only an Admin can change it.
@@ -393,7 +439,7 @@ Every F/T sample (about 500 Hz) is checked, on a 5-sample average so one noisy s
 * It is a GUI guard for scraping contacts, not a safety function. The robot's own limits and the e-stop stay the
   safety.
 
-## F/T bias (SETUP › F/T + Payload)
+## F/T bias (SETUP › F/T + payload)
 
 A software bias on the ATI reading. The ATI box is never biased (keep `ft_hardware_biasing:=false`). The GUI sets
 the `offset.*` parameters of `/ft/force_torque_sensor_broadcaster`. The broadcaster re-reads them every cycle and
@@ -487,18 +533,28 @@ For scraping inside a round-bottom flask. The page fits the flask from touches, 
 **Flask scrape** (Operator, same page): choose the tool (**Straight**: shaft radius and length; **Bent**: also the
 length and angle of the bent end; **Suggest bend** proposes a bend that passes the neck, fills it in and says which
 polar band it reaches and whether that covers your polar range),
-the TCP, the polar angles (0° = the bottom of the bulb), the **pattern** (**Top to bottom**, the default, like the
-vial scrape: one stroke per angle around, from the highest polar angle down to the lowest; **Rings**: round the axis
-from the bottom up), the heights (how many polar angles from min to max), the step around, the press depth (how far
-past the inner wall the tip aims), an optional force (N, along the tool, in the force mode) and the speed (mm/s,
-default 10, set on every linear move). The tool goes down the neck axis and pivots at the bottom of the neck (orange
-dot). **Check reach** shows the polar band where whole rings are reachable, how many poses are reachable and why the
+the TCP, the polar angles (0° = the bottom of the bulb), the points per stroke, the step around, the press depth
+(how far past the inner wall the tip aims), an optional force (N, in the force mode) and the speed (mm/s, default
+10, set on every linear move). The scrape is like the vial's: one stroke every step ° all the way round (360°), each
+following the wall from the highest polar angle down to the lowest, so Z goes down along the stroke. A straight
+tool's TCP X faces the wall at each angle and the force presses into the wall along its normal at each point (a
+force step before each move: mostly along the tool high up, straight down at the bottom); a bent tool's end points
+into the wall and the force is along +Z. **Pitch ° top / bottom** (straight tool): its tilt from vertical, toward
+the wall, at the top and the bottom of each stroke (linear in between; one value: the same all the way). Empty =
+automatic: the shaft passes through the middle of the neck (orange dot), which reaches highest; where that line
+is blocked, through the middle of the neck off the axis (the robot then moves the tool sideways and up / down
+through the neck, not only about one point). Only the spatula's end (up to 10 mm) may lie on the glass. Either way the neck
+(margin kept at both ends) and the glass are checked, and Check reach shows the poses they block in red. A bent tool
+pivots near the bottom of the neck. **Check reach** shows the polar band reached all the way round, how many poses are reachable and why the
 others are not, and draws them green / red in the 3D view. **Make program** builds the program (approach above the
-neck, down to the pivot, then per stroke or ring: in, press, scrape, release, back to the pivot; out) and opens it in PROGRAMS **unsaved**: review it, then save. It never
+neck, Zero F/T there, the force mode, down to the pivot, then per stroke: down the shaft line to 5 mm short of the
+wall, onto it, press, 0.5 s, scrape down, release, 0.25 s, back to the pivot; out) and opens it in PROGRAMS **unsaved**: review it, then save. It never
 runs it.
 
-**Straight-tool limit:** a straight tool must pass the neck, so it only reaches a small cap at the bottom: about
-10–17° from the bottom of a 250 ml flask through a 50 mm neck (wider shaft or longer neck = less). The rest of the
+**Straight-tool limit:** a straight tool must pass the neck, so it only reaches the lower part of the bulb. With
+an 82 mm bulb, 50 mm neck, 3 mm shaft radius and 1 mm margin it reaches from the bottom up to 37° through a 24 mm
+bore, 53° through 30 mm, 78° through 40 mm and 109° (past the widest point) through 60 mm: above that no straight
+line through the neck reaches the wall (a shorter neck reaches a little higher). The rest of the
 bulb needs a **bent tool**: its end goes in along the neck, then the tool tilts so the bent end reaches the side
 of the bulb. Check reach with a bent tool takes a few seconds. On the simulated robot, **Fake touches** puts touches on a 250 ml
 flask 5 cm below the TCP to try the page.
@@ -558,11 +614,11 @@ single-convex-hull behaviour.
   single-hull behaviour. The same collision geometry goes live in MoveIt and into the generated URDF.
 * **Visual / Collision** (bottom right of every 3D view): show the robot's visual meshes, its collision shapes
   (translucent green: what MoveIt checks, robot links and parts), or both. Every 3D view follows the choice.
-* A new tool changes the payload: redo SETUP › F/T + Payload.
+* A new tool changes the payload: redo SETUP › F/T + payload.
 
 Screenshot: `docs/ux/web_setup_parts.png`.
 
-**Camera calibration** (SETUP › Camera calibration): hand-eye with a ChArUco board (7×5 squares, 35 / 26 mm,
+**Camera calibration** (SETUP › Camera): hand-eye with a ChArUco board (7×5 squares, 35 / 26 mm,
 DICT_5X5_100 by default; **Print board…** opens it at true size; print at 100 %, measure a square, enter it, *Save
 board*). Eye-in-hand (camera on the tool, board still in the cell: gives flange → camera) or eye-to-hand (camera on
 a stand, board on the tool: gives base → camera).
@@ -589,7 +645,7 @@ Screenshot: `docs/ux/web_setup_handeye.png`.
 **Robot** (SETUP › Setups › **Hardware…**): one pop-up for the whole robot: **1. Robot arm** (Real or Fake, and the
 robot's IP), **2. Gripper**, **3. Force/torque sensor** (and its IP), **4. ROS 2** (the domain ID, and **Lab network** or **This PC only**:
 whether ROS 2 programs on other PCs see the robot's topics), **5. Cameras** (tick to add a RealSense, ZED or
-USB camera; edit or remove them in SETUP › Drivers & cameras). The first time someone takes control on a PC where
+USB camera; edit or remove them in SETUP › Cameras). The first time someone takes control on a PC where
 nothing is set up yet, it opens by itself (*Later* asks again next time). What is not ready on this PC is greyed out
 with what is missing (e.g. the Franka image not built on this PC, or a camera whose ROS package is not in the image).
 The arms: **UR7e** (Robotiq 2F-85 and/or ATI F/T) and **Franka FR3** (Franka Hand and/or ATI F/T; the
@@ -646,7 +702,7 @@ selecting it shows the live picture, its topics (green = publishing) and the log
   and *Pictures sent* full, half or quarter size. A mode the camera does not have is refused on Save where known.
   The Set up pop-up adds a camera type only once; add a second camera of a type here, with its serial number.
 - **In OPERATE**: the **Camera drivers** window lists the same drivers with Start / Stop (layout 3, Cameras, has
-  it; add it to any layout in SETUP › Layouts › Edit). Camera windows show the cameras that publish first. Each camera window has a picture setting: Low (640 px,
+  it; add it to any layout in SETTINGS › Layouts › Edit). Camera windows show the cameras that publish first. Each camera window has a picture setting: Low (640 px,
   10 fps, the default), Med (960 px, 15 fps) or High (1280 px, 30 fps; more data over the network).
 - Stop sends Ctrl-C (SIGINT), then SIGTERM after 8 s, then SIGKILL. A GUI-only restart leaves the drivers running
   (the new GUI takes them over); closing the GUI or restarting the robot stack stops them.
@@ -694,3 +750,9 @@ by kind, updates by itself, and nobody can edit it from the GUI. It is kept in
 `~/.config/moveit_gui/activity/activity.jsonl`; at 2 MB the file is renamed to `activity.jsonl.1` (the old `.1` is
 dropped). No control tokens or browser ids are written, only the public user id. A STOP or a recording stop from a
 browser without control is named by its typed name (STOP) or as "someone without control" (recording stop).
+
+* **SETTINGS** (next to SETUP) holds the GUI itself: Layouts, Profiles and Roles. Profiles lists the profiles, makes a new one,
+  deletes an empty one, and copies another profile's screen layout into yours (the page reloads). The profile picker only
+  picks or creates a profile. SETUP keeps the robot: Setups, Parts, TCPs; Calibration (Camera, F/T + payload, Vial, Flask);
+  Cell (Cameras, Keep-out zones, Gains).
+* The named pose "home" is now "up". Programs that say "home" still work (either name finds the pose saved under the other).

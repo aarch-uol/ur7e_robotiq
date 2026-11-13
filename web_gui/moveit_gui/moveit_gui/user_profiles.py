@@ -1,11 +1,13 @@
-"""Profiles: one per person (Cenk, Ayesha, ...), so everyone keeps their own setups and screen layout.
+"""Profiles: one per person, so everyone keeps their own setups and screen layout.
 
     config_dir()/profiles/<name>/setups/<setup>/   that person's setups (setups.py: parts, TCPs, calibrations, ...)
     config_dir()/profiles/<name>/prefs.json        the browser layout: OPERATE panels, 3D view options, ...
 
-The setups saved before profiles existed stay in config_dir()/setups/ and show as "Shared". The robot runs one set of
-files whoever is using it: a profile only says where a setup is kept. A setup or a layout can be copied from another
-profile.
+    config_dir()/profiles/<name>/live/             that person's own settings (worksets.py: the robot runs the
+                                                   settings of the one in control)
+
+The setups saved before profiles existed stay in config_dir()/setups/ and show as "Shared". A setup or a layout can
+be copied from another profile; nobody changes another person's.
 """
 from __future__ import annotations
 
@@ -17,7 +19,8 @@ from typing import Dict, List
 
 NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,23}$")
 # the browser settings a profile keeps (localStorage keys of the web GUI); the rest stay per browser
-PREF_KEYS = ("op-layouts1", "op-joints", "pg-jog-open", "pg-path", "v3-frames", "v3-pose", "v3-show", "v3-zones")
+PREF_KEYS = ("ftchart", "op-layouts1", "op-joints", "pg-jog-open", "pg-path", "v3-frames", "v3-pose", "v3-show",
+             "v3-zones")
 PREFS_MAX = 256 * 1024
 
 
@@ -42,7 +45,7 @@ class Profiles:
             return False
 
     def find(self, name: str) -> str:
-        """The profile's name as stored (names are matched without case: "cenk" finds "Cenk")."""
+        """The profile's name as stored (names are matched without case: "alex" finds "Alex")."""
         name = str(name or "").strip()
         for n in self.names():
             if n.lower() == name.lower():

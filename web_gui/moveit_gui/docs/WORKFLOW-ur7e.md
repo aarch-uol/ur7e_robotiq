@@ -8,13 +8,13 @@ inference.
 
 | FR3 script | GUI |
 |---|---|
-| `estimation.py`: low impedance, Enter ×3 on the rim | SETUP › Vial Geometry: **Freedrive**, then **Capture** ×3 |
+| `estimation.py`: low impedance, Enter ×3 on the rim | SETUP › Vial: **Freedrive**, then **Capture** ×3 |
 | `circle_from_points`, bottom = lowest point | the same maths (`geometry_calibration.estimate_vial`), saved as fixture `vial` |
 | `target_xyz`, `vial_radius`, `vial_height` parameters | the `vial` fixture and one taught contact pose |
 | `_create_scrape_quat_xyzw`: RPY constants for `fr3_hand_tcp` | none: the taught pose is turned about the vial axis |
 | `ANGLE_STEP_DEGREES = 10`, forward + inverted pass | **Angle step**, **Angles** and **Then sweep back** |
 | `_run_policy_at_angle`: policy for `policy_duration` | a `policy` step (it runs the runner for `duration` seconds) |
-| `ft_sensor_calibration` | SETUP › F/T + Payload, then **Apply to admittance** |
+| `ft_sensor_calibration` | SETUP › F/T + payload, then **Apply to admittance** |
 
 ## 0. Start
 
@@ -34,7 +34,7 @@ the next switch to Admittance brings it back.
 Select or create the TCP of the tool that touches the vial (for example `spatula_tip`), then click **Set active**.
 Every pose you record is stored *with* its TCP, so record with the TCP you will scrape with.
 
-## 2. Payload, mass and CoG (once per tool): SETUP › F/T + Payload
+## 2. Payload, mass and CoG (once per tool): SETUP › F/T + payload
 1. Switch to **Position** mode, and check that the seven poses are clear of the cell.
 2. Click **▶ Collect all poses**. The arm visits each pose, settles, and averages the ATI readings.
 3. Read the result: it should say PASS. Mass and CoG are fitted in `ft_fts_link` by `calibration_math`.
@@ -45,10 +45,10 @@ Every pose you record is stored *with* its TCP, so record with the TCP you will 
    - The values last until the controller restarts. To keep them, use **Copy YAML** and paste the snippet into
      `gravity_compensation:` in `ur_controllers_gui.yaml` (and `ur_controllers_admittance.yaml`).
    - The controller has no offset term. Keep `ft_hardware_biasing:=false` (the default), and do not re-zero
-     the ATI after calibrating. The software F/T bias (web SETUP › F/T + Payload) must stay as it was while
+     the ATI after calibrating. The software F/T bias (web SETUP › F/T + payload) must stay as it was while
      the poses were collected; the GUI refuses to apply a fit after it changed.
 
-## 3. Vial, every time it moves: SETUP › Vial Geometry
+## 3. Vial, every time it moves: SETUP › Vial
 1. Click **Freedrive** and drag the tool tip to the rim.
 2. Click **Capture** for Rim 1, then do the same for Rim 2 and Rim 3. Spread the points around the rim; more
    than 90° apart is best.
@@ -66,7 +66,7 @@ the robot is idle.
    covers the table (e.g. 1200 × 800 × 20 mm), click **Under TCP** (centre under the TCP, top face 5 mm below
    it), then **Save box**. Keep the top a few mm below the robot base: a box that contains the TCP, the flange
    or the base origin is refused, because MoveIt would start in collision and every plan would fail.
-2. **Vial holder**: after SETUP › Vial Geometry, choose frame `vial` (origin at the vial bottom centre) and enter
+2. **Vial holder**: after SETUP › Vial, choose frame `vial` (origin at the vial bottom centre) and enter
    the holder size and centre in that frame, e.g. 120 × 90 × 60 mm at 0, 0, 30 mm. When the vial is re-taught,
    the box moves with it automatically.
 3. Check the status line: **✓ MoveIt: n box(es) in MoveIt's planning scene** means move_group was read back and

@@ -8,6 +8,6 @@ steps:
   - {type: controller, mode: position}
   - {type: movej, target: ready, velocity: 0.2}
   - {type: controller, mode: admittance}
-  - {type: movej, target: home, velocity: 0.05}
+  - {type: movej, target: up, velocity: 0.05}
   - {type: controller, mode: position}
   - {type: movej, target: ready, velocity: 0.2}

@@ -249,19 +249,30 @@ def make_tool(d: Optional[dict], tcp: str):
 
 
 # ------------------------------------------------------- reach and program
-def scrape_args(theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0, press_mm=0.5, margin_mm=1.0,
-                pattern="down") -> dict:
+def scrape_args(theta_min_deg=0.0, theta_max_deg=15.0, rings=6, step_deg=15.0, press_mm=0.5, margin_mm=1.0,
+                pattern="down", pitch_top_deg=None, pitch_bottom_deg=None) -> dict:
     try:
         out = {"theta_min_deg": float(theta_min_deg), "theta_max_deg": float(theta_max_deg),
                "rings": int(rings), "step_deg": float(step_deg), "press_depth_mm": float(press_mm),
                "margin_m": float(margin_mm) / 1000.0}
     except (TypeError, ValueError):
-        raise FlaskSetupError("the scrape needs numbers: angles, rings, step, press depth") from None
+        raise FlaskSetupError("the scrape needs numbers: angles, points per stroke, step, press depth") from None
     if out["rings"] > 50 or out["step_deg"] < 1.0:
-        raise FlaskSetupError("at most 50 rings and a step of 1° or more")
+        raise FlaskSetupError("at most 50 points per stroke and a step of 1° or more")
     if pattern not in fs.PATTERNS:
         raise FlaskSetupError(f"the pattern is one of {', '.join(fs.PATTERNS)}, not '{pattern}'")
     out["pattern"] = pattern
+    # the straight tool's tilt from vertical at the top / bottom of a stroke; empty = automatic (one given: both)
+    vals = [None if v in (None, "") else v for v in (pitch_top_deg, pitch_bottom_deg)]
+    try:
+        vals = [None if v is None else float(v) for v in vals]
+    except (TypeError, ValueError):
+        raise FlaskSetupError("pitch: degrees from vertical, or empty for automatic") from None
+    if vals[0] is None and vals[1] is None:
+        out["pitch_deg"] = None
+    else:
+        top, bottom = (vals[0] if vals[0] is not None else vals[1]), (vals[1] if vals[1] is not None else vals[0])
+        out["pitch_deg"] = top if top == bottom else (top, bottom)
     return out
 
 

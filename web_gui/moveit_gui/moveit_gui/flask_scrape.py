@@ -22,6 +22,7 @@ from . import transforms as tf
 from .flask_geometry import FlaskGeometry, T_base_flask
 from .geometry import PoseSpec
 from .program import Program, ProgramWaypoint, Step
+from .scrape_pattern import PRESS_AXES
 
 
 class FlaskScrapeError(ValueError):
@@ -103,6 +104,11 @@ class BendSuggestion:
 
 
 PATTERNS = ("down", "rings")      # down: strokes from high on the wall to the bottom, like the vial scrape
+# x: a straight tool's TCP X faces the wall (pressed along +X, as in the vial scrape); a bent tool's end can only
+# point into the wall, so it takes normal. normal / tangent: the tool end against the wall.
+CONTACTS = ("x", "normal", "tangent")
+CONTACT_M = 0.010                 # the most of a straight tool's end that may lie against the wall at the contact
+NEAR_M = 0.005                    # a straight tool comes in along its shaft to this far from the wall, then onto it
 
 
 @dataclass
@@ -112,6 +118,7 @@ class ScrapePose:
     theta_deg: float
     azimuth_deg: float
     pose: PoseSpec
+    pivot: Optional[np.ndarray] = None   # where this pose's shaft crosses the middle of the neck (None: the plan's)
 
 
 @dataclass
@@ -151,7 +158,7 @@ class FlaskScrape:
     margin_mm: float = 1.0
     pivot_depth_m: Optional[float] = None
     reference_orientation: Optional[np.ndarray] = None
-    contact_preference: str = "normal"
+    contact_preference: str = "x"
     pattern: str = "down"
 
     def generate(self) -> ScrapePlan:
@@ -169,6 +176,11 @@ def _flask_values(g: FlaskGeometry) -> tuple[np.ndarray, np.ndarray, float, floa
     return T, rim, g.neck_join_height, float(rim[2])
 
 
+def _inner_join(g: FlaskGeometry) -> float:
+    """Height where the neck bore meets the inside of the bulb: below it the inside is the sphere, above it the bore."""
+    return math.sqrt(max(0.0, g.R_inner ** 2 - min(g.neck_inner_radius, g.R_inner) ** 2))
+
+
 def pivot_point(geometry: FlaskGeometry, pivot_depth_m: Optional[float] = None) -> np.ndarray:
     """Pivot in ``flask``; default is the bulb-side end of the neck."""
     _, rim, join, rim_z = _flask_values(geometry)
@@ -182,9 +194,15 @@ def pivot_point(geometry: FlaskGeometry, pivot_depth_m: Optional[float] = None) 
 
 def _tool_pivot(geometry: FlaskGeometry, tool: ToolModel,
                 pivot_depth_m: Optional[float]) -> np.ndarray:
-    # Put the RCM near the bulb while retaining a short constrained neck span.
+    # Bent tool: the RCM near the bulb while retaining a short constrained neck span.
+    # Straight tool: halfway along the bore. A line through the middle of the neck can tilt twice as far as one
+    # through its bottom end before it touches the bore (the bottom end on one side, the rim on the other), so the
+    # tip reaches much higher up the bulb, and every less tilted line keeps the same clearance at both ends.
     if pivot_depth_m is None and isinstance(tool, BentTool):
         pivot_depth_m = 0.90 * geometry.neck_length
+    elif pivot_depth_m is None:
+        _, _, _, rim_z = _flask_values(geometry)
+        pivot_depth_m = 0.5 * (rim_z - _inner_join(geometry))
     return pivot_point(geometry, pivot_depth_m)
 
 
@@ -251,7 +269,8 @@ def _bent_parts(T: np.ndarray, tool: BentTool):
 
 def _neck_clearance(elbow: np.ndarray, axis: np.ndarray, geometry: FlaskGeometry,
                     tool: ToolModel, margin: float) -> Optional[str]:
-    _, rim, join_z, rim_z = _flask_values(geometry)
+    _, rim, _, rim_z = _flask_values(geometry)
+    join_z = _inner_join(geometry)           # the bore goes down to where it meets the inside of the bulb
     if abs(float(axis[2])) < 1e-9:
         return "The shaft cannot pass up through the neck."
     s_join = (elbow[2] - join_z) / axis[2]
@@ -311,12 +330,16 @@ def clearance_reason(T_flask_tcp: np.ndarray, geometry: FlaskGeometry, tool: Too
     reason = _neck_clearance(elbow, axis, geometry, tool, margin_m)
     if reason:
         return reason
-    _, _, join_z, _ = _flask_values(geometry)
-    s_open = max(0.0, (elbow[2] - join_z) / axis[2])
+    s_open = max(0.0, (elbow[2] - _inner_join(geometry)) / axis[2])
     sphere_limit = geometry.R_inner + max(0.0, press_depth_m)
     shaft_start = elbow
     if isinstance(tool, StraightTool):
-        shaft_start = elbow - min(tool.shaft_radius, s_open) * axis
+        # the end of the shaft is what touches the wall: at a shallow angle to the wall its round side meets the
+        # glass over r / tan(angle) from the tip too. That is the contact, not a collision (at most 10 mm of it).
+        n = tip / max(float(np.linalg.norm(tip)), 1e-9)
+        slope = abs(float(axis @ n))
+        touch = tool.shaft_radius * (1.0 + math.sqrt(max(0.0, 1.0 - slope * slope)) / max(slope, 1e-3))
+        shaft_start = elbow - min(touch, CONTACT_M, s_open) * axis
     if s_open > 1e-9 and not _segment_inside(
             shaft_start, elbow - s_open * axis, tool.shaft_radius, sphere_limit):
         return "The shaft touches the bulb wall away from the tip."
@@ -328,6 +351,16 @@ def clearance_reason(T_flask_tcp: np.ndarray, geometry: FlaskGeometry, tool: Too
 
 
 check_clearance = clearance_reason
+
+
+def _facing_wall(z: np.ndarray, wall: np.ndarray) -> Optional[np.ndarray]:
+    """Rotation with tool Z along ``z`` and X toward ``wall`` (made perpendicular to Z)."""
+    z = z / np.linalg.norm(z)
+    x = wall - z * float(wall @ z)
+    if np.linalg.norm(x) < 1e-9:
+        return None
+    x /= np.linalg.norm(x)
+    return np.column_stack((x, np.cross(z, x), z))
 
 
 def _bent_orientations(target: np.ndarray, normal: np.ndarray, pivot: np.ndarray,
@@ -364,17 +397,59 @@ def _bent_orientations(target: np.ndarray, normal: np.ndarray, pivot: np.ndarray
         y /= np.linalg.norm(y)
         R = np.column_stack((x, y, end))
         contact = float(end @ normal)
-        contact_cost = -contact if preference == "normal" else abs(contact)
+        contact_cost = abs(contact) if preference == "tangent" else -contact
         continuity = 3.0 - float(np.trace(reference.T @ R))
         candidates.append((contact_cost, continuity, roll, R))
     candidates.sort(key=lambda item: item[:3])
     return [item[3] for item in candidates]
 
 
-def _target_pose(target, normal, pivot, tool, reference, preference, geometry, margin, press):
+def _pitched(target, wall, pitch_deg, geometry):
+    """A straight tool tilted pitch_deg from the neck axis toward the wall (tip outward), and where its shaft line
+    crosses the middle of the neck: that point is its pivot."""
+    p = math.radians(pitch_deg)
+    direction = np.array([math.sin(p) * wall[0], math.sin(p) * wall[1], -math.cos(p)])
+    mid = float(_tool_pivot(geometry, StraightTool("x", 1e-3, 1.0), None)[2])
+    s = (mid - float(target[2])) / math.cos(p)
+    return target - s * direction
+
+
+def _offsets(geometry: FlaskGeometry, tool: ToolModel, margin_m: float, step: float = 0.0005):
+    """Where else a straight shaft may cross the middle of the neck, along the stroke's azimuth (m from the axis,
+    + toward the wall), nearest the axis first."""
+    room = geometry.neck_inner_radius - margin_m - tool.shaft_radius
+    out = []
+    k = 1
+    while k * step <= room:
+        out += [k * step, -k * step]
+        k += 1
+    return out
+
+
+def pitch_at(pitch, theta_deg, theta_min, theta_max) -> Optional[float]:
+    """The tilt from vertical (deg) at polar angle theta: one value, or (at the top, at the bottom) of the range
+    theta_max..theta_min, linear in between. None: automatic (the shaft through the middle of the neck)."""
+    if pitch is None:
+        return None
+    if isinstance(pitch, (int, float)):
+        return float(pitch)
+    top, bottom = (float(v) for v in pitch)
+    if theta_max - theta_min < 1e-9:
+        return top
+    f = (theta_deg - theta_min) / (theta_max - theta_min)
+    return bottom + f * (top - bottom)
+
+
+def _target_pose(target, normal, pivot, tool, reference, preference, geometry, margin, press, wall=None):
     if isinstance(tool, StraightTool):
         direction = target - pivot
-        candidates = [] if np.linalg.norm(direction) < 1e-9 else [_minimal_twist(direction, reference)]
+        R = None
+        if np.linalg.norm(direction) < 1e-9:
+            candidates = []
+        else:
+            if preference == "x" and wall is not None:
+                R = _facing_wall(direction, wall)
+            candidates = [R if R is not None else _minimal_twist(direction, reference)]
     else:
         candidates = _bent_orientations(target, normal, pivot, tool, reference, preference)
     if not candidates:
@@ -394,15 +469,24 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
                           step_deg: float, *, press_depth_mm: float = 0.0,
                           margin_m: float = 0.001, pivot_depth_m: Optional[float] = None,
                           reference_orientation: Optional[np.ndarray] = None,
-                          contact_preference: str = "normal", pattern: str = "down") -> ScrapePlan:
+                          contact_preference: str = "x", pattern: str = "down",
+                          pitch_deg=None, free_line: bool = True) -> ScrapePlan:
     """Generate the contact poses, ``rings`` polar angles from theta_min to theta_max, ``step_deg`` apart around.
 
-    ``down`` (default), like the vial scrape: one stroke per azimuth, from the highest polar angle down to the
-    lowest (toward the bottom), named stroke_<azimuth>_<level>. ``rings``: alternating rings around the axis from
-    the bottom up, named ring_<ring>_<index>.
+    ``down`` (default), like the vial scrape: one stroke per azimuth (0 to 360), each following the wall from the
+    highest polar angle down to the lowest, so Z goes down along the stroke; named stroke_<stroke>_<point>.
+    ``rings``: alternating rings around the axis from the bottom up, named ring_<ring>_<index>.
 
-    Normal contact is the default because it gives a predictable force and
-    avoids scraping on a tip edge. ``tangent`` is available for blade-like ends.
+    ``x`` (default): a straight tool's TCP X faces the wall at that azimuth (the outward horizontal made
+    perpendicular to the shaft), so a force along tool +X presses it on the wall, as in the vial scrape. A bent
+    tool's end can only point into the wall, so ``x`` is ``normal`` for it. ``normal``: the tool end along the wall
+    normal; ``tangent`` for blade-like ends.
+
+    ``pitch_deg`` (straight tool): the tool's tilt from the neck axis, leaning toward the wall: one value, or
+    (top, bottom) changing linearly down each stroke. None (default): automatic, the shaft through the middle of the
+    neck, and where that line is blocked (high up the bulb) a line crossing the middle of the neck off the axis,
+    nearest the axis first (``free_line``): the tool then moves sideways and up / down through the neck, not only
+    about one point. Either way the neck and the bulb are checked: a pose they block is unreachable, with the reason.
     """
     if not isinstance(tool, (StraightTool, BentTool)):
         raise FlaskScrapeError("tool must be a StraightTool or BentTool")
@@ -418,10 +502,16 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
         raise FlaskScrapeError("ring step must be in (0, 360] degrees")
     if press_depth_mm < 0.0 or margin_m < 0.0:
         raise FlaskScrapeError("press depth and clearance margin must be non-negative")
-    if contact_preference not in ("normal", "tangent"):
-        raise FlaskScrapeError("contact preference must be 'normal' or 'tangent'")
+    if contact_preference not in CONTACTS:
+        raise FlaskScrapeError(f"contact preference must be one of {', '.join(CONTACTS)}")
     if pattern not in PATTERNS:
         raise FlaskScrapeError(f"pattern must be one of {', '.join(PATTERNS)}")
+    if pitch_deg is not None:
+        if not isinstance(tool, StraightTool):
+            raise FlaskScrapeError("a pitch is for a straight tool (a bent tool's end sets its own angle)")
+        vals = [pitch_deg] if isinstance(pitch_deg, (int, float)) else list(pitch_deg)
+        if len(vals) not in (1, 2) or not all(math.isfinite(float(v)) and 0.0 <= float(v) < 80.0 for v in vals):
+            raise FlaskScrapeError("pitch: 0 to 80 degrees from vertical (one value, or top and bottom)")
     press = float(press_depth_mm) / 1000.0
     radius = geometry.R_inner + press
     pivot = _tool_pivot(geometry, tool, pivot_depth_m)
@@ -443,17 +533,32 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
             normal = np.array([math.sin(theta) * math.cos(phi),
                                math.sin(theta) * math.sin(phi), -math.cos(theta)])
             target = normal * radius
+            wall = np.array([math.cos(phi), math.sin(phi), 0.0])
+            tilt = pitch_at(pitch_deg, float(theta_deg), theta_min_deg, theta_max_deg)
+            here = pivot if tilt is None else _pitched(target, wall, tilt, geometry)
             if insertion:
                 T, reason = None, insertion
             else:
-                T, reason = _target_pose(target, normal, pivot, tool, previous,
-                                         contact_preference, geometry, margin_m, press)
+                T, reason = _target_pose(target, normal, here, tool, previous,
+                                         contact_preference, geometry, margin_m, press, wall)
+                if reason and tilt is None and isinstance(tool, StraightTool) and free_line:
+                    # the line through the middle of the neck is blocked: cross the middle of the neck off the axis
+                    # instead (the robot moves the tool sideways and up / down, not only about one point), nearest
+                    # the axis first
+                    for off in _offsets(geometry, tool, margin_m):
+                        cand = pivot + off * wall
+                        T2, r2 = _target_pose(target, normal, cand, tool, previous,
+                                              contact_preference, geometry, margin_m, press, wall)
+                        if r2 is None:
+                            T, reason, here = T2, None, cand
+                            break
             if reason:
                 unreachable.append(UnreachablePose(ring, float(theta_deg), float(azimuth_deg), reason))
                 continue
             pose = PoseSpec.from_T("flask", tool.tcp, T)
             name = f"{prefix}_{ring + 1:02d}_{index + 1:03d}"
-            reachable.append(ScrapePose(name, ring, float(theta_deg), float(azimuth_deg), pose))
+            reachable.append(ScrapePose(name, ring, float(theta_deg), float(azimuth_deg), pose,
+                                        None if here is pivot else here))
             previous = T[:3, :3]
     return ScrapePlan(reachable, unreachable, pivot, geometry, tool, margin_m, press, reference)
 
@@ -464,7 +569,7 @@ generate = generate_scrape_poses
 def reachable_band(geometry: FlaskGeometry, tool: ToolModel, *, margin_m: float = 0.001,
                    pivot_depth_m: Optional[float] = None, resolution_deg: float = 0.25,
                    azimuth_step_deg: float = 15.0,
-                   contact_preference: str = "normal") -> Optional[tuple[float, float]]:
+                   contact_preference: str = "x") -> Optional[tuple[float, float]]:
     """Largest polar band for which every sampled azimuth is reachable."""
     if resolution_deg <= 0.0 or azimuth_step_deg <= 0.0:
         raise FlaskScrapeError("band sampling steps must be positive")
@@ -542,6 +647,8 @@ def _insertion_pose(centre: np.ndarray, tool: ToolModel, reference: np.ndarray) 
 def _retracted_pose(target: ScrapePose, pivot: np.ndarray, tool: ToolModel,
                     geometry: FlaskGeometry) -> PoseSpec:
     T = target.pose.T()
+    if target.pivot is not None:
+        pivot = target.pivot
     if isinstance(tool, StraightTool):
         tip = pivot
     else:
@@ -558,9 +665,15 @@ def _retracted_pose(target: ScrapePose, pivot: np.ndarray, tool: ToolModel,
 def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
                   approach_m: float = 0.05, velocity: float = 0.05,
                   contact_velocity: float = 0.02, force_n: Optional[float] = None,
-                  motion_mode: str = "position", force_mode: str = "admittance") -> Program:
+                  motion_mode: str = "position", force_mode: str = "admittance",
+                  press_axis: Optional[str] = None) -> Program:
     """Build named flask waypoints, retracting through the safe pose per ring or stroke: in at the group's first
-    pose (the top of a stroke), scrape, back out at its last."""
+    pose (the top of a stroke), press ``force_n``, wait, scrape down, release, back out at its last.
+
+    The press, like the vial scrape's: ``press_axis`` "wall" (default for a straight tool) presses into the wall
+    along its normal at every point, so the force follows the curve (sideways high up, down at the bottom: a new
+    force step before each move). A fixed tool axis (+x, ..., default +z for a bent tool: the end into the wall)
+    is set once per group. With a force: F/T zeroed in free air above the neck, then the force mode."""
     plan = scrape.generate() if isinstance(scrape, FlaskScrape) else scrape
     if not isinstance(plan, ScrapePlan):
         raise FlaskScrapeError("build_program needs a ScrapePlan or FlaskScrape")
@@ -572,6 +685,20 @@ def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
         raise FlaskScrapeError("velocity scalings must be in (0, 1]")
     if force_n is not None and (not math.isfinite(force_n) or force_n <= 0.0):
         raise FlaskScrapeError("scrape force must be positive")
+    if press_axis is None:
+        press_axis = "+z" if isinstance(plan.tool, BentTool) else "wall"
+    if press_axis != "wall" and press_axis not in PRESS_AXES:
+        raise FlaskScrapeError(f"press axis is one of wall, {', '.join(PRESS_AXES)}")
+
+    def press(target: ScrapePose) -> Step:
+        if press_axis == "wall":           # the wall's outward normal at the contact, in the tool frame
+            T = target.pose.T()
+            n = T[:3, 3] / np.linalg.norm(T[:3, 3])
+            axis = T[:3, :3].T @ n
+        else:
+            axis = np.array(PRESS_AXES[press_axis], dtype=float)
+        return Step("force", {"wrench": [round(float(force_n) * float(v), 4) + 0.0 for v in axis] + [0.0, 0.0, 0.0],
+                              "frame": "tool", "wait": False})
     _, rim, _, rim_z = _flask_values(plan.geometry)
     reference = plan.reachable[0].pose.T()[:3, :3]
     safe_pose = _insertion_pose(plan.pivot, plan.tool, reference)
@@ -593,28 +720,37 @@ def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
             entry, pose=_retracted_pose(targets[0], plan.pivot, plan.tool, plan.geometry))
         waypoints[exit_name] = ProgramWaypoint(
             exit_name, pose=_retracted_pose(targets[-1], plan.pivot, plan.tool, plan.geometry))
-        rings.append((targets, entry, exit_name))
-    active_mode = force_mode if force_n is not None else motion_mode
+        near = ""
+        if isinstance(plan.tool, StraightTool):   # fast down the shaft to just short of the wall, then onto it slowly
+            near = f"{group}_near"
+            T = targets[0].pose.T()
+            via = targets[0].pivot if targets[0].pivot is not None else plan.pivot
+            back = min(NEAR_M, 0.5 * float(np.linalg.norm(T[:3, 3] - via)))
+            waypoints[near] = ProgramWaypoint(near, pose=PoseSpec.from_T(
+                "flask", plan.tool.tcp, tf.from_rotation(T[:3, :3], T[:3, 3] - back * T[:3, 2])))
+        rings.append((targets, entry, exit_name, near))
     steps = [Step("comment", {"text": "Round-bottom flask scrape"}),
-             Step("controller", {"mode": active_mode}),
+             Step("controller", {"mode": motion_mode}),
              Step("move_pose", {"target": "approach_neck", "cartesian": False,
-                                "velocity": velocity}),
-             Step("move_pose", {"target": "pivot_safe", "cartesian": True,
-                                "velocity": contact_velocity})]
-    force_active = False
-    for ring_index, (targets, entry, exit_name) in enumerate(rings):
+                                "velocity": velocity})]
+    if force_n is not None:
+        steps += [Step("zero_ft", {}), Step("controller", {"mode": force_mode})]
+    steps.append(Step("move_pose", {"target": "pivot_safe", "cartesian": True,
+                                    "velocity": contact_velocity}))
+    for ring_index, (targets, entry, exit_name, near) in enumerate(rings):
         steps.append(Step("move_pose", {"target": entry, "cartesian": True,
                                          "velocity": contact_velocity}))
-        for target in targets:
+        if near:
+            steps.append(Step("move_pose", {"target": near, "cartesian": True, "velocity": contact_velocity}))
+        for i, target in enumerate(targets):
+            if force_n is not None and i > 0 and press_axis == "wall":
+                steps.append(press(target))            # the normal where this move ends
             steps.append(Step("move_pose", {"target": target.name, "cartesian": True,
                                              "velocity": contact_velocity}))
-            if force_n is not None and not force_active:
-                steps.append(Step("force", {
-                    "wrench": [0.0, 0.0, float(force_n), 0.0, 0.0, 0.0], "frame": "tool"}))
-                force_active = True
-        if force_active:
-            steps.append(Step("force_off", {}))
-            force_active = False
+            if force_n is not None and i == 0:
+                steps += [press(target), Step("wait", {"seconds": 0.5})]
+        if force_n is not None:
+            steps += [Step("force_off", {}), Step("wait", {"seconds": 0.25})]
         steps.append(Step("move_pose", {"target": exit_name, "cartesian": True,
                                          "velocity": contact_velocity}))
         if ring_index + 1 < len(rings):
@@ -624,6 +760,6 @@ def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
                                      "velocity": contact_velocity}),
                   Step("move_pose", {"target": "approach_neck", "cartesian": True,
                                      "velocity": contact_velocity})])
-    if force_n is not None and force_mode != motion_mode:
+    if force_n is not None:
         steps.append(Step("controller", {"mode": motion_mode}))
     return Program(name=name, robot=robot, steps=steps, waypoints=waypoints)

@@ -149,7 +149,8 @@ export function ftChart(storage = globalThis.localStorage) {
   const root = el("details", { class: "card ft-chart", ontoggle: () => kick(true) },
     el("summary", { class: "section" }, "F/T chart"), body);
   if (saved.open !== false) root.open = true;
-  root.addEventListener("toggle", () => { try { storage.setItem("ftchart", JSON.stringify({ pick: [...pick], win, open: root.open })); } catch (e) { /* */ } });
+  let shown = root.open;                     // opening it here fires a toggle too: store only real changes
+  root.addEventListener("toggle", () => { if (root.open === shown) return; shown = root.open; try { storage.setItem("ftchart", JSON.stringify({ pick: [...pick], win, open: root.open })); } catch (e) { /* */ } });
 
   const visible = () => root.open && root.offsetParent !== null && !(globalThis.document && document.hidden);
   function kick(now) {

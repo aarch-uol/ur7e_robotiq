@@ -146,6 +146,14 @@ class ImageWatch:
     def set_limits(self, max_decode_hz: float, max_width: int):
         self._period, self.max_width = 1.0 / max_decode_hz, int(max_width)
 
+    def wants(self) -> bool:
+        """A frame now would be decoded. If not, it only counts for the rate (tick()): the caller can skip turning
+        the message into Python at all (megabytes per frame for a raw camera image)."""
+        return time.monotonic() - self._last_decode >= self._period
+
+    def tick(self):
+        self.stats.tick(time.monotonic())
+
     def on_image(self, encoding, width, height, step, data, is_bigendian=False, frame_id=""):
         now = time.monotonic()
         self.stats.tick(now)

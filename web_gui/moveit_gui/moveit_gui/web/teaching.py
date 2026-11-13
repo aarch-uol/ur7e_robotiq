@@ -14,11 +14,14 @@ import numpy as np
 from .. import cart_speed
 from .. import transforms as tf
 from ..geometry import PoseSpec
+from .. import replay
 from ..program import ProgramWaypoint, RunState, Step, path_label, walk
-from ..teach import Sampler, StillDetector, TaughtPath, TeachError, check_tolerances, suggested_speed
+from ..teach import (JOINT_HZ, MAX_JOINT_SAMPLES, SAMPLE_HZ, Sampler, StillDetector, TaughtPath, TeachError,
+                     check_tolerances, suggested_speed)
 
 MOVES = {"joints": "MoveJ", "pose": "MoveJ to pose", "linear": "MoveL"}
 MAX_PREVIEW_POINTS = 500
+INSERT_KINDS = ("replay", "movel")   # a path goes in as one Replay step (the motion as taught) or as MoveL points
 
 PRESS_LIFT_M = 0.010     # a pressed path starts and ends 10 mm off the surface
 
@@ -59,7 +62,8 @@ class TeachCommands:
     def cmd_teach_start(self, mode="waypoints", move="linear", frame=None, auto=False, path=None, where="after",
                         pos_tol_mm=1.0, rot_tol_deg=2.0):
         """Begin teaching. waypoints: Mark adds a waypoint + a move step (move: joints | pose | linear), auto=True
-        also marks when the arm stood still ~1 s after it moved. path: samples the TCP until Finish."""
+        also marks when the arm stood still ~1 s after it moved. path: samples the joints (100 Hz) and the TCP
+        (20 Hz) until Finish."""
         if self.teach is not None:
             raise self._err("already teaching: finish or cancel first")
         why = self._teach_refusal()
@@ -87,9 +91,31 @@ class TeachCommands:
              "t0": time.monotonic(), "start": start, "where": where if where in ("after", "before", "into") else "after",
              "anchor": None, "marks": 0, "names": [], "samples": [], "phase": "recording", "full": False,
              "error": "", "pos_tol_mm": pos_tol_mm, "rot_tol_deg": rot_tol_deg, "taught": None, "simp": None,
-             "sampler": None, "detector": None}
+             "sampler": None, "detector": None, "joints": [], "tf_missed": 0, "replay": None}
         if mode == "path":
-            s["sampler"] = Sampler(lambda: c.geo.current_T_base_tcp(tcp), lambda t, T: s["samples"].append((t, T)),
+            every, tick = max(1, int(round(JOINT_HZ / SAMPLE_HZ))), [0]
+
+            def get():                          # the joints every time, the TCP every 5th time (20 Hz)
+                n, tick[0] = tick[0], tick[0] + 1
+                js, T = self._teach_joint_sample(), None
+                if n % every == 0:
+                    try:
+                        T = np.asarray(c.geo.current_T_base_tcp(tcp), float)
+                    except Exception as e:          # noqa: BLE001 - TF late for a moment: that TCP sample is missed
+                        s["tf_missed"] += 1
+                        s["tf_error"] = str(e)
+                if js is None and T is None:
+                    raise TeachError("no fresh joint state")
+                return js, T
+
+            def on(t, x):
+                js, T = x
+                if T is not None:
+                    s["samples"].append((t, T))
+                if js is not None and (not s["joints"] or js[0] > s["joints"][-1][0]):
+                    s["joints"].append(js)
+
+            s["sampler"] = Sampler(get, on, hz=JOINT_HZ, max_samples=MAX_JOINT_SAMPLES,
                                    on_full=lambda: s.update(full=True))
         elif s["auto"]:
             det = StillDetector()
@@ -105,6 +131,18 @@ class TeachCommands:
                 f"waypoints ({MOVES[s['move']]}): move the arm, then Mark" + (" (or stand still 1 s)" if s["auto"] else ""))
         c.bridge.log(f"teach: {self.lease.name or 'operator'} started teaching {what}, {tcp} in {frame}")
         return self._ok(f"teaching {what}", teach=self.teach_view())
+
+    def _teach_joint_sample(self):
+        """(time stamp s, joints) of the last joint state, None when there is none or it is stale."""
+        b, c = self.core.bridge, self.core
+        age = b.joint_state_age() if hasattr(b, "joint_state_age") else None
+        if age is None or age > c.profile.joint_state_timeout_s:
+            return None
+        if hasattr(b, "joint_sample"):
+            got = b.joint_sample()
+            return None if got is None else (float(got[0]), [float(x) for x in got[1]])
+        snap = b.snapshot()
+        return (time.monotonic() - age, list(snap.joints)) if snap.joints else None
 
     def _teach_mark(self, s: dict):
         """One waypoint + move step at the arm's position now. The caller holds the edit lock."""
@@ -181,6 +219,10 @@ class TeachCommands:
                 raise self._err(str(e)) from None
             s["phase"] = "review"
             s["simp"] = s["taught"].simplify(s["pos_tol_mm"], s["rot_tol_deg"])
+            try:
+                s["replay"] = replay.from_recording(list(s["joints"]))
+            except replay.ReplayError as e:          # e.g. no joint states: only MoveL points then
+                s["replay"] = {"error": str(e)}
         v = self.teach_view()
         r = v["result"]
         return self._ok(f"{r['points']} points from {r['samples']} samples, max {r['max_mm']:.1f} mm / "
@@ -198,8 +240,11 @@ class TeachCommands:
         return self._ok(f"{len(s['simp'].keep)} points", teach=self.teach_view())
 
     def cmd_teach_insert(self, pos_tol_mm=None, rot_tol_deg=None, speed_mm_s=None, path=None, where="after",
-                         press_n=None, press_dir="tool"):
-        """Put the simplified path into the program: a folder with a MoveJ to pose to its start, then MoveL steps
+                         press_n=None, press_dir="tool", kind="replay", speed_pct=None):
+        """kind "replay" (default): one Replay step, the joint motion as taught (replay.py), speed_pct % of the
+        taught timing (100 = as taught).
+
+        kind "movel": the simplified path, a folder with a MoveJ to pose to its start, then MoveL steps
         (optional Max mm/s), waypoints taught_NNN in the teaching frame.
 
         press_n (N, optional): replay the path pressing with this force in a force mode (Admittance): switch to it,
@@ -209,6 +254,10 @@ class TeachCommands:
         if s["phase"] != "review":
             raise self._err("finish the recording first")
         self._editable()
+        if kind not in INSERT_KINDS:
+            raise self._err("insert the path as replay or movel")
+        if kind == "replay":
+            return self._teach_insert_replay(s, speed_mm_s, press_n, speed_pct, path, where)
         c = self.core
         if pos_tol_mm is not None or rot_tol_deg is not None:
             try:
@@ -269,6 +318,34 @@ class TeachCommands:
                      f"{s['simp'].max_deg:.1f}° off the taught path" + (f", {mm_s:g} mm/s" if mm_s else "") + ")")
         return self._reply(f"inserted the path: {n} points in folder {path_label(at)}", at)
 
+    def _teach_insert_replay(self, s: dict, speed_mm_s, press_n, speed_pct, path, where):
+        if press_n not in (None, "", 0):
+            raise self._err("pressing a path needs MoveL points (Insert as: MoveL points)")
+        if speed_mm_s not in (None, "", 0):
+            raise self._err("Max mm/s is for MoveL points: a replay keeps the taught timing (Speed %)")
+        rp = s["replay"] or {}
+        if "points" not in rp:
+            raise self._err(rp.get("error") or "no joint motion recorded")
+        try:
+            speed = 1.0 if speed_pct in (None, "") else float(speed_pct) / 100.0
+            if not replay.SPEED_RANGE[0] <= speed <= replay.SPEED_RANGE[1]:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise self._err(f"speed must be {replay.SPEED_RANGE[0] * 100:g}..{replay.SPEED_RANGE[1] * 100:g} %") from None
+        title = f"Taught path {time.strftime('%H:%M')}"
+        params = {"name": title, "velocity": 0.1}
+        if speed != 1.0:
+            params["speed"] = round(speed, 3)
+        params["points"] = rp["points"]
+        st = Step("replay", params)
+        at = self._insert_step(st, self._path(path) if path not in (None, []) else None, where)
+        n = len(rp["points"])
+        self._teach_end(f"inserted a replay of {n} points")
+        self.core.bridge.log(f"teach: path inserted as a replay at {path_label(at)}: {n} points from "
+                             f"{rp['samples']} joint samples, {rp['duration_s']:.1f} s")
+        return self._reply(f"inserted the path: replay of {n} points, {rp['duration_s']:.1f} s, at step "
+                           f"{path_label(at)}", at)
+
     def _press_plan(self, press_n, press_dir) -> Optional[dict]:
         """None (no force), or the force mode, force, direction and the mode to go back to after."""
         if press_n in (None, "", 0):
@@ -323,8 +400,8 @@ class TeachCommands:
         v = {"mode": s["mode"], "move": s["move"], "move_label": MOVES[s["move"]], "frame": s["frame"],
              "tcp": s["tcp"], "auto": s["auto"], "by": s["by"], "phase": s["phase"],
              "elapsed_s": round(time.monotonic() - s["t0"], 1), "samples": len(s["samples"]),
-             "missed": sp.missed if sp else 0, "marks": s["marks"], "last": s["names"][-1] if s["names"] else "",
-             "full": s["full"], "error": s["error"] or (sp.last_error if sp and sp.missed else ""),
+             "missed": (sp.missed if sp else 0) + s["tf_missed"], "joint_samples": len(s["joints"]), "marks": s["marks"], "last": s["names"][-1] if s["names"] else "",
+             "full": s["full"], "error": s["error"] or (sp.last_error if sp and sp.missed else "") or s.get("tf_error", ""),
              "pos_tol_mm": s["pos_tol_mm"], "rot_tol_deg": s["rot_tol_deg"], "result": None}
         if s["phase"] == "review" and s["simp"] is not None:
             tp, sm = s["taught"], s["simp"]
@@ -339,5 +416,7 @@ class TeachCommands:
             v["result"] = {"samples": len(tp), "points": len(sm.keep), "max_mm": round(sm.max_mm, 2),
                            "max_deg": round(sm.max_deg, 2), **st,
                            "speed_mm_s": suggested_speed(st["avg_mm_s"], self.core.profile.max_cart_speed_mm_s),
-                           "raw_mm": raw, "kept": kept}
+                           "raw_mm": raw, "kept": kept,
+                           "replay": {k: v for k, v in (s["replay"] or {}).items() if k != "points"}
+                           | ({"points": len(s["replay"]["points"])} if "points" in (s["replay"] or {}) else {})}
         return v

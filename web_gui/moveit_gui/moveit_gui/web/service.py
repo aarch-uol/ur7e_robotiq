@@ -21,6 +21,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import threading
 import time
 from collections import deque
@@ -51,7 +52,7 @@ from ..activity import KINDS as ACTIVITY_KINDS, ActivityLog, summarize_args
 from .users import Users, public_id
 from .roles import Roles, RolesError, at_least
 from ..program import CONTAINER_STEPS, STEP_TYPES, Program, ProgramError, ProgramWaypoint, RunState, Step, path_label, walk
-from ..program_path import simulate
+from ..program_path import fk, simulate
 from ..robot_model import model_or_error
 from ..vials import VialLibrary, VialProfileError
 from ..handeye import HandEyeError
@@ -88,17 +89,20 @@ ADMIN_COMMANDS = frozenset((
     "profile_delete",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
     "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN))
+# commands allowed while the one in control does not have their own settings in use (worksets.py)
+SWITCH_FREE = frozenset(("profile_activate",))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
 ACTIVITY_COMMANDS = {
     **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
                               "program_scrape_baseline", "program_flask_scrape", "program_save", "program_open", "program_new",
-                              "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
+                              "program_copy", "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
     **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_stop")},
     **{c: "record" for c in ("record_start", "record_stop")},
     **{c: "mode" for c in ("switch_mode", "freedrive", "recover")},
     **{c: "power" for c in ("power_on", "power_off", "brake_release")},
     **{c: "batch" for c in ("batch_run", "batch_stop", "batch_save")},
     **{c: "teach" for c in ("teach_start", "teach_insert", "teach_cancel")},
+    "profile_activate": "setup",
 }
 
 
@@ -140,6 +144,7 @@ class Lease:
         self.key = ""                                # the holder's roles.py key (Tailscale login or IP): public
         self.role = ""
         self.away = False                            # went quiet while the robot was idle (see IDLE_LEASE_S)
+        self.profile = ""                            # the holder's profile (user_profiles.py), "" if the name is none
 
     @property
     def client(self) -> Optional[str]:               # truthy while somebody holds the lease
@@ -149,7 +154,7 @@ class Lease:
         return bool(token) and bool(self.token) and secrets.compare_digest(str(token), self.token)
 
     def view(self) -> dict:
-        return {"client": self.id, "name": self.name, "uid": self.uid, "away": self.away}
+        return {"client": self.id, "name": self.name, "uid": self.uid, "away": self.away, "profile": self.profile}
 
 
 def remote_power() -> bool:
@@ -354,11 +359,15 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             lease.token, lease.id = client or secrets.token_urlsafe(24), secrets.token_urlsafe(6)
             lease.name, lease.seen, lease.uid = name or "browser", self.clock(), uid
             lease.key, lease.role = key, role
+            lease.profile = self._profile_of(lease.name)
             self.lease = lease
             self.offer = None
             if self.asking and (self.asking["uid"] == uid or not again):
                 self.asking = None                        # answered by taking it (or a new holder: the question is gone)
             out = {**lease.view(), "token": lease.token}
+        self._claim_settings(lease)
+        out["needs_switch"] = self._needs_switch()
+        out["settings_owner"] = self.worksets.active()
         if not again:                                     # a holder taking again (page reload) is no news
             gift = bool(off and off["uid"] == uid)
             self._act("control", "took over control" if took_from else "took control", self._actor_of(lease),
@@ -424,7 +433,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             o = self.offer = None
         if a and not a["kept"] and not self.lease.token and not o:
             a = self.asking = None                        # the holder left: just take control
-        return {**self.lease.view(),
+        return {**self.lease.view(), "needs_switch": self._needs_switch(), "settings_owner": self.worksets.active(),
                 "ask": {"id": a["uid"], "name": a["name"], "kept": a["kept"], "age_s": round(now - a["at"], 1)} if a else None,
                 "offer": {"id": o["uid"], "name": o["name"]} if o else None}
 
@@ -487,6 +496,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         holds = self.heartbeat(client)                    # any request with the valid token is also a heartbeat
         if not read_only and not holds:
             raise CommandError("take control first: another browser or nobody holds the control lease")
+        if not read_only and cmd not in SWITCH_FREE and self._needs_switch():
+            raise CommandError(self._switch_refusal())
         args = dict(args or {})
         args.pop("local", None)                           # the server says where the browser is, never the page
         if local_only:
@@ -688,6 +699,12 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             raise CommandError("that run is no longer in the history")
         return self._ok(run=e)
     cmd_history_get.read_only = True
+
+    def cmd_cpu_profile(self, seconds=5):
+        """DIAGNOSTICS: which threads of the GUI use the CPU, and where (cpu_sample.py). Changes nothing."""
+        from ..cpu_sample import sample
+        return self._ok(threads=sample(float(seconds)))
+    cmd_cpu_profile.read_only = True
 
     def cmd_activity(self, n=300, who="", kind=""):
         a = self.activity
@@ -1139,12 +1156,47 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
     cmd_jog_stop.read_only = True          # stopping never needs the lease
 
     # ---------------------------------------------------------------- program
-    def _programs_dir(self) -> Path:
-        return self.core.programs_dir
+    def _programs_dir(self, owner="", create=False) -> Path:
+        """Where `owner`'s programs are: <programs_dir>/<profile name>/; "" = Shared, the programs dir itself."""
+        if not str(owner or "").strip():
+            return self.core.programs_dir
+        d = self.core.programs_dir / self.profiles.find(owner)
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+        return d
 
-    def cmd_program_list(self):
-        return self._ok(files=sorted(p.name for p in self._programs_dir().glob("*.y*ml")
-                                     if not p.name.endswith(".batch.yaml")))      # PROGRAMS > Batch files
+    def _program_owner(self) -> str:
+        """Whose folder the open program is in ("" = Shared or not saved yet)."""
+        p = self.program_path
+        return p.parent.name if p and p.parent != self.core.programs_dir.resolve() else ""
+
+    def _program_files(self, owner="") -> dict:
+        d = self._programs_dir(owner)
+        return dict(owner=self.profiles.find(owner) if str(owner or "").strip() else "",
+                    profiles=[x["name"] for x in self.profiles.list()],
+                    files=sorted(p.name for p in d.glob("*.y*ml") if not p.name.endswith(".batch.yaml")))   # PROGRAMS > Batch files
+
+    def cmd_program_list(self, owner=""):
+        return self._ok(**self._program_files(owner))
+
+    def cmd_program_copy(self, source_owner, name, owner="", new_name="", replace=False):
+        """Copy a program file of another profile (or Shared) into profile `owner`."""
+        src = self._safe_path(name, source_owner)
+        if not src.is_file():
+            raise CommandError(f"no program '{name}'")
+        new = str(new_name or "").strip() or src.name
+        if not new.endswith((".yaml", ".yml")):
+            new += ".yaml"
+        dst = self._safe_path(new, self._own(owner), create=True)        # into your own profile (or Shared)
+        if dst.exists() and not replace:
+            raise CommandError(f"{dst.name} already exists there")
+        if dst == src:
+            raise CommandError("pick another profile to copy into")
+        shutil.copyfile(src, dst)
+        who = self.profiles.find(owner) if str(owner or "").strip() else "Shared"
+        self.core.bridge.log(f"program: copied {src} to {dst}")
+        return self._ok(f"copied {src.name} to {who}" + (f" as {dst.name}" if dst.name != src.name else ""),
+                        **self._program_files(owner))
     cmd_program_list.read_only = True
 
     def cmd_program_get(self):
@@ -1292,6 +1344,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         "photo": {"topic": str, "label": str},
         "record_start": {"preset": str, "note": str},
         "record_stop": {},
+        "replay": {"name": str, "speed": float, "velocity": float, "on_fail": _choice("stop", "continue")},
     }
 
     def _default_camera(self) -> str:
@@ -1498,9 +1551,9 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         self.program.name = str(name).strip()
         return self._reply(f"renamed to {self.program.name}")
 
-    def cmd_program_open(self, name):
+    def cmd_program_open(self, name, owner=""):
         self._editable()
-        path = self._safe_path(name)
+        path = self._safe_path(name, owner)
         self.program = Program.load(path, self.core.profile)
         self.program_path = path
         self._mark_saved()
@@ -1519,13 +1572,17 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         self.program = Program.from_dict(d, self.core.profile)
         return self._ok("program updated", **self.program_view())
 
-    def cmd_program_save(self, name=None):
+    def cmd_program_save(self, name=None, owner=None):
+        """owner: whose folder to save into ("" = Shared); default: where the open program is."""
+        if owner is None:
+            owner = self._program_owner()
+        owner = self._own(owner)                    # nobody saves into another person's programs
         name = name or (self.program_path.name if self.program_path else None)
         if not name:
             raise CommandError("name the program")
         if "." in name and not name.endswith((".yaml", ".yml")):
             raise CommandError("program names are plain .yaml file names")
-        path = self._safe_path(name if name.endswith((".yaml", ".yml")) else name + ".yaml")
+        path = self._safe_path(name if name.endswith((".yaml", ".yml")) else name + ".yaml", owner, create=True)
         self.program.name, self.program.robot = path.stem, self.core.profile.name
         self.program.save(path)
         self.program_path = path
@@ -1662,10 +1719,10 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             k += 1
         return f"{prefix}{k}"
 
-    def _safe_path(self, name: str) -> Path:
+    def _safe_path(self, name: str, owner="", create=False) -> Path:
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise CommandError("program names are plain .yaml file names")
-        d = self._programs_dir().resolve()
+        d = self._programs_dir(owner, create).resolve()
         p = (d / name).resolve()                     # file names only: no paths from the browser
         if p.parent != d or p.suffix not in (".yaml", ".yml"):
             raise CommandError("program names are plain .yaml file names")
@@ -1713,7 +1770,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 problems = [str(e)]
             rows.append({"path": list(path), "label": path_label(path), "depth": len(path) - 1, "type": s.type,
                          "title": s.title, "detail": detail, "container": s.container,
-                         "params": {k: v for k, v in p.items()}, "waypoint": wp, "problems": problems,
+                         "params": {k: v for k, v in p.items() if k != "points"}, "waypoint": wp, "problems": problems,
                          "sweep": sweep_options(s)})
         return rows
 
@@ -1734,6 +1791,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 detail = f"{m.label} · {m.command_interface.upper()}" if m else detail
             steps.append({"type": s.type, "detail": detail})
         return {"program": {"name": self.program.name, "file": self.program_path.name if self.program_path else None,
+                            "owner": self._program_owner(),
                             "steps": steps, "rows": self._rows(), **self._history_view(), "rev": self.program_rev,
                             "yaml": yaml.safe_dump(self.program.to_dict(), sort_keys=False, default_flow_style=None)}}
 
@@ -2323,6 +2381,12 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             cams += [{"name": f"{r['label']} {o['label']}", "topic": o["topic"], "info": info, "driver": r["name"]}
                      for o in r["outputs"] if o["image"]]
         cams += [c for c in self.core.profile.cameras if all(c["topic"] != d["topic"] for d in cams)]   # the profile's
+        # the same picture as JPEG (image_transport's <topic>/compressed), where the driver offers it: the GUI passes
+        # it to the browser as it is, no decoding or re-encoding, and far less data than the raw picture
+        have = {t for t, _ in topics}
+        cams = [x for c in cams for x in ([c] + ([{**c, "name": c["name"] + " (compressed)", "topic": c["topic"] + "/compressed",
+                                                    "compressed": True}]
+                                                  if c["topic"] + "/compressed" in have and "depth" not in c["topic"] else []))]
         return self._ok(error=err, topics=[t for t, _ in topics],
                         cameras=[{**c, "publishers": b.topic_publishers(c["topic"])} for c in cams])
     cmd_camera_status.read_only = True
@@ -2388,6 +2452,27 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 "fixtures": [n for n in st.fixtures]}
 
     TCP_HOLD_S = 2.0                     # the TCP pose shown while TF is late, at most this long
+    JOINTS_FRESH_S = 0.5                 # joint states older than this are not used for the TCP pose
+
+    def _tcp_from_joints(self):
+        """T_base_tcp from the latest joint states and the robot model (display only), None if it can't."""
+        c = self.core
+        snap = c.last_snap
+        q = snap.joints
+        if not q or snap.joint_state_age is None or snap.joint_state_age > self.JOINTS_FRESH_S:
+            return None
+        try:
+            link, _, T_link_tcp = c.geo.tcp_anchor(c.store.active_tcp)
+            m = self._base_model()
+            if not m.get("ok"):
+                return None
+            T = fk(m, dict(zip(c.profile.joint_names, q)), c.profile.base_link, link)
+            if T is None:
+                T = fk(self.robot_model(), dict(zip(c.profile.joint_names, q)), c.profile.base_link, link)
+            return None if T is None else T @ T_link_tcp
+        except Exception:
+            return None
+
 
     def state(self) -> dict:
         c = self.core
@@ -2401,9 +2486,17 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         except Exception:
             # TF a moment late (a loaded PC): show the last pose, marked stale, rather than blanking the view.
             # Display only: moves and Record pose still need fresh TF.
-            t0, name, last = getattr(self, "_tcp_last", (0.0, None, None))
-            if last and name == c.store.active_tcp and time.monotonic() - t0 < self.TCP_HOLD_S:
-                tcp = {**last, "stale": True}
+            # First the joints through the robot model (the URDF robot_state_publisher uses too: the same pose,
+            # without waiting for /tf, which camera drivers can crowd), else the last pose, marked stale.
+            T = self._tcp_from_joints()
+            if T is not None:
+                xyz, rpy = tf.T_to_mm_deg(T)
+                tcp = {"xyz_mm": [round(v, 2) for v in xyz], "rpy_deg": [round(v, 2) for v in rpy]}
+                self._tcp_last = (time.monotonic(), c.store.active_tcp, tcp)
+            else:
+                t0, name, last = getattr(self, "_tcp_last", (0.0, None, None))
+                if last and name == c.store.active_tcp and time.monotonic() - t0 < self.TCP_HOLD_S:
+                    tcp = {**last, "stale": True}
         tcp_off = None
         try:                                   # changes when the active TCP or its definition does (preview cache key)
             link, _, T_lt = c.geo.tcp_anchor(c.store.active_tcp)
@@ -2428,7 +2521,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             "gripper_position": s.gripper_position, "gripper_status": s.gripper_status,
             "gripper_controller": s.gripper_controllers.get(c.profile.gripper.get("controller") or ""),
             "freedrive": s.freedrive,
-            "mode": c.mode, "mode_label": c.mode_label(), "command_source": c.command_source, "busy": c.busy,
+            "mode": c.shown_mode, "mode_label": c.mode_label(c.shown_mode), "command_source": c.command_source, "busy": c.busy,
             "idle": c.idle(), "motion_refusal": c.motion_refusal(), "manual_refusal": self._manual_refusal(),
             "unknown": c.modes.control_state_unknown, "unknown_reason": c.modes.unknown_reason,
             "last_refusal": c.last_refusal, "controllers": s.controllers,

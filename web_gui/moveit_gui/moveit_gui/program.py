@@ -35,6 +35,9 @@ Schema v2 (written by this version):
       - {type: record_start, preset: all, note: "trial 3"}   # preset and note are optional; no preset = saved selection
       - {type: photo, topic: /camera/camera/color/image_rect_raw, label: before}   # one JPEG, timestamp + label
       - {type: record_stop}
+      # record and replay (Teach by hand, Path, Insert as Replay; replay.py): the joint motion as it was taught.
+      # A planned MoveJ (velocity) to the first point, then ONE trajectory with the recorded timing / speed
+      - {type: replay, name: "Taught path 14:02", speed: 1.0, velocity: 0.1, points: [[0.0, q1, .., q6], [0.012, ...], ...]}
 
 Every Cartesian pose carries its reference frame and TCP (T_frame_tcp).
 Lengths are metres, joint values radians, quaternions xyzw.
@@ -48,6 +51,7 @@ until it is saved, which writes v2. Program.notes lists what was migrated.
 from __future__ import annotations
 
 import enum
+import math
 import re
 import threading
 import time
@@ -64,15 +68,15 @@ from .profile import RobotProfile
 PROGRAM_VERSION = 2
 STEP_TYPES = ("movej", "move_pose", "move_relative", "move_until_contact", "force", "force_off", "zero_ft",
               "gripper", "wait", "controller", "policy", "set_io", "speed", "loop", "folder", "comment",
-              "photo", "record_start", "record_stop")
+              "photo", "record_start", "record_stop", "replay")
 CONTAINER_STEPS = ("loop", "folder")
-MOTION_STEPS = ("movej", "move_pose", "move_relative", "move_until_contact")
+MOTION_STEPS = ("movej", "move_pose", "move_relative", "move_until_contact", "replay")
 MAX_LOOP_TIMES = 10000
 TITLES = {"movej": "MoveJ", "gripper": "Gripper", "wait": "Wait", "controller": "Control mode", "policy": "Policy",
           "set_io": "Set output", "speed": "Speed", "loop": "Loop", "folder": "Folder", "comment": "Comment",
           "move_relative": "Move relative", "move_until_contact": "Move until contact", "force": "Force",
           "force_off": "Force off", "zero_ft": "Zero F/T", "photo": "Photo",
-          "record_start": "Record start", "record_stop": "Record stop"}
+          "record_start": "Record start", "record_stop": "Record stop", "replay": "Replay"}
 AXIS_NAMES = ("X", "Y", "Z")
 MAX_RELATIVE_MM = 300.0
 MAX_CONTACT_MM = 200.0
@@ -218,6 +222,9 @@ class Step:
             return " · ".join(x for x in (p.get("preset") or "selected topics", p.get("note")) if x)
         if self.type == "record_stop":
             return "finish the recording"
+        if self.type == "replay":
+            from .replay import summary
+            return summary(p)
         return ""
 
 
@@ -505,6 +512,13 @@ class Program:
                         problems.append(f"step {i}: unknown recording preset '{p['preset']}'")
                     if len(str(p.get("note", ""))) > 200:
                         problems.append(f"step {i}: the note is limited to 200 characters")
+                elif s.type == "replay":
+                    from .replay import ReplayError, parse, speed_of
+                    try:
+                        parse(p, n)
+                        speed_of(p)
+                    except ReplayError as e:
+                        problems.append(f"step {i}: {e}")
                 elif s.type == "loop":
                     t = p.get("times", 1)
                     if isinstance(t, bool) or int(t) != float(t) or not 1 <= int(t) <= MAX_LOOP_TIMES:
@@ -545,8 +559,12 @@ def _group_missing_frames(problems: List[str], profile: RobotProfile) -> List[st
             out.append(msg)
     examples = getattr(profile, "example_fixtures", None) or {}
     for f in missing:
-        how = "SETUP > Vial Geometry: teach it and Save" + (
-            ", or pick one in Vial profiles (baseline = the example position, only if yours is really there)" if f in examples else "")
+        if (examples.get(f) or {}).get("kind") == "flask" or f == "flask":
+            how = "SETUP > Flask: touch your flask and Save"
+        else:
+            how = "SETUP > Vial Geometry: teach it and Save" + (
+                ", or pick one in Vial profiles (baseline = the example position, only if yours is really there)"
+                if f in examples else "")
         out.insert(0, f"fixture '{f}' is not taught yet (used by step {', '.join(steps[f])}): {how}")
     return out
 
@@ -601,6 +619,10 @@ class ProgramHooks:
 
     def photo(self, topic: str, label: str) -> Tuple[bool, str]:
         return False, "photo steps need the GUI core"
+
+    def replay_check(self, names, Q):
+        """(problems, joint velocity limits, joint acceleration limits) of a replay (replay.check)."""
+        return ["replay steps need the GUI core (robot model, keep-out zones)"], None, None
 
 
 # =================================================================== runner
@@ -693,6 +715,16 @@ class ProgramRunner:
         top = self._start_path(start_index)[0]
         sub = Program(program.name, program.robot, program.steps[top:], program.waypoints)
         problems = sub.validate(self.profile, self.geometry, self.policies, live=True, bridge=self.bridge)
+        if not problems:
+            from .replay import ReplayError, parse
+            for path, st in walk(sub.steps):
+                if st.type == "replay":          # joint limits and keep-out zones: refused before anything moves
+                    try:
+                        _t, Q = parse(st.params, len(self.profile.joint_names))
+                    except ReplayError:
+                        continue
+                    why, _v, _a = self.hooks.replay_check(list(self.profile.joint_names), Q)
+                    problems += [f"step {path_label((path[0] + top,) + path[1:])}: {w}" for w in why]
         if self.policies is not None and self.policies.running:
             problems.append("a policy is already running")
         return problems
@@ -921,6 +953,11 @@ class ProgramRunner:
                 return False
             return self._move_until_contact(p, vel, acc, self._cart_speed(step))
 
+        if t == "replay":
+            if not self._require_moveit_mode():
+                return False
+            return self._replay(p, vel, acc)
+
         if t == "force":
             ok, msg = self.hooks.force_apply([float(x) for x in p["wrench"]], p.get("frame", "tool"))
             self.on_log(f"force: {msg}")
@@ -975,6 +1012,66 @@ class ProgramRunner:
 
         self.on_log(f"unhandled step type {t}")
         return False
+
+    # ------------------------------------------------------------ replay
+    def _replay(self, p: dict, vel: float, acc: float) -> bool:
+        """A taught joint trajectory (replay.py): MoveJ to its first point, then one trajectory with the recorded
+        timing / speed, slowed down if it would exceed the joint limits. After a pause: from where it stopped."""
+        import numpy as np
+        from . import replay as rp
+        names = list(self.profile.joint_names)
+        try:
+            t, Q = rp.parse(p, len(names))
+            speed = rp.speed_of(p) * max(0.01, float(self.speed_override()))
+        except rp.ReplayError as e:
+            self.on_log(f"replay refused: {e}")
+            return False
+        why, vlim, alim = self.hooks.replay_check(names, Q)
+        if why:
+            for w in why:
+                self.on_log(f"replay refused: {w}")
+            self._fail_msg = why[0]
+            return False
+        t_run, V, k = rp.fit_limits(t / speed, Q, np.asarray(vlim, float), np.asarray(alim, float))
+        if k > 1.0:
+            self.on_log(f"replay slowed x{k:.2f}: the taught motion at {speed * 100:.0f} % would exceed the joint "
+                        "velocity / acceleration limits")
+        k0 = 0
+        snap = self.bridge.snapshot()
+        if not snap.joints:
+            self.on_log("replay refused: no joint state")
+            return False
+        memo = self._step_memo
+        if "replay_elapsed" in memo:               # resumed after a pause: go on from about where it stopped
+            k0 = rp.resume_index(memo["replay_t"], Q, memo["replay_k0"], memo["replay_elapsed"], snap.joints)
+            if k0 >= len(Q) - 1:
+                k0 = len(Q) - 1
+            self.on_log(f"replay: going on from point {k0 + 1} of {len(Q)}")
+        dev = float(np.max(np.abs(np.asarray(snap.joints, float) - Q[k0])))
+        if dev > rp.START_TOL_RAD:
+            self.on_log(f"replay: MoveJ to {'its start' if k0 == 0 else f'point {k0 + 1}'} "
+                        f"({math.degrees(dev):.1f}° away)")
+            if not self.bridge.move_joints([float(x) for x in Q[k0]], vel, acc):
+                return False
+            if self._stop.is_set() or self._state == RunState.PAUSED:
+                return False
+            q = self.bridge.snapshot().joints or []
+            dev = float(np.max(np.abs(np.asarray(q, float) - Q[k0]))) if q else 1.0
+            if dev > rp.START_TOL_RAD:
+                self._fail_msg = f"the arm did not reach the replay's start ({math.degrees(dev):.2f}° off)"
+                self.on_log(f"replay refused: {self._fail_msg}")
+                return False
+        if k0 >= len(Q) - 1:
+            return True
+        tt = t_run[k0:] - t_run[k0]
+        VV = V[k0:].copy()
+        VV[0] = 0.0                                 # from rest (a resumed replay too)
+        self.on_log(f"replay: {len(tt)} points, {tt[-1]:.1f} s")
+        memo.update(replay_t=t_run, replay_k0=k0)
+        t_start = time.monotonic()
+        ok = self.bridge.execute_joint_path(names, [float(x) for x in tt], Q[k0:].tolist(), VV.tolist())
+        memo["replay_elapsed"] = time.monotonic() - t_start
+        return bool(ok)
 
     # ------------------------------------------------------------ force work
     def _target_from(self, frame: str, offset_m, rot_deg, pivot: str = "tcp") -> PoseSpec:

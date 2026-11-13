@@ -28,8 +28,8 @@ class VialLibrary:
         self.base_link = base_link
         self.builtin: Dict[str, dict] = {}
         for key, e in (examples or {}).items():
-            if e.get("parent", base_link) != base_link:
-                continue                                   # profiles are in the base frame
+            if e.get("parent", base_link) != base_link or e.get("kind", "vial") != "vial":
+                continue                                   # vials only; profiles are in the base frame
             name = str(e.get("label") or ("baseline" if key == "vial" else key))
             self.builtin[name] = {"xyz_mm": [float(v) for v in e.get("xyz_mm", [0, 0, 0])],
                                   "radius_mm": e.get("radius_mm"), "height_mm": e.get("height_mm"),

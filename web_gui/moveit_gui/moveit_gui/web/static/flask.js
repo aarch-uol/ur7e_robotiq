@@ -1,4 +1,4 @@
-// SETUP > Flask Geometry: touch a round-bottom flask with the TCP, fit it, save it as the "flask" fixture and a
+// SETUP > Flask: touch a round-bottom flask with the TCP, fit it, save it as the "flask" fixture and a
 // named profile, then check what a tool reaches through the neck and make a scrape program (opened unsaved in
 // PROGRAMS). Built by app.js with its helpers (ctx). The server owns every rule; this only shows and asks.
 
@@ -102,39 +102,44 @@ export function flaskPage(ctx) {
       bendL.value = g.length_mm.toFixed(1); bendA.value = g.angle_deg.toFixed(1);
       sugOut.textContent = `Suggested: ${fmt(g.length_mm)} mm at ${fmt(g.angle_deg)}° (fits ${fmt(g.length_range_mm[0])}–` +
         `${fmt(g.length_range_mm[1])} mm, ${fmt(g.angle_range_deg[0])}–${fmt(g.angle_range_deg[1])}°). ` +
-        (g.band ? `Whole rings ${fmt(g.band[0])}–${fmt(g.band[1])}°` : "No whole ring") +
+        (g.band ? `All the way round ${fmt(g.band[0])}–${fmt(g.band[1])}°` : "Not all the way round anywhere") +
         (g.meets ? ": covers your polar range." : `: not all of ${fmt(g.target[0])}–${fmt(g.target[1])}°.`);
     }, "A bend that passes the neck and reaches far up the bulb, for this shaft and your polar range")));
   const tcpSel = h("select", {});
-  const thMin = num("0", "1"), thMax = num("15", "1"), rings = num("3", "1"), step = num("15", "1");
-  const pattern = h("select", {}, h("option", { value: "down" }, "Top to bottom"), h("option", { value: "rings" }, "Rings"));
+  const thMin = num("0", "1"), thMax = num("15", "1"), rings = num("6", "1"), step = num("15", "1");
+  const pitchTop = num("", "1", "70px", "auto"), pitchBot = num("", "1", "70px", "auto");
   const press = num("0.5", "0.1"), force = num("", "0.5", "70px", "off"), speed = num("10", "1"), appr = num("50", "5");
   const reachOut = h("div", { class: "col small", style: "gap:2px" });
   const scrapeArgs = () => ({ tool: { kind: toolSel.value, shaft_radius_mm: +shaftR.value, shaft_length_mm: +shaftL.value,
       ...(toolSel.value === "bent" ? { bend_length_mm: +bendL.value, bend_angle_deg: +bendA.value } : {}) },
     tcp: tcpSel.value, theta_min_deg: +thMin.value, theta_max_deg: +thMax.value, rings: +rings.value, step_deg: +step.value,
-    pattern: pattern.value, press_mm: +press.value || 0 });
+    press_mm: +press.value || 0,
+    pitch_top_deg: pitchTop.value === "" ? null : +pitchTop.value, pitch_bottom_deg: pitchBot.value === "" ? null : +pitchBot.value });
   const showReach = (r) => {
     F.reach = r; ctx.repaint();
     const total = r.reachable + r.unreachable;
     reachOut.replaceChildren(
-      h("div", {}, r.band ? `Whole rings reach ${fmt(r.band[0])}–${fmt(r.band[1])}° from the bottom.` : "No whole ring is reachable with this tool."),
+      h("div", {}, r.band ? `Reached all the way round from ${fmt(r.band[0])} to ${fmt(r.band[1])}° from the bottom.` : "No polar angle is reached all the way round with this tool."),
       h("div", { class: r.unreachable ? "warn" : "good" }, `${r.reachable} of ${total} poses reachable (green), ${r.unreachable} not (red).`),
       ...r.reasons.map(([why, n]) => h("div", { class: "muted" }, `${n} × ${why}`)));
   };
   const scrapeCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask scrape"),
-    note("The tool goes in through the neck and pivots there. Top to bottom (like the vial): one stroke per angle " +
-      "around, from the highest polar angle down to the lowest. Rings: round the axis, from the bottom up.",
-      "0° is the bottom of the bulb. Heights is how many polar angles from min to max. Press depth is how far past the inner wall the tip is aimed. Speed limits every " +
-      "linear move. Force (optional) presses along the tool in a force mode. A straight tool only reaches a small band " +
-      "near the bottom; a bent tool (bend length and angle of the end) reaches higher. Suggest bend proposes one."),
+    note("Like the vial scrape: one stroke down the wall every step ° around (360°), each from the highest polar " +
+      "angle down to the lowest. The tool goes in through the neck and pivots there.",
+      "0° is the bottom of the bulb. Points per stroke: how many poses from max down to min. Press depth is how far past the inner wall the tip is aimed. Speed limits every " +
+      "linear move. Force (optional, in a force mode): a straight tool's TCP X faces the wall and the force is along +X; " +
+      "a bent tool's end points into the wall and the force is along +Z. Pitch (straight tool): its tilt from vertical, " +
+      "toward the wall, at the top and the bottom of each stroke (one value: the same all the way); empty: automatic, the " +
+      "shaft through the middle of the neck, which reaches highest. The neck and the glass are checked either way: " +
+      "Check reach shows what they block (red). A wider neck reaches higher; a bent tool too (Suggest bend)."),
     h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
       h("span", { class: "k" }, "Tool"), h("div", { class: "row" }, toolSel, "shaft r", shaftR, "length", shaftL, "mm"),
       h("span", { class: "k" }, ""), h("div", { class: "col", style: "gap:2px" }, bentRow, sugOut),
       h("span", { class: "k" }, "TCP"), tcpSel,
       h("span", { class: "k" }, "Polar ° min / max"), h("div", { class: "row" }, thMin, thMax),
-      h("span", { class: "k" }, "Pattern"), pattern,
-      h("span", { class: "k" }, "Heights / step °"), h("div", { class: "row" }, rings, step),
+      h("span", { class: "k" }, "Points per stroke / step °"), h("div", { class: "row" }, rings, step),
+      h("span", { class: "k" }, "Pitch ° top / bottom"), h("div", { class: "row" }, pitchTop, pitchBot,
+        h("span", { class: "muted small" }, "straight tool's tilt from vertical; empty = automatic")),
       h("span", { class: "k" }, "Press mm / force N"), h("div", { class: "row" }, press, force),
       h("span", { class: "k" }, "Speed mm/s / approach mm"), h("div", { class: "row" }, speed, appr)),
     h("div", { class: "row" },

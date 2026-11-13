@@ -137,10 +137,10 @@ def test_reach_groups_the_reasons_and_the_straight_tool_band_is_small(s):
         cmd(s, "flask_reach", tool=TOOL)
     touch_flask(s)
     cmd(s, "flask_save", name="A", neck_id_mm=24)
-    r = cmd(s, "flask_reach", tool=TOOL, theta_min_deg=0, theta_max_deg=40, rings=5, step_deg=30)
+    r = cmd(s, "flask_reach", tool=TOOL, theta_min_deg=0, theta_max_deg=60, rings=7, step_deg=30)
     m = r["reach"]
     lo, hi = m["band"]
-    assert lo == 0.0 and 10.0 <= hi <= 20.0                     # straight tool: only near the bottom
+    assert lo == 0.0 and 30.0 <= hi <= 45.0                     # straight tool: the lower part of the bulb
     assert m["reachable"] > 0 and m["unreachable"] > 0
     assert sum(n for _, n in m["reasons"]) == m["unreachable"]
     assert any(p["ok"] for p in m["poses"])
@@ -210,3 +210,15 @@ def test_bent_tool_suggest_reach_and_program(s):
     assert r["ok"] and r["reach"]["reachable"] > 0
     assert s.program.validate(s.core.profile, s.core.geo) == []
     assert cmd(s, "program_check")["problems"] == []
+
+
+def test_the_page_can_set_the_pitch(s):
+    touch_flask(s)
+    cmd(s, "flask_save", name="A", neck_id_mm=24)
+    auto = cmd(s, "flask_reach", tool=TOOL, theta_min_deg=0, theta_max_deg=30, rings=4, step_deg=90)["reach"]
+    set_ = cmd(s, "flask_reach", tool=TOOL, theta_min_deg=0, theta_max_deg=30, rings=4, step_deg=90,
+               pitch_top_deg=40, pitch_bottom_deg=40)["reach"]
+    assert auto["unreachable"] == 0 and set_["reachable"] < auto["reachable"]     # 40 deg does not fit a 24 mm neck
+    assert any("neck bore" in why for why, _ in set_["reasons"])
+    with pytest.raises(CommandError, match="pitch"):
+        cmd(s, "flask_reach", tool=TOOL, pitch_top_deg="steep")

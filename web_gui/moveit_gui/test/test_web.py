@@ -323,3 +323,26 @@ def test_a_late_tf_holds_the_last_tcp_pose_briefly(env, monkeypatch):
     assert held["stale"] is True and held["xyz_mm"] == good["xyz_mm"]
     s._tcp_last = (s._tcp_last[0] - s.TCP_HOLD_S - 0.1,) + s._tcp_last[1:]
     assert s.state()["tcp"] is None                    # longer than that: no pose
+
+
+def test_a_camera_with_a_compressed_topic_is_offered_both_ways(env, monkeypatch):
+    s = env[0]
+    b = s.core.bridge
+    raw = s.core.profile.cameras[0]["topic"] if s.core.profile.cameras else "/cam/image"
+    if not s.core.profile.cameras:
+        monkeypatch.setattr(s.core.profile, "cameras", [{"name": "Cam", "topic": raw}])
+    monkeypatch.setattr(b, "image_topics", lambda: [(raw, "sensor_msgs/msg/Image"),
+                                                   (raw + "/compressed", "sensor_msgs/msg/CompressedImage")])
+    cams = s.command("me", "camera_status", {})["cameras"]
+    i = [c["topic"] for c in cams].index(raw)
+    assert cams[i + 1]["topic"] == raw + "/compressed" and cams[i + 1]["name"].endswith("(compressed)")
+
+
+def test_an_image_frame_the_preview_drops_is_only_counted():
+    from moveit_gui.camera import ImageWatch
+    w = ImageWatch("/t", max_decode_hz=1.0)
+    assert w.wants()
+    w.on_compressed("jpeg", b"x")
+    assert not w.wants()                               # within the period: the bridge skips deserializing it
+    w.tick()
+    assert len(w.stats.times) == 2

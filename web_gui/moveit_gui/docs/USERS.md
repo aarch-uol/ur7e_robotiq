@@ -2,15 +2,21 @@
 
 ## 1. The GUI
 
-Open **http://X.X.X.38:XXXX/** in a browser (ask Cenk for the address).
+Open **http://X.X.X.38:XXXX/** in a browser.
 
 * Press **Take control** (top right) before you command anything, and **Release** when you are done.
   One person controls the robot at a time. Everyone else can watch.
 * **STOP** (top right, or Esc) works from every browser. It is a software stop: the red button on the pendant
   is the emergency stop.
-* Ask before you move the robot, and check that nobody is near it.
-* The first time, pick your **profile** (Cenk, Ayesha, or *New profile…*). It keeps your setups and your screen
-  layout. Change it with your name at the top right (*Change my name*).
+* Check that nobody is near the robot before you move it.
+* The first time, pick your **profile** (your name, or *New profile…*). It keeps your own settings (TCPs,
+  keep-out zones, fixtures, vials, gains, F/T bias, limit and payload, parts, camera calibrations), your setups,
+  programs and screen layout. Change it with your name at the top right (*Change my name*).
+* The robot runs the settings of the person in control. When you take control and someone else's settings are in
+  use, the GUI asks to switch to yours and restarts (about a minute). Their settings stay in their profile. The first
+  time, you choose what yours start from: a copy of the ones in use, or a setup. SETUP › Setups shows whose
+  settings are in use.
+* Nobody can change another person's settings, setups or programs. Copy them into your profile instead.
 * Nobody using the robot? SETUP › Setups › Robot › **Stop robot stack…** stops everything. The address then shows
   a page with **Start robot stack** (about a minute).
 
@@ -23,15 +29,23 @@ rest. The gripper and the F/T sensor stay the same for everyone.
 1. Load the setup that is closest (SETUP › Setups › Load…), or start from the one in use.
 2. SETUP › Parts › **Import mesh…**: your camera holder (.stl, .obj, .dae), on the tool. Press **Restart robot
    stack** (banner) so MoveIt plans around it.
-3. SETUP › Drivers & cameras: add your camera if it is not there yet, and **Start** it.
-4. SETUP › Camera calibration: pick the camera, *eye-in-hand*, **Start**, **Plan poses**, **Collect all…**,
+3. SETUP › Cameras: add your camera if it is not there yet, and **Start** it.
+4. SETUP › Camera: pick the camera, *eye-in-hand*, **Start**, **Plan poses**, **Collect all…**,
    **Solve**, **Save + add to robot**.
-5. SETUP › Setups: type a name (e.g. `cenk_d405`) and **Save**.
+5. SETUP › Setups: type a name (e.g. `my_d405`) and **Save**.
 
 Setups are saved in the profile shown above the list. "Shared" holds the ones saved before profiles.
 
 **Copy someone's setup:** SETUP › Setups › **Copy from another profile…**. You get your own copy. To copy a
-layout, pick *copy X's layout* when you choose your profile.
+layout: SETTINGS › Profiles › **Copy a layout**.
+
+**Programs are per profile too.** PROGRAMS shows your programs; the selector next to the list shows another
+profile's, or "Shared" (the programs and examples that were here before profiles: open and run them). Save goes
+into your own profile (or Shared). **Copy from…** copies someone's program into yours. The files are in the programs folder,
+one folder per profile.
+
+**Run a program:** the Run, Pause and Stop buttons are at the top of PROGRAMS, next to the program name. **⋯** has
+Step, From selected and Loop.
 
 **Switch:** SETUP › Setups › your setup › **Load…**. The robot stack restarts (about a minute) with your holder and
 calibration. Then start your camera in OPERATE › Camera drivers.

@@ -62,7 +62,7 @@ class FakeBridge:
         self._lock = threading.Lock()
         self._logs: deque = deque(maxlen=500)
         n = len(profile.joint_names)
-        home = profile.waypoints.get("home")
+        home = profile.waypoints.get("up")
         self._q = list(home.joints) if home and home.joints else [0.0] * n
         self._qd = [0.0] * n
         self.T_base_tool0 = fake_fk(self._q)
@@ -499,6 +499,51 @@ class FakeBridge:
         if not self._route():
             return False
         return self._interpolate(list(trajectory.points[-1].positions), 1.0, epoch)
+
+    def execute_joint_path(self, joint_names, times, positions, velocities=None) -> bool:
+        """Follows the points at their times (/ move_time_scale), like the trajectory controller."""
+        self.calls.append(("execute_joint_path", len(positions), round(float(times[-1]), 3)))
+        self.last_joint_path = (list(joint_names), [float(t) for t in times], [list(map(float, q)) for q in positions])
+        epoch = self.stop_epoch
+        if not self._route():
+            return False
+        self._cancel.clear()
+        t0, held = time.monotonic(), 0.0
+        k = 0
+        while k < len(positions):
+            if self._cancel.is_set() or self.stop_epoch != epoch:
+                with self._lock:
+                    self._qd = [0.0] * len(self._qd)
+                self.log("motion cancelled")
+                return False
+            if self.robot_mode != "RUNNING" or self.program_running is False:
+                time.sleep(0.02)                       # held at speed scaling 0, as on the UR
+                held += 0.02
+                continue
+            now = (time.monotonic() - t0 - held) * self.time_scale
+            while k < len(positions) and float(times[k]) <= now:
+                k += 1
+            q = list(map(float, positions[max(0, k - 1)]))
+            with self._lock:
+                self._q = q
+                self.T_base_tool0 = fake_fk(self._q)
+            if k < len(positions):
+                time.sleep(0.005)
+        with self._lock:
+            self._q = list(map(float, positions[-1]))
+            self._qd = [0.0] * len(self._qd)
+            self.T_base_tool0 = fake_fk(self._q)
+        return True
+
+    def joint_sample(self):
+        with self._lock:
+            return time.monotonic(), list(self._q)
+
+    def set_fake_joints(self, q):
+        """Test / demo helper: the arm moved by hand (freedrive) to these joints."""
+        with self._lock:
+            self._q = [float(x) for x in q]
+            self.T_base_tool0 = fake_fk(self._q)
 
     # ------------------------------------------------------------- force / model
     def publish_wrench(self, topic: str, frame: str, wrench):

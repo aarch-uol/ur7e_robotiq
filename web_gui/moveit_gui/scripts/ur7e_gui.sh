@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One command for the UR7e + MoveIt GUI:
-#   1. rebuilds the ur7e_robotiq:jazzy image if ~/ur7e_robotiq changed since it was built
-#   2. builds the GUI workspace (~/ws: moveit_gui + pymoveit2)
+#   1. rebuilds the ur7e_robotiq:jazzy image if the dependencies in ~/ur7e_robotiq changed (docker/deps_hash.sh)
+#   2. builds ~/ur7e_robotiq's packages (~/ur7e_data/overlay, seconds) and the GUI workspace (~/ws: moveit_gui + pymoveit2)
 #   3. starts the robot stack (gui.launch.py) in the container
 #   4. starts the GUI. Ctrl-C stops the GUI and the robot stack
 #      gracefully (GUI: SIGINT, 10 s grace; stack: SIGINT, 30 s grace; nothing is SIGKILLed unless it hangs).
@@ -83,19 +83,40 @@ mkdir -p "$DATA/logs"
 say() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------- 1. image
-image_time=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
-if [ -z "$image_time" ]; then
-  say "Image $IMAGE missing: building it (takes a while)"
-  "$REPO/docker/build.sh"
-else
-  image_epoch=$(date -d "$image_time" +%s)
-  src_epoch=$(find "$REPO" -path "$REPO/.git" -prune -o -name __pycache__ -prune -o -type f -printf '%T@\n' \
+# The image holds the dependencies; ~/ur7e_robotiq's own packages are built from the source at each stack start
+# (build_overlay below), so changing a launch file, a yaml or a script needs no new image. The image is rebuilt only
+# when docker/deps_hash.sh (in ~/ur7e_robotiq) gives another hash than the one build.sh stored in the image: the
+# docker/ files, the workspace script, the patches or a package.xml changed. An image built before these labels
+# counts as current unless one of those files is newer than it. A ~/ur7e_robotiq without deps_hash.sh (older
+# checkout) keeps the old rule: rebuild when any file is newer than the image, and no overlay.
+DEPS_LABEL=ur7e_robotiq.deps
+OVERLAY=0
+image_rebuild_reason() {                            # prints why the image must be (re)built; nothing if it is current
+  local created have want newest
+  created=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
+  if [ -z "$created" ]; then echo "Image $IMAGE missing: building it (takes a while)"; return 0; fi
+  if [ -x "$REPO/docker/deps_hash.sh" ]; then
+    want=$("$REPO/docker/deps_hash.sh")
+    have=$(docker image inspect "$IMAGE" --format "{{index .Config.Labels \"$DEPS_LABEL\"}}" 2>/dev/null || true)
+    [ "$have" = "<no value>" ] && have=""
+    if [ -n "$have" ]; then
+      [ "$have" = "$want" ] || echo "The image's dependencies changed in ~/ur7e_robotiq: rebuilding $IMAGE"
+      return 0
+    fi
+    newest=$(cd "$REPO" && "$REPO/docker/deps_hash.sh" --files | tr '\n' '\0' | xargs -0 -r stat -c %Y | sort -n | tail -1)
+  else
+    newest=$(find "$REPO" -path "$REPO/.git" -prune -o -name __pycache__ -prune -o -type f -printf '%T@\n' \
               | sort -n | tail -1 | cut -d. -f1)
-  if [ "${src_epoch:-0}" -gt "$image_epoch" ]; then
-    say "~/ur7e_robotiq changed since the image was built: rebuilding $IMAGE"
-    "$REPO/docker/build.sh"
   fi
+  [ "${newest:-0}" -gt "$(date -d "$created" +%s)" ] && echo "~/ur7e_robotiq changed since the image was built: rebuilding $IMAGE"
+  return 0
+}
+reason=$(image_rebuild_reason)
+if [ -n "$reason" ]; then
+  say "$reason"
+  "$REPO/docker/build.sh"
 fi
+[ -x "$REPO/docker/deps_hash.sh" ] && OVERLAY=1
 
 # ---------------------------------------------------------------- 2. GUI workspace (built in the robot's image)
 WS_BUILT_FOR=""
@@ -106,6 +127,35 @@ build_ws() {                                        # $1: the image the stack an
     bash -c 'source /opt/ros/jazzy/setup.bash && colcon build --packages-select pymoveit2 moveit_gui' \
     > "$DATA/logs/ws_build.log" 2>&1 || { tail -30 "$DATA/logs/ws_build.log"; return 1; }
   WS_BUILT_FOR=$1
+}
+
+# ---------------------------------------------------------------- ~/ur7e_robotiq's packages (overlay on the image)
+# Built from ~/ur7e_robotiq (mounted read-only at /ur7e_robotiq) into ~/ur7e_data/overlay, incrementally, with
+# --symlink-install: launch files, yaml, URDF and Python scripts are links to the source, so editing one takes
+# effect at the next stack start; new files and C++ are built here in seconds. The stack sources it after the
+# image's /opt/ur7e_ws (whose copies of these packages it overrides). Skipped when nothing changed since the last
+# build for this image (the stamp has the time that build started); a new image starts it from scratch.
+OVERLAY_DIR=/data/overlay                           # $DATA/overlay on this PC
+OVERLAY_STAMP="$DATA/overlay/.built_for"            # the image id it was built for
+overlay_pkgs() { sed -n 's:.*<name>\(.*\)</name>.*:\1:p' "$REPO"/*/package.xml | paste -sd' '; }
+build_overlay() {
+  [ "$OVERLAY" = 1 ] || return 0
+  local id pkgs
+  id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
+  if [ -f "$OVERLAY_STAMP" ] && [ "$(cat "$OVERLAY_STAMP" 2>/dev/null)" = "$id" ] && \
+     [ -z "$(find "$REPO" -path "$REPO/.git" -prune -o -newer "$OVERLAY_STAMP" -print -quit)" ]; then
+    return 0
+  fi
+  pkgs=$(overlay_pkgs)
+  say "Building ~/ur7e_robotiq's packages (overlay on $IMAGE): $pkgs"
+  docker run --rm --network none -v "$REPO:/ur7e_robotiq:ro" -v "$DATA:/data" -e ID="$id" "$IMAGE" bash -c "
+    mkdir -p $OVERLAY_DIR && cd $OVERLAY_DIR || exit 1
+    [ \"\$(cat .built_for 2>/dev/null)\" = \"\$ID\" ] || rm -rf build install log .built_for
+    touch .started && source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash &&
+    ov=''; colcon build --help 2>/dev/null | grep -q -- --allow-overriding && ov='--allow-overriding $pkgs'
+    colcon build --symlink-install --base-paths /ur7e_robotiq --packages-select $pkgs \$ov &&
+    printf '%s' \"\$ID\" > .built_for && touch -r .started .built_for && rm -f .started" \
+    > "$DATA/logs/overlay_build.log" 2>&1 || { tail -30 "$DATA/logs/overlay_build.log"; echo "Building ~/ur7e_robotiq failed (log: ~/ur7e_data/logs/overlay_build.log)"; return 1; }
 }
 
 # ---------------------------------------------------------------- robots (moveit_gui/robots.py ROBOTS)
@@ -130,7 +180,10 @@ robot_config() {                                    # ROBOT -> R_IMAGE, UNDERLAY
       R_RUN=(-u root -v "$FR3_WS:/ros2_ws:ro" --cap-add SYS_NICE --ulimit rtprio=99 --ulimit rttime=-1
              --ulimit memlock=8428281856) ;;
     *)
-      R_IMAGE=$IMAGE; UNDERLAY=/opt/ur7e_ws/install/setup.bash; PROFILE=ur7e_lab; R_RUN=() ;;
+      R_IMAGE=$IMAGE; UNDERLAY=/opt/ur7e_ws/install/setup.bash; PROFILE=ur7e_lab; R_RUN=()
+      if [ "$OVERLAY" = 1 ]; then                   # ~/ur7e_robotiq's packages, built by build_overlay
+        UNDERLAY="$UNDERLAY && source $OVERLAY_DIR/install/setup.bash"; R_RUN=(-v "$REPO:/ur7e_robotiq:ro")
+      fi ;;
   esac
 }
 
@@ -311,6 +364,7 @@ start_stack() {
        echo "Pick another robot:  printf 'robot=ur7e\\n' > ~/ur7e_data/config/moveit_gui/robot  (or fix the above)"
        return 1 ;;
   esac
+  [ "$ROBOT" = fr3 ] || build_overlay || return 1
   build_ws "$R_IMAGE" || return 1
   build_gui_cmd
   stamp=$(date +%Y%m%d_%H%M%S)
@@ -396,7 +450,9 @@ while true; do
   rc=0
   run_gui || rc=$?
   case "$rc" in
-    76) say "Restarting the GUI (asked from the GUI)" ;;
+    76) say "Restarting the GUI (asked from the GUI)"
+        # ~/ws is installed as copies: build it again so a GUI restart runs the code pulled since (seconds)
+        WS_BUILT_FOR=""; build_ws "$R_IMAGE" || echo "GUI workspace build failed: starting the GUI as it was" ;;
     75) # fake robot: the container is restarted too, so a new base (UR7E_EE_CONFIG) reaches the robot model
         # the GUI switched the robot: its choice wins over --fake / --robot-ip from now on
         [ "$(cat "$ROBOT_FILE" 2>/dev/null || true)" != "$ROBOT_SEEN" ] && OVERRIDE=0

@@ -25,6 +25,7 @@ from .. import transforms as tf
 from ..calibration import TcpDef, config_dir
 from ..setups import Setups, members as S_members
 from ..user_profiles import Profiles, ProfileError
+from ..worksets import WorkSets
 
 RESTART_STACK, RESTART_GUI = 75, 76
 PARTS_VERIFY_S = 10.0
@@ -39,6 +40,7 @@ class WorkcellCommands:
         self.cams = he.CameraCalibrations(config_dir() / "cameras" / f"{prof}.yaml")
         self.setups = Setups(config_dir(), prof)            # the shared setups (made before profiles existed)
         self.profiles = Profiles(config_dir())
+        self.worksets = WorkSets(config_dir(), prof, self.profiles)   # whose settings are in use (worksets.py)
         self.restart_code: Optional[int] = None
         self.model_rev = 0                                  # +1 when the 3D views must reload the robot model
         self.on_restart = None                              # set by the server's main()
@@ -664,8 +666,111 @@ class WorkcellCommands:
         o = self.profiles.find(owner)
         return Setups(config_dir(), self.core.profile.name, owner=o, root=self.profiles.setups_dir(o))
 
+    # ---- whose settings are in use (worksets.py): the robot runs the settings of the one in control
+    def _profile_of(self, lease_name: str) -> str:
+        """The profile a lease name ("Cenk @ 100.x.y.z") belongs to, "" if none."""
+        n = str(lease_name or "").split(" @ ")[0].strip()
+        try:
+            return self.profiles.find(n) if n else ""
+        except ProfileError:
+            return ""
+
+    def _claim_settings(self, lease):
+        """Settings that are nobody's yet (from before profiles) become the first taker's, without a restart."""
+        me = lease.profile
+        if me and not self.worksets.active() and not self.worksets.has(me):
+            self.worksets.set_active(me)
+            self.worksets.save(me, base=self.running_base())
+            self.core.bridge.log(f"web: the settings in use are now {me}'s (kept in their profile)")
+
+    def _needs_switch(self) -> bool:
+        """The one in control does not have their own settings in use (they must switch first)."""
+        L = self.lease
+        if not L.token or not self.profiles.names():
+            return False
+        return (L.profile or "").lower() != self.worksets.active().lower()
+
+    def _switch_refusal(self) -> str:
+        act = self.worksets.active()
+        if not self.lease.profile:
+            return (f"pick your profile first (your name in the header): the robot has {act}'s settings in use, "
+                    "and only they can change them")
+        return (f"the robot has {act or 'other'}'s settings in use: switch to your own settings first "
+                "(Use my settings, in the pop-up or SETUP › Setups)")
+
+    def _own(self, owner) -> str:
+        """`owner` ("" = Shared) checked against the one in control: nobody changes another person's things."""
+        o = str(owner or "").strip()
+        if not o:
+            return ""
+        o = self.profiles.find(o)
+        mine = self.lease.profile if self.lease.token else ""
+        if o.lower() != (mine or "").lower():
+            raise ProfileError(f"that belongs to {o}: you can only change your own"
+                               + (f" ({mine})" if mine else " (pick your profile first)"))
+        return o
+
+    def settings_view(self) -> dict:
+        t, v = getattr(self, "_settings_cache", (0.0, None))
+        if v is None or time.monotonic() - t > 2.0:
+            v = {"owner": self.worksets.active(), "have": [n for n in self.profiles.names() if self.worksets.has(n)]}
+            self._settings_cache = (time.monotonic(), v)
+        return v
+
+    def cmd_profile_activate(self, start="", owner="", name=""):
+        """Put the settings of the one in control in place: the ones in use go back to their profile, the GUI
+        restarts (and the robot stack when the parts or the base differ). A profile without settings of its own
+        starts from `start`: "" = a copy of the settings in use, "setup" = setup `name` of `owner` ("" = Shared)."""
+        me = self.lease.profile
+        if not me:
+            raise ProfileError("pick your profile first (your name in the header)")
+        act = self.worksets.active()
+        if act.lower() == me.lower():
+            return self._ok("your settings are in use already")
+        why = self._restart_refusal()
+        if why:
+            raise P.PartError(why)
+        if self.core.mode not in ("unknown",) and not self.core.modes.mode_supports_moveit(self.core.mode):
+            raise P.PartError(f"change to Position first (now '{self.core.mode}'): the switch changes gains and "
+                              "payload")
+        if self.on_restart is None:
+            raise P.PartError("switching settings restarts the GUI, and this GUI was not started by the launcher "
+                              "(ur7e_gui.sh)")
+        base_now = self.running_base()
+        src = None
+        if not self.worksets.has(me) and start == "setup":
+            S = self._setups(owner)
+            info = S.info(str(name))                       # raises SetupError: no such setup
+            if info.get("profile") and info["profile"] != self.core.profile.name:
+                raise ProfileError(f"setup '{name}' is for robot profile {info['profile']}")
+            src = (S, str(name), str(info.get("base") or ""))
+        if act:
+            self.worksets.save(act, base=base_now)         # the settings in use go back to their owner first
+        if self.worksets.has(me):
+            base = str(self.worksets.load(me).get("base") or "")
+            how = "your settings"
+        elif src is not None:
+            S, n, base = src
+            self.worksets.put_setup(S._path(n) / "files")
+            S._mark(n)
+            how = f"setup '{n}'" + (f" of {S.owner}" if S.owner else " (Shared)")
+        else:
+            base = ""
+            how = f"a copy of {act + chr(39) + 's' if act else 'the'} settings"
+        self.worksets.set_active(me)
+        self.worksets.save(me, base=base or base_now)
+        m = self._base_model()
+        stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(self.parts.path), m).values())
+        if base and base in B.BASES and base != base_now:
+            B.write_next(config_dir(), base)
+            stack = True
+        self._restart(RESTART_STACK if stack else RESTART_GUI, f"{me}'s settings in use ({how})")
+        kept = f"{act}'s are kept in their profile; " if act else ""
+        return self._ok(f"{me}'s settings in use ({how}): {kept}restarting {'the robot stack and ' if stack else ''}"
+                        "the GUI", restart="stack" if stack else "gui")
+
     def cmd_profile_list(self):
-        return self._ok(profiles=self.profiles.list(), in_use=self.setups.in_use())
+        return self._ok(profiles=self.profiles.list(), in_use=self.setups.in_use(), settings=self.settings_view())
     cmd_profile_list.read_only = True
 
     def cmd_profile_create(self, name):
@@ -676,6 +781,10 @@ class WorkcellCommands:
 
     def cmd_profile_delete(self, name):
         n = self.profiles.find(str(name))
+        if n.lower() == self.worksets.active().lower():
+            raise ProfileError(f"{n}'s settings are in use: someone else must switch to theirs first")
+        if self.worksets.has(n) and n.lower() != (self.lease.profile or "").lower():
+            raise ProfileError(f"profile '{n}' still has its own settings: only {n} can delete it")
         self.profiles.delete(n)
         return self._ok(f"profile '{n}' deleted", profiles=self.profiles.list())
 
@@ -703,7 +812,7 @@ class WorkcellCommands:
             S = self.setups
         n = S.current()
         out = {"name": n, "owner": S.owner if n else "", "changed": [], "base_changed": False,
-               "present": self.setups.present()}
+               "present": self.setups.present(), "settings_owner": self.worksets.active()}
         if n:
             try:
                 out["changed"] = S.changes(n)
@@ -722,7 +831,7 @@ class WorkcellCommands:
             except Exception as e:
                 v = {"name": "", "changed": [], "base_changed": False, "present": [], "error": str(e)}
                 self._setup_cache = (time.monotonic(), v)
-        return {k: v.get(k, "") for k in ("name", "owner", "changed", "base_changed")}
+        return {k: v.get(k, "") for k in ("name", "owner", "changed", "base_changed", "settings_owner")}
 
     def cmd_setup_list(self, owner=""):
         S = self._setups(owner)
@@ -731,8 +840,8 @@ class WorkcellCommands:
     cmd_setup_list.read_only = True
 
     def cmd_setup_copy(self, source_owner, name, owner="", new_name="", replace=False):
-        """Copy a setup from another profile (or Shared) into profile `owner`."""
-        S = self._setups(owner)
+        """Copy a setup from another profile (or Shared) into profile `owner` (your own)."""
+        S = self._setups(self._own(owner))
         n = S.copy_from(self._setups(source_owner), str(name), str(new_name or ""), bool(replace))
         return self._ok(f"setup '{name}' copied to {S.owner or 'Shared'} as '{n}'", setups=S.list(), owner=S.owner,
                         current=self.setup_current())
@@ -766,7 +875,7 @@ class WorkcellCommands:
                 "calibrations": [c["name"] for c in self.cams.view()]}
 
     def cmd_setup_save(self, name, note="", replace=False, owner=""):
-        S = self._setups(owner)
+        S = self._setups(self._own(owner))
         holds = S.save(str(name), str(note or ""), bool(replace), base=self.running_base(), cameras=self._cameras_on())
         who = f" in {S.owner}" if S.owner else ""
         self.core.bridge.log(f"setup '{name}'{who} saved: {', '.join(holds) or 'nothing to save yet'}")
@@ -774,7 +883,7 @@ class WorkcellCommands:
                         base=self.base_view(), current=self.setup_current())
 
     def cmd_setup_delete(self, name, owner=""):
-        S = self._setups(owner)
+        S = self._setups(self._own(owner))
         S.delete(str(name))
         return self._ok(f"setup '{name}' deleted", setups=S.list(), owner=S.owner, base=self.base_view(),
                         current=self.setup_current())
@@ -788,7 +897,10 @@ class WorkcellCommands:
         if self.on_restart is None:
             raise P.PartError("loading a setup restarts the GUI, and this GUI was not started by the launcher "
                               "(ur7e_gui.sh)")
-        r = self._setups(owner).load(str(name), base=self.running_base(), cameras=self._cameras_on())
+        # anyone's setup can be loaded into your settings; the backup of the files in use goes to your profile
+        mine = self.lease.profile if self.lease.token else ""
+        r = self._setups(owner).load(str(name), base=self.running_base(), cameras=self._cameras_on(),
+                                     backup_to=self._setups(mine) if mine else None)
         if r.get("cameras") is not None:                  # its cameras start with the GUI, the others stop
             for x in self.drivers.view()["services"]:
                 if x["kind"] != "camera":

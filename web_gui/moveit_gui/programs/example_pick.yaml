@@ -17,4 +17,4 @@ steps:
   - {type: gripper, command: close, effort: 40}
   - {type: wait, seconds: 0.5}
   - {type: move_pose, target: above_pick, cartesian: true, velocity: 0.05}
-  - {type: movej, target: home, velocity: 0.2}
+  - {type: movej, target: up, velocity: 0.2}

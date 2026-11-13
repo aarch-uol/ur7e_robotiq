@@ -46,5 +46,24 @@ def test_the_rbf_example_scrapes_stroke_one_down_at_5_mm_s(s):
     d["steps"] = d["steps"][:cut + 1] + \
         [x for x in d["steps"][cut + 1:] if x.get("target") == "approach_neck"][-1:] + [d["steps"][-1]]
     v = _run(s, d, 240)
-    # approach (joint move), into the neck, to the top of the stroke, 3 x down the wall, out, up
-    assert v == [0.0, 15.0, 15.0, 5.0, 5.0, 5.0, 15.0, 15.0], v
+    # approach (joint move), into the neck, turned to the stroke, down the shaft to 5 mm short of the wall, onto it
+    # and 13 more poses down the wall, out, up
+    assert v == [0.0, 15.0, 15.0, 15.0] + [5.0] * 16 + [15.0, 15.0], v
+
+
+def test_the_rbf_example_previews_on_the_example_flask_until_one_is_taught(s):
+    """No flask taught: PROGRAMS previews the scrape on the profile's example flask (never saved as a fixture)."""
+    from test_program_franka import _chain_urdf
+    s.core.bridge.fake_robot_description = _chain_urdf(s.core.profile.joint_names)
+    s.core.bridge._q = [0.0] * 6
+    s.tick()
+    assert "flask" not in s.core.store.fixtures
+    d = yaml.safe_load(open(os.path.join(ROOT, "example_rbf_scrape_speed.yaml")))
+    cmd(s, "program_set_yaml", text=yaml.safe_dump(d, sort_keys=False))
+    r = cmd(s, "program_preview_path")
+    assert r["assumed"] == {"flask": [500.0, -200.0, 82.5]}
+    assert "example position" in r["note"] and "SETUP > Flask" in r["note"] and "Vial" not in r["note"]
+    z = [p[2] for p in r["points"][1:]]                                   # mm
+    assert min(z) == __import__("pytest").approx(82.5 - 41.0, abs=0.01)     # the tip reaches the inside bottom
+    assert "flask" not in s.core.store.fixtures
+    assert "example" not in [v["name"] for v in cmd(s, "vial_profiles")["vials"]]   # a flask is not a vial profile

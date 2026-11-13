@@ -9,7 +9,8 @@ Before a load, the current files are kept as an automatic setup ("_before_<name>
 A setup also remembers the end-effector base it was made on (bases.py: gripper, F/T + gripper, ...): loading it
 puts that base back, so the robot stack restarts when the base differs from the running one.
 
-Programs, policies and recordings are not part of a setup: they are shared by every setup.
+Programs, policies and recordings are not part of a setup (programs are kept per profile, see web/service.py).
+A profile's own settings in use are kept the same way (worksets.py).
 
 Setups are kept per person (user_profiles.py: config_dir()/profiles/<name>/setups/); the older ones in
 config_dir()/setups/ are the "Shared" ones (owner ""). Whoever's setup it is, the one in use is marked in
@@ -51,7 +52,13 @@ def members(profile: str) -> Dict[str, str]:
         "part meshes": "parts/meshes/",
         "parts URDF/SRDF": "parts/generated/",
         "camera calibrations": f"cameras/{profile}.yaml",
+        "F/T limit": "ft_limit.yaml",
+        "recording settings": f"recording/{profile}.json",
     }
+
+
+# Added later: a setup saved before them does not hold them, and loading it leaves those files as they are
+OPTIONAL = ("F/T limit", "recording settings")
 
 
 def _payload_files(cfg: Path, profile: str) -> List[Path]:
@@ -85,6 +92,59 @@ def _same_file(a: Path, b: Path) -> bool:
         except (OSError, ValueError):
             return False
     return False
+
+
+def copy_files(cfg: Path, profile: str, dest: Path) -> List[str]:
+    """Copy the files in use (members(), and the last payload calibration) into `dest` (made empty first).
+    Returns what was there. `dest/.strict` marks a complete set: put_in_place then also removes what it lacks."""
+    cfg, dest = Path(cfg), Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    holds = []
+    for key, rel in members(profile).items():
+        src = cfg / rel.rstrip("/")
+        if rel.endswith("/"):
+            if src.is_dir() and any(src.iterdir()):
+                shutil.copytree(src, dest / rel.rstrip("/"))
+                holds.append(key)
+        elif src.is_file():
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest / rel)
+            holds.append(key)
+    pf = _payload_files(cfg, profile)
+    if pf:
+        (dest / "ft_payload").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pf[-1], dest / "ft_payload" / pf[-1].name)
+        holds.append("last payload calibration")
+    (dest / ".strict").write_text("")
+    return holds
+
+
+def put_in_place(cfg: Path, profile: str, files: Path):
+    """Make the files in use those of `files` (as copy_files made them). A member `files` lacks is removed, except
+    an OPTIONAL one in a set saved before it existed (no `.strict`), which stays as it is."""
+    cfg, files = Path(cfg), Path(files)
+    strict = (files / ".strict").exists()
+    for key, rel in members(profile).items():
+        dst, src = cfg / rel.rstrip("/"), files / rel.rstrip("/")
+        if key in OPTIONAL and not strict and not src.exists():
+            continue
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        elif dst.exists():
+            dst.unlink()
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        elif src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    kept = sorted((files / "ft_payload").glob("*.json")) if (files / "ft_payload").is_dir() else []
+    if kept and not (_payload_files(cfg, profile) and
+                     filecmp.cmp(_payload_files(cfg, profile)[-1], kept[-1], shallow=False)):
+        (cfg / "ft_payload").mkdir(parents=True, exist_ok=True)
+        # a new name, so it is the newest file (the one SETUP shows as the last calibration)
+        shutil.copy2(kept[-1], cfg / "ft_payload" / f"{profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
 
 
 class Setups:
@@ -184,6 +244,8 @@ class Setups:
             if key in DERIVED:
                 continue
             a, b = self.cfg / rel.rstrip("/"), files / rel.rstrip("/")
+            if key in OPTIONAL and not b.exists() and not (files / ".strict").exists():
+                continue
             if not (_same_tree(a, b) if rel.endswith("/") else _same_file(a, b)):
                 out.append(key)
         live, kept = _payload_files(self.cfg, self.profile), sorted((files / "ft_payload").glob("*.json"))
@@ -203,22 +265,7 @@ class Setups:
         if tmp.exists():
             shutil.rmtree(tmp)
         tmp.mkdir(parents=True)
-        holds = []
-        for key, rel in members(self.profile).items():
-            src = self.cfg / rel.rstrip("/")
-            if rel.endswith("/"):
-                if src.is_dir() and any(src.iterdir()):
-                    shutil.copytree(src, tmp / "files" / rel.rstrip("/"))
-                    holds.append(key)
-            elif src.is_file():
-                (tmp / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, tmp / "files" / rel)
-                holds.append(key)
-        pf = _payload_files(self.cfg, self.profile)
-        if pf:
-            (tmp / "files" / "ft_payload").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(pf[-1], tmp / "files" / "ft_payload" / pf[-1].name)
-            holds.append("last payload calibration")
+        holds = copy_files(self.cfg, self.profile, tmp / "files")
         info = {"version": 1, "profile": self.profile, "note": str(note or "")[:300],
                 "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}
         if base:
@@ -255,7 +302,8 @@ class Setups:
             raise SetupError(f"no setup '{name}'")
         shutil.rmtree(d)
 
-    def load(self, name: str, base: Optional[str] = None, cameras: Optional[List[str]] = None) -> dict:
+    def load(self, name: str, base: Optional[str] = None, cameras: Optional[List[str]] = None,
+             backup_to: Optional["Setups"] = None) -> dict:
         """Put the setup's files in place (base, cameras: the running ones, kept in the automatic backup).
         Returns {"backup": name, "holds": [...], "base": the setup's base or "", "cameras": its camera drivers, or
         None for a setup saved before setups kept them}; the caller starts / stops the cameras and restarts."""
@@ -267,24 +315,11 @@ class Setups:
         if info.get("profile") and info["profile"] != self.profile:
             raise SetupError(f"setup '{name}' is for robot profile {info['profile']}, this GUI runs {self.profile}")
         backup = f"{AUTO_PREFIX}{re.sub(r'[^A-Za-z0-9_.-]', '_', d.name)[:16]}_{time.strftime('%m%d_%H%M%S')}"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._copy_in(self.dir / backup, f"automatic: the files in use before '{d.name}' was loaded", base, cameras)
-        for rel in members(self.profile).values():
-            dst, src = self.cfg / rel.rstrip("/"), files / rel.rstrip("/")
-            if dst.is_dir():
-                shutil.rmtree(dst)
-            elif dst.exists():
-                dst.unlink()
-            if src.is_dir():
-                shutil.copytree(src, dst)
-            elif src.is_file():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-        for p in sorted((files / "ft_payload").glob("*.json")) if (files / "ft_payload").is_dir() else []:
-            (self.cfg / "ft_payload").mkdir(parents=True, exist_ok=True)
-            # a new name, so it is the newest file (the one SETUP shows as the last calibration)
-            shutil.copy2(p, self.cfg / "ft_payload" / f"{self.profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
-        self._prune()
+        bk = backup_to or self                         # the backup goes to the one loading it
+        bk.dir.mkdir(parents=True, exist_ok=True)
+        bk._copy_in(bk.dir / backup, f"automatic: the files in use before '{d.name}' was loaded", base, cameras)
+        put_in_place(self.cfg, self.profile, files)
+        bk._prune()
         self._mark(d.name)
         b = str(info.get("base") or "")
         from .bases import BASES

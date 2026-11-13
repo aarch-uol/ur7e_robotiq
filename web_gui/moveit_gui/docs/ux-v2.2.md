@@ -80,7 +80,7 @@ The **gripper** is modelled outside this: `gripper.controller_manager: /robotiq_
 5. **Gripper card:** Ready / Fault / Unavailable, % closed, Open / Close, target + effort.
    `Advanced ▸` shows the raw position, velocity and effort, the controller manager, the controller
    states and the action type. The reactivation button only appears when a verified service is configured.
-6. **ATI F/T strip:** read-only. The ATI box is never biased; a software bias is set in web SETUP › F/T + Payload (see WEB.md).
+6. **ATI F/T strip:** read-only. The ATI box is never biased; a software bias is set in web SETUP › F/T + payload (see WEB.md).
 
 ## 5. PROGRAMS ([1366](ux/v2.2/1366_programs.png))
 

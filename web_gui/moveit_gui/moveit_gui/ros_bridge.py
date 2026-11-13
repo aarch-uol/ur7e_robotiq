@@ -235,7 +235,16 @@ class CameraTopics:
         else:
             from sensor_msgs.msg import CompressedImage as Msg
             cb = lambda m: w.on_compressed(m.format, m.data, m.header.frame_id)  # noqa
-        return self.node.create_subscription(Msg, topic, cb, qos_profile_sensor_data, callback_group=self.cb), ""
+
+        # Raw: a frame the preview would drop anyway (it shows at most ~15 per second) is only counted, never turned
+        # into a Python message. A ZED colour frame is megabytes: at 30-60 Hz that copying alone took most of a core.
+        def raw_cb(data: bytes):
+            if not w.wants():
+                w.tick()
+                return
+            cb(deserialize_message(data, Msg))
+        return self.node.create_subscription(Msg, topic, raw_cb, qos_profile_sensor_data, callback_group=self.cb,
+                                             raw=True), ""
 
     def watch_image(self, topic: Optional[str]) -> Tuple[bool, str]:
         """Preview one image topic (or none). Only one subscription exists at a time (the desktop GUI)."""
@@ -285,6 +294,17 @@ class CameraTopics:
 
     def watched_image(self) -> Optional[ImageWatch]:
         return self._image_watch
+
+
+def light_executor():
+    """rclpy's EventsExecutor (Jazzy: rclpy.experimental), else a SingleThreadedExecutor. Both cost much less per
+    message than a MultiThreadedExecutor; only for callbacks that never block."""
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except Exception:  # pragma: no cover - older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 
 
 class RealCameras(CameraTopics):
@@ -345,14 +365,19 @@ class RosBridge(CameraTopics):
 
         t, s = profile.topics, profile.services
         n = self.node
+        # The fast streams (joint states, F/T, speed scaling at 500 Hz; Servo status and output) on their own node and a lighter executor
+        # (_fast_spin). On the shared MultiThreadedExecutor each one took ~50 % of a Jetson core in executor overhead
+        # alone (measured: 52 % for /joint_states; EventsExecutor 10 %). Their callbacks only store values.
+        self._moveit_js_cb = None                       # see _take_moveit_joint_states
+        self._fast_node = Node(node_name + "_fast")
+        fn = self._fast_node
         # raw: most messages are dropped unread (_on_joints_raw), which saves decoding them in Python
-        n.create_subscription(JointState, t.get("joint_states", "/joint_states"), self._on_joints_raw,
-                              qos_profile_sensor_data, callback_group=self.cb, raw=True)
+        fn.create_subscription(JointState, t.get("joint_states", "/joint_states"), self._on_joints_raw,
+                               qos_profile_sensor_data, raw=True)
         if t.get("wrench"):
-            n.create_subscription(WrenchStamped, t["wrench"], self._on_wrench,
-                                  qos_profile_sensor_data, callback_group=self.cb)
-        if t.get("speed_scaling"):
-            n.create_subscription(Float64, t["speed_scaling"], self._on_speed, 10, callback_group=self.cb)
+            fn.create_subscription(WrenchStamped, t["wrench"], self._on_wrench, qos_profile_sensor_data)
+        if t.get("speed_scaling"):                     # also 500 Hz (ur_controllers' broadcaster): the fast node
+            fn.create_subscription(Float64, t["speed_scaling"], self._on_speed, 10)
         if t.get("program_running"):
             n.create_subscription(Bool, t["program_running"], self._on_prog, LATCHED, callback_group=self.cb)
         if HAVE_UR_MSGS:
@@ -498,14 +523,12 @@ class RosBridge(CameraTopics):
                     cfg.get("output_type", ""))
                 if cfg.get("output_topic") and out_type is not None:
                     # Diagnostics only: how many commands this Servo node actually sent to its controller.
-                    n.create_subscription(out_type, cfg["output_topic"],
-                                          lambda _m, ep=ep: ep.__setitem__("out_n", ep["out_n"] + 1),
-                                          10, callback_group=self.cb)
-                if cfg.get("status_topic"):
-                    n.create_subscription(
-                        ServoStatus, cfg["status_topic"],
-                        lambda msg, route=name: self._on_servo_status(route, msg),
-                        10, callback_group=self.cb)
+                    # (the fast node: up to 500 Hz while jogging)
+                    self._fast_node.create_subscription(
+                        out_type, cfg["output_topic"], lambda _m, ep=ep: ep.__setitem__("out_n", ep["out_n"] + 1), 10)
+                if cfg.get("status_topic"):                    # 100 Hz while Servo runs: the fast node
+                    self._fast_node.create_subscription(
+                        ServoStatus, cfg["status_topic"], lambda msg, route=name: self._on_servo_status(route, msg), 10)
         except ImportError:  # pragma: no cover
             pass
         if ExecuteTrajectory is not None:
@@ -533,6 +556,7 @@ class RosBridge(CameraTopics):
                                   use_move_group_action=bool(m.get("use_move_group_action", True)))
             self.set_scaling(float(m.get("default_velocity_scaling", 0.1)),
                              float(m.get("default_acceleration_scaling", 0.1)))
+            self._take_moveit_joint_states()
         except Exception as e:  # pragma: no cover
             self.log(f"MoveIt interface unavailable: {e}")
 
@@ -541,7 +565,37 @@ class RosBridge(CameraTopics):
         self._executor.add_node(n)
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True, name="ros-executor")
         self._spin_thread.start()
-        self.log(f"ROS bridge up for profile '{profile.name}'")
+        self._fast_executor = light_executor()          # after every _fast_node subscription is made
+        self._fast_executor.add_node(self._fast_node)
+        threading.Thread(target=self._fast_spin, daemon=True, name="ros-fast").start()
+        self.log(f"ROS bridge up for profile '{profile.name}' (joint states / F/T on "
+                 f"{type(self._fast_executor).__name__})")
+
+    def _take_moveit_joint_states(self):
+        """pymoveit2 subscribes to /joint_states itself (for a move's start state), on the shared executor: 500 Hz
+        there cost ~40 % of a Jetson core. Drop that subscription and hand it the arm messages _on_joints already
+        reads (about 100 Hz). If this pymoveit2 has other internals, its own subscription stays."""
+        mv = self.moveit
+        sub = getattr(mv, "_MoveIt2__joint_state_subscription", None)
+        cb = getattr(mv, "_MoveIt2__joint_state_callback", None)
+        if sub is None or cb is None:
+            self.log("pymoveit2 keeps its own /joint_states subscription (unknown version)")
+            return
+        self._moveit_js_cb = cb
+        self.node.destroy_subscription(sub)
+
+    def _fast_spin(self):
+        while not self._shutting_down:
+            try:
+                self._fast_executor.spin_once(timeout_sec=0.1)
+            except Exception as e:
+                if self._shutting_down or not rclpy.ok():
+                    return
+                try:
+                    self.log(f"ROS joint state / F/T executor error (spinning on): {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
     def _spin_loop(self):
         """Spin the executor until shutdown. One failing callback must not end every update silently: log it and
@@ -647,7 +701,16 @@ class RosBridge(CameraTopics):
             self._snap.joint_velocities = qd
             self._velocities_ok = qd is not None
             self._t_joints = time.monotonic()
+            st = getattr(getattr(msg, "header", None), "stamp", None)   # teaching: the joint state's own time
+            self._joints_stamp = (st.sec + st.nanosec * 1e-9) if st is not None and (st.sec or st.nanosec) \
+                else time.monotonic()
             self._joints_received = True
+        mcb = getattr(self, "_moveit_js_cb", None)
+        if mcb is not None:
+            try:
+                mcb(msg)
+            except Exception as e:  # pragma: no cover - never break the joint state subscription
+                self.log(f"pymoveit2 joint state: {e}")
 
     def _on_robot_description(self, msg):
         with self._lock:
@@ -1216,6 +1279,30 @@ class RosBridge(CameraTopics):
     def execute_trajectory(self, trajectory) -> bool:
         return self._execute_on_active_controller(trajectory)
 
+    def execute_joint_path(self, joint_names, times, positions, velocities=None) -> bool:
+        """A taught replay (replay.py): one JointTrajectory, sent like a planned one (MoveIt ExecuteTrajectory to the
+        active mode's controller, or from its reference in chained admittance)."""
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        traj = JointTrajectory()
+        traj.joint_names = list(joint_names)
+        for k, (t, q) in enumerate(zip(times, positions)):
+            p = JointTrajectoryPoint()
+            p.positions = [float(x) for x in q]
+            if velocities is not None:
+                p.velocities = [float(x) for x in velocities[k]]
+            ns = int(round(float(t) * 1e9))
+            p.time_from_start = DurationMsg(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
+            traj.points.append(p)
+        self.log(f"replay: {len(traj.points)} points, {float(times[-1]):.1f} s")
+        return self._execute_on_active_controller(traj)
+
+    def joint_sample(self):
+        """(JointState header stamp s, joints) of the last arm joint state, or None."""
+        with self._lock:
+            if not self._joints_received or not self._snap.joints:
+                return None
+            return getattr(self, "_joints_stamp", self._t_joints), list(self._snap.joints)
+
     def move_joints(self, joints, vel=0.1, acc=0.1) -> bool:
         self.log(f"MoveJ -> {[round(j, 4) for j in joints]}")
         epoch = self.stop_epoch
@@ -1727,6 +1814,12 @@ class RosBridge(CameraTopics):
                 time.sleep(0.02)
         time.sleep(0.1)                                  # let DDS send the last zeros before the node goes
         self._executor.shutdown(timeout_sec=1.0)
+        if getattr(self, "_fast_node", None) is not None:
+            try:
+                self._fast_executor.shutdown(timeout_sec=1.0)
+                self._fast_node.destroy_node()
+            except Exception as e:
+                self.log(f"shutdown: joint state / F/T node: {e}")
         if getattr(self, "_tf_node", None) is not None:
             try:
                 self._tf_listener.executor.shutdown(timeout_sec=1.0)

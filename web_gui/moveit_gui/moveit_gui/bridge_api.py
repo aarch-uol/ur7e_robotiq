@@ -38,6 +38,10 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
   move_pose(target_link, T_base_link, cartesian, vel, acc, cart_speed=0.0, speed_point=None) -> bool
                                              cart_speed: m/s limit of a linear move (<= 0 = none) for the point
                                              speed_point (xyz m in target_link: the TCP); plan_pose takes the same
+  execute_joint_path(names, times, positions, velocities) -> bool
+                                             one joint trajectory (a taught replay, replay.py) through the active
+                                             mode's controller, as a planned trajectory is executed; STOP cancels it
+  joint_sample() -> Optional[(t, q)]         the last arm joint state with its own time stamp (s; teaching)
 """
 from __future__ import annotations
 

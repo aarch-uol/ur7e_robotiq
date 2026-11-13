@@ -320,13 +320,17 @@ ft_calibration:
 # Example fixtures, NOT taught: the PROGRAMS preview uses one while the real fixture is missing, and SETUP >
 # Vial Geometry > Vial profiles lists it as the built-in profile `label` (Use makes it the real fixture). vial = scraping.py's target_xyz
 # (~/franka_ros2/sample_scraping/scripts/scraping.py, `robot_demo`): vial centre at the bottom, base axes.
+# flask: a round-bottom flask, 85 mm bulb (kind: flask, the frame of SETUP > Flask: bulb centre, Z up the neck) standing
+# on the same surface as the vial, 200 mm to its right: the PROGRAMS preview of example_rbf_scrape_speed.
 example_fixtures:
   vial: {parent: base_link, xyz_mm: [525.0, 16.0, 40.0], rpy_deg: [0.0, 0.0, 0.0],
          source: "scraping.py target_xyz", radius_mm: 17.0, height_mm: 40.0, label: baseline}
+  flask: {parent: base_link, xyz_mm: [500.0, -200.0, 82.5], rpy_deg: [0.0, 0.0, 0.0], kind: flask,
+          source: "example 250 ml flask", label: example}
 
 # Named joint waypoints usable from programs (radians).
 waypoints:
-  home:
+  up:
     joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
   ready:
     joints: [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]

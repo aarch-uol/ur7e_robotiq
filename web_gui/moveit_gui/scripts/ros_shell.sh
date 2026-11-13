@@ -30,7 +30,10 @@ else
 fi
 echo "ROS domain $DOMAIN, discovery $RANGE. This folder is /work." >&2
 
-SRC="source /opt/ros/jazzy/setup.bash; for f in /opt/ur7e_ws/install/setup.bash /ws/install/setup.bash; do [ -f \$f ] && source \$f; done"
+# ~/ur7e_robotiq's packages as the launcher built them (its overlay on the image), when there is one
+OVERLAY=(); [ -f "$HOME/ur7e_data/overlay/install/setup.bash" ] && \
+  OVERLAY=(-v "$HOME/ur7e_data/overlay:/data/overlay:ro" -v "$HOME/ur7e_robotiq:/ur7e_robotiq:ro")
+SRC="source /opt/ros/jazzy/setup.bash; for f in /opt/ur7e_ws/install/setup.bash /data/overlay/install/setup.bash /ws/install/setup.bash; do [ -f \$f ] && source \$f; done"
 TTY=(-i); [ -t 0 ] && [ -t 1 ] && TTY=(-it)
 if [ $# -gt 0 ]; then
   CMD=(bash -c "$SRC; exec python3 \"\$@\"" ros_shell "$@")
@@ -40,4 +43,4 @@ fi
 # --ipc=host like the ZED container: without it the topics show but no messages arrive (ROS 2 on one PC uses
 # shared memory; tested on the Jetson)
 exec docker run --rm "${TTY[@]}" --net=host --ipc=host -e ROS_DOMAIN_ID="$DOMAIN" -e ROS_AUTOMATIC_DISCOVERY_RANGE="$RANGE" \
-  -v "$PWD:/work" -w /work -v "$WS:/ws:ro" "$IMAGE" "${CMD[@]}"
+  -v "$PWD:/work" -w /work -v "$WS:/ws:ro" "${OVERLAY[@]}" "$IMAGE" "${CMD[@]}"

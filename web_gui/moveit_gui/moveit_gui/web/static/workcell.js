@@ -147,7 +147,7 @@ export function workcell(ctx) {
         "A shape sits on its frame and grows along +Z, so a part put on another one starts on its far face. Saved parts are " +
         "live at once: a TF frame, a MoveIt collision object (carried by the arm link they ride on) and the 3D views. " +
         "Restart the robot stack to write them into the robot model too (URDF / SRDF: RViz, recordings, self-collision). " +
-        "Changing the tool changes the payload: redo SETUP › F/T + Payload."),
+        "Changing the tool changes the payload: redo SETUP › F/T + payload."),
       h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, ["Part", "On", "Shape", "Offset mm, °", "", ""].map((x) => h("th", {}, x)))),
         h("tbody", { id: "pt-list" })),
       h("div", { class: "muted small", id: "pt-sync" }),
@@ -693,7 +693,7 @@ export function workcell(ctx) {
           h("div", { class: "list" }, ...v.nets.map((n) => radio("su-net", n.name, n.name === net, n.label, n.text, true, (x) => (net = x)))),
           sec(5, "Cameras"),
           v.cameras.length ? h("div", { class: "small" }, "On this robot: " + v.cameras.map((c) => `${c.name} (${c.label})`).join(", ") +
-            ". Edit or remove them in SETUP › Drivers & cameras.") : h("div", { class: "muted small" }, "None yet. Tick the ones to add:"),
+            ". Edit or remove them in SETUP › Cameras.") : h("div", { class: "muted small" }, "None yet. Tick the ones to add:"),
           h("div", { class: "list" }, ...v.camera_types.filter((t) => !v.cameras.some((c) => c.type === t.type)).map((t) => {
             const box = camChecks[t.type] || (camChecks[t.type] = h("input", { type: "checkbox", disabled: !t.installed }));
             return h("label", { class: "item" + (t.installed ? "" : " muted"), style: t.installed ? "cursor:pointer" : "" }, box,
@@ -804,13 +804,16 @@ export function workcell(ctx) {
       if (!c) return;
       $("#st-present").textContent = c.present?.length ? "Saves: " + [B ? "base " + baseLabel(B.running) : "", ...words(c.present)].filter(Boolean).join(" · ")
         : "Nothing to save yet.";
+      const who = c.settings_owner ? h("div", { class: "small", title: "The robot runs the settings of the one in " +
+        "control. Taking control switches to your own; theirs stay in their profile." },
+        "Settings in use: ", h("b", {}, `${c.settings_owner}'s`)) : "";
       if (!c.name) {
-        cur.replaceChildren(h("b", {}, "No setup loaded."), " The robot runs what was set up last. Save it below to keep it.");
+        cur.replaceChildren(who, h("b", {}, "No setup loaded."), " The robot runs what was set up last. Save it below to keep it.");
         return;
       }
       const ch = words(c.changed).concat(c.base_changed ? ["base"] : []);
       const mine = (c.owner || "") === (OWNER || "");
-      cur.replaceChildren(h("div", { class: "row" }, h("span", { class: "grow" }, "In use: ", h("b", {}, c.owner ? `${c.owner} / ${c.name}` : c.name), " ",
+      cur.replaceChildren(who, h("div", { class: "row" }, h("span", { class: "grow" }, "In use: ", h("b", {}, c.owner ? `${c.owner} / ${c.name}` : c.name), " ",
           ch.length ? chip("changed", "warn") : chip("saved", "ok")),
         ch.length && mine ? lease(btn(`Save into "${c.name}"`, "primary", async () => (await ask(`Save the changes (${ch.join(", ")}) into "${c.name}"?`)) &&
           save(true, c.name, CUR.note))) : ""),
@@ -828,9 +831,9 @@ export function workcell(ctx) {
         step(1, "Put your camera holder in the robot model", g.parts.length > 0,
           g.parts.length ? "Parts now: " + g.parts.join(", ") : "Import its mesh (.stl, .obj, .dae) on the tool. Then Restart robot stack.", "SETUP", "Parts"),
         step(2, "Add your camera and start it", run.length > 0,
-          run.length ? "Running: " + run.map((c) => c.label).join(", ") : g.cameras.length ? "Start yours (others: Stop)." : "Add it with + Add…", "SETUP", "Drivers & cameras"),
+          run.length ? "Running: " + run.map((c) => c.label).join(", ") : g.cameras.length ? "Start yours (others: Stop)." : "Add it with + Add…", "SETUP", "Cameras"),
         step(3, "Calibrate the camera", g.calibrations.length > 0,
-          g.calibrations.length ? "Calibrated: " + g.calibrations.join(", ") : "Eye-in-hand: Start, Plan poses, Collect all…, Solve, Save + add to robot.", "SETUP", "Camera calibration"),
+          g.calibrations.length ? "Calibrated: " + g.calibrations.join(", ") : "Eye-in-hand: Start, Plan poses, Collect all…, Solve, Save + add to robot.", "SETUP", "Camera"),
         step(4, "Save it under your name", !!CUR?.name && !(CUR.changed?.length || CUR.base_changed),
           CUR?.name ? `In use: ${CUR.name}` : "Type a name below (e.g. alice_d405) and press Save.", "", ""));
     }

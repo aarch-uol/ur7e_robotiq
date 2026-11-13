@@ -182,10 +182,14 @@ tr.exec td { background: var(--warn-bg); }
 tbody tr { cursor: pointer; }
 .scroll { overflow: auto; }
 
-/* ----------------------------------------------------------------- run bar */
-.runbar { background: var(--surface); display: flex; gap: var(--s); align-items: center; padding: var(--s) var(--m);
-          border-radius: var(--r); flex-wrap: wrap; }
-.runbar .state { font-weight: 800; letter-spacing: .5px; width: 100px; }
+/* ------------------------------------------------- run controls (PROGRAMS toolbar) */
+.pg-run { gap: 4px; align-items: center; }
+.pg-runmenu { position: relative; }
+.pg-runmenu summary { list-style: none; cursor: pointer; }
+.pg-runmenu summary::-webkit-details-marker { display: none; }
+.pg-runpop { position: absolute; z-index: 20; top: 100%; left: 0; margin-top: 4px; min-width: 150px; padding: var(--s);
+             display: flex; flex-direction: column; gap: var(--s); background: var(--raised); border: 1px solid var(--line);
+             border-radius: var(--r); box-shadow: 0 4px 14px rgba(0,0,0,.15); }
 
 /* ------------------------------------------------------------------- lists */
 .list { display: flex; flex-direction: column; }
@@ -392,7 +396,6 @@ header .pill { max-width: 240px; }
 }
 @media (pointer: coarse) { #stop { height: 48px; min-width: 110px; } }
 /* PROGRAMS: the run bar stays visible at the bottom of the page */
-.runbar { position: sticky; bottom: 0; z-index: 5; box-shadow: 0 -2px 8px rgba(0,0,0,.06); }
 
 /* recording */
 .pill.rec { background: #8e1f1f; color: #fff; cursor: pointer; animation: recblink 1.6s steps(2, start) infinite; }
@@ -499,7 +502,7 @@ ol.steps { margin: 4px 0 6px; padding-left: 18px; color: var(--muted); } ol.step
 .v3pose-t { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
 .v3pose .grid.pose2 { column-gap: 10px; row-gap: 0; }
 .v3pose .k { color: var(--muted); }
-.v3pose .v { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: var(--text); }
+.v3pose .v { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: var(--text); min-width: 9ch; }
 /* Visual / Collision (view3d.js) as the same chips, bottom right */
 .v3show { right: 8px; bottom: 8px; gap: 4px; padding: 0; background: none; }
 .v3show label { height: 26px; padding: 0 11px; border-radius: 13px; font-size: 12px; background: rgba(255,255,255,.92);
