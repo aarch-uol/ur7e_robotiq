@@ -209,6 +209,9 @@ async function profilePrefs(name, reload) {
   const sorted = (o) => JSON.stringify(Object.fromEntries(Object.entries(o).sort()));
   if (!Object.keys(r.prefs).length) {
     if (!Object.keys(local).length) { prefsSynced = sorted(local); return; }
+    // Boot and profile selection happen before the browser takes the control lease. Do not
+    // turn the viewer's first layout sync into a refused write; the autosave loop retries it.
+    if (!holds) { prefsSynced = null; return; }
     const saved = await scmd("profile_prefs_save", { name, prefs: local });
     prefsSynced = saved.ok ? sorted(local) : null;       // a failed save must be retried, not remembered as synced
     return;
@@ -308,7 +311,7 @@ function usersFill() {
       h("span", { class: "up-name" }, u.name + (u.id === MYUID ? " (you)" : "")),
       u.control ? h("span", { class: "chip ok" }, S && S.lease && S.lease.away ? "control · away" : "control") : "",
       u.role ? h("span", { class: "chip", title: "Role (SETTINGS › Roles)" }, u.role) : "",
-      h("span", { class: "up-where muted small", title: "Where it connects from (Tailscale user or IP)" },
+      h("span", { class: "up-where muted small", title: "Connection details" },
         u.where + (u.tabs > 1 ? ` · ${u.tabs} tabs` : "")))),
     h("div", { class: "up-foot" },
       h("button", { class: "btn quiet", type: "button", onclick: async () => {
@@ -709,8 +712,8 @@ pages.OPERATE = {
     this.ftc = ftChart();
     const ft = h("div", { class: "card" },
       h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: `Frame: ${INFO.ft_frame || "sensor frame"}` }, "F/T sensor"),
-        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + payload)" }, "Biased"),
-        h("span", { class: "chip hidden", id: "op-ft-lim", title: "F/T limit (SETUP › F/T + payload): amber over the soft limit, red over the hard one" }, ""),
+        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software offset is set (SETUP › Force sensor)" }, "Biased"),
+        h("span", { class: "chip hidden", id: "op-ft-lim", title: "Force limit (SETUP › Force sensor)" }, ""),
         h("button", { class: "btn quiet ibtn", type: "button", id: "op-ft-show", title: "Show the F/T chart under this card",
           html: icon("chart") + "<span>Chart</span>", onclick: () => this.vg.toggleChart() })),
       h("div", { class: "ft3" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(ftCell),
@@ -1468,7 +1471,7 @@ function forcePanel() {
     h("div", { class: "muted", id: "op-f-note" }),
     note(`Max ${f.max_force_n} N · ${f.max_torque_nm} Nm`,
       `The tool pushes with this wrench at the active TCP. In free air the arm moves until the controller's ` +
-      `stiffness balances it (≈ force / stiffness, see SETUP › Gains); on a surface it presses. ` +
+      `stiffness balances it (≈ force / stiffness, see SETUP › Compliance); on a surface it presses. ` +
       `Ramps at ${f.ramp_force_nps} N/s. ` +
       `Zeroed at once on STOP, losing control, or if this page stops renewing ` +
       `(keep it in front: hidden tabs are throttled). Ends after ${f.max_duration_s} s.`));
@@ -2100,7 +2103,7 @@ pages.PROGRAMS = {
         velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)) });
     } else if (T === "zero_ft") {
       lines.push(h("span"), h("span", { class: "muted small" }, "Averages the F/T reading for 1 s with the arm still and makes it " +
-        "read zero (software bias, SETUP › F/T + payload). Refused in Admittance or with a force applied: put it before them."));
+        "read zero (software offset, SETUP › Force sensor). Refused in compliance or with a force applied: put it before them."));
       this.get = () => ({});
     } else this.get = () => ({});
     if (["movej", "move_pose", "move_relative", "move_until_contact", "replay"].includes(T)) {
@@ -2132,7 +2135,7 @@ pages.PROGRAMS = {
         // which TCP goes to this pose: a named one, or "active" (whichever TCP is selected when it runs, UR style)
         const tcps = ((S && S.calibration && S.calibration.tcps) || []).map((t) => t.name);
         const tc = h("select", { title: "Which TCP goes to this pose. Active TCP: whichever is selected (top bar) when it " +
-          "runs, so switching to e.g. a spatula tip makes the tip go here. A named TCP: always that one; another active " +
+          "runs, so switching to another tool point makes the tip go here. A named TCP: always that one; another active " +
           "TCP then ends up offset (the preview shows where)" },
           [["active", "active TCP (" + ((S && S.calibration && S.calibration.active_tcp) || "?") + ")"],
            ...[...new Set([...(wp.tcp !== "active" ? [wp.tcp] : []), ...tcps])].map((n) => [n, n])]
@@ -2415,7 +2418,7 @@ pages.PROGRAMS = {
     this.bWant = null;
     $("#pg-b-vlist").replaceChildren(...(r.vials.length ? r.vials.map((v) => h("label", { class: "chk" },
       h("input", { type: "checkbox", value: v.name, checked: was.has(v.name) }), v.name))
-      : [h("span", { class: "muted" }, "No vial profiles yet (SETUP › Vial).")]));
+      : [h("span", { class: "muted" }, "No saved vials yet (SETUP › Vial).")]));
   },
   batchSteps() {
     if (!this.prog) return;
@@ -2628,17 +2631,21 @@ pages.AUTOMATION = {
 pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
-  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibration", ["Camera", "F/T + payload", "Vial", "Flask"]],
-    ["Cell", ["Cameras", "Keep-out zones", "Gains"]]],
+  LABELS: { "Setups": "Tool setups", "Parts": "Parts & tools", "TCPs": "Tool points (TCP)",
+    "Camera": "Camera calibration", "F/T + payload": "Force sensor", "Gains": "Compliance" },
+  GROUPS: [["Robot", ["Setups", "Parts", "TCPs", "Cameras"]],
+    ["Sensors / calibration", ["Camera", "F/T + payload"]], ["Workspace", ["Keep-out zones"]],
+    ["Fixtures", ["Vial", "Flask"]], ["Control", ["Gains", "Policies"]]],
+  label(n) { return this.LABELS[n] || n; },
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
       ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
-        h("span", { class: "grow" }, n), h("span", { class: "nb" })))]));
+        h("span", { class: "grow" }, this.label(n)), h("span", { class: "nb" })))]));
     this.body = h("div", { class: "grow col" });
     // one bar for every SETUP page: saved changes that the robot model (URDF) only gets at a robot stack restart
     this.mbar = h("div", { class: "banner-warn row hidden", id: "su-modelbar" }, h("span", { class: "grow", id: "su-modelbar-msg" }),
-      (() => { const b = btn("Restart robot stack…", "", () => this.wc.restart("stack"),
-        "Driver, controllers, MoveIt and the GUI restart (about a minute) and the robot model is rebuilt"); b.dataset.lease = "1"; return b; })());
+      (() => { const b = btn("Restart robot…", "", () => this.wc.restart("stack"),
+        "Restart the robot, MoveIt and the GUI"); b.dataset.lease = "1"; return b; })());
     el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), h("div", { class: "grow col" }, this.mbar, this.body)));
     this.views = {};
     // TCPs: one list, one editor. Name and parent once, then type the offset or measure the tip (pivot)
@@ -2648,20 +2655,18 @@ pages.SETUP = {
     const howBtn = (k, label) => h("button", { class: "btn" + (k === "type" ? " on" : ""), "data-how": k, onclick: () => this.tcpSetHow(k) }, label);
     this.views["TCPs"] = h("div", { class: "col su-main" },
       h("div", { class: "card" },
-        h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "TCPs"),
-          btn("+ New TCP", "", () => this.tcpNew(), "Clear the editor below for a new TCP")),
-        note("A TCP is the tool point the robot moves: tool0 (the flange), robotiq_tcp, or your own, e.g. a spatula tip.",
-          "Your own TCP is a fixed offset from a parent TCP or link. Recorded poses store their TCP. A TCP changes poses only, " +
-          "not MoveIt's collision model (for that, add the tool as a part)."),
+        h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Tool points (TCP)"),
+          btn("+ New tool point", "", () => this.tcpNew(), "Clear the editor below for a new tool point")),
+        note("The point the robot moves and rotates about."),
         h("div", { class: "list", id: "su-tcps" })),
       h("div", { class: "card" },
-        h("div", { class: "section", id: "su-t-title" }, "New TCP"),
+        h("div", { class: "section", id: "su-t-title" }, "New tool point"),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
-          h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "su-tn", placeholder: "spatula_tip" }),
+          h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "su-tn", placeholder: "tool point name" }),
           h("span", { class: "k" }, "From"), h("select", { id: "su-tp", title: "The parent: the offset is measured from this frame",
             onchange: () => this.tcpHow === "pivot" && this.pivot?.samples.length && this.pivotReset() }),
           h("span", { class: "k" }, "How"), h("div", {}, h("span", { class: "seg", id: "su-t-how" },
-            howBtn("type", "Type the offset"), howBtn("pivot", "Measure the tip (pivot)")))),
+            howBtn("type", "Enter offset"), howBtn("pivot", "Measure tip")))),
         h("div", { id: "su-t-type" },
           h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
             h("span", { class: "k" }, "X Y Z mm"), h("div", { class: "row" }, [0, 1, 2].map((i) => n3(i, "0.5"))))),
@@ -2669,7 +2674,7 @@ pages.SETUP = {
           h("ol", { class: "small steps" },
             h("li", {}, "Freedrive on. Hold the tool tip on one fixed point (a cone, a screw head)."),
             h("li", {}, "Keep the tip there, tilt the tool to a new angle, press Capture. 6–12 times, about two different axes."),
-            h("li", {}, "Solve and check the error (under 1 mm is good), then Save TCP.")),
+            h("li", {}, "Solve and check the error (under 1 mm is good), then Save.")),
           h("div", { class: "row" }, freedriveButton(),
             lb(btn("Capture", "", () => this.pivotCmd("pivot_capture", { parent: $("#su-tp").value }), "Reads where the tool is now. Nothing moves")),
             lb(btn("Solve", "", () => this.pivotCmd("pivot_solve"))),
@@ -2680,10 +2685,9 @@ pages.SETUP = {
           h("div", { class: "mono small", id: "su-pivot-result" }, "")),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
           h("span", { class: "k" }, "R P Y °"), h("div", { class: "row" }, [3, 4, 5].map((i) => n3(i, "1")))),
-        h("div", { class: "muted small", id: "su-t-rpyhint" }, "Rotation of the TCP from its parent (0 0 0 = the same axes)."),
+        h("div", { class: "muted small", id: "su-t-rpyhint" }, ""),
         h("div", { class: "row" },
-          (() => { const b = lb(btn("Save TCP", "primary", () => this.tcpHow === "pivot" ? this.pivotSave() : this.saveTcp())); b.id = "su-t-save"; return b; })(),
-          h("span", { class: "muted small" }, "Saving a name that exists changes that TCP."))));
+          (() => { const b = lb(btn("Save", "primary", () => this.tcpHow === "pivot" ? this.pivotSave() : this.saveTcp())); b.id = "su-t-save"; return b; })()));
     // Vial
     const vrows = INFO.vial_points.map((n, k) => h("div", { class: "row" }, h("span", { class: "dot", id: `su-vd-${k}` }),
       h("span", { style: "width:130px" }, n + (n === "Bottom" ? " (optional)" : "")),
@@ -2691,23 +2695,23 @@ pages.SETUP = {
       btn("Capture", "", () => cmd("vial_capture", { point: n }).then((r) => r.ok && this.vial(r.vial)))));
     vrows.forEach((r) => (r.lastChild.dataset.lease = "1"));
     this.views["Vial"] = h("div", { class: "col su-main" },
-      h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow" }, "Touch points"), freedriveButton()),
-        h("div", { class: "muted" }, "In freedrive, touch the TCP to the rim at three points spread around it and capture each. Optionally touch the bottom."),
+      h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow" }, "Touch the rim"), freedriveButton()),
+        h("div", { class: "muted" }, "In freedrive, touch the rim at three points and capture each. The bottom is optional."),
         vrows, h("div", {}, btn("Reset", "quiet", () => cmd("vial_reset").then((r) => r.ok && this.vial(r.vial))))),
       h("div", { class: "card" }, h("div", { class: "section" }, "Vial"),
         h("div", { class: "grid", id: "su-vres" }), h("div", { class: "error", id: "su-verr" }),
-        note("XY circle in the base frame.", "XY circle in the base frame, assuming a level rim and a vertical vial. Without a bottom touch, Z is the lowest rim point."),
+        note("Fit the rim and save it for use."),
         h("div", { class: "row" }, h("input", { type: "text", id: "su-vname", value: "vial", style: "flex:1" }),
-          btn("Save as fixture", "primary", () => cmd("vial_save", { name: $("#su-vname").value }))),
-        h("div", { class: "row" }, btn("Save as vial profile…", "", async () => {
-          const n = (await askText("Name of this vial (e.g. 'vial A', 'rack 2'). It is kept in the vial profiles list:", ""));
+          btn("Use now", "primary", () => cmd("vial_save", { name: $("#su-vname").value }))),
+        h("div", { class: "row" }, btn("Save to list", "", async () => {
+          const n = (await askText("Name for this vial:", ""));
           if (n) cmd("vial_profile_save", { name: n, source: "touch", fixture: $("#su-vname").value || "vial",
             use: (await ask(`Also use it as "${$("#su-vname").value || "vial"}" now (the frame programs use)?`)) })
             .then((r) => r.ok && this.vialProfiles(r.vials));
         }, "Keep the fitted vial as a named profile, to switch back to it later"))),
-      // several vials: named profiles (built-in baseline = scraping.py's), one of them is the fixture programs use
+      // Several vials can be saved for later use.
       h("div", { class: "card" },
-        h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Vial profiles"),
+        h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Saved vials"),
           h("span", { class: "muted small" }, "Use as"),
           h("input", { type: "text", id: "su-vp-as", value: "vial", style: "width:90px",
             title: "The fixture a profile becomes when you press Use. Programs use \"vial\"; a second vial in the " +
@@ -2719,31 +2723,27 @@ pages.SETUP = {
           ...["x", "y", "z"].map((a) => h("input", { type: "number", id: `su-vp-${a}`, placeholder: a + " mm", step: "0.5", style: "width:80px" })),
           h("input", { type: "number", id: "su-vp-r", placeholder: "radius", step: "0.5", style: "width:70px" }),
           h("input", { type: "number", id: "su-vp-h", placeholder: "height", step: "0.5", style: "width:70px" }),
-          btn("Add typed", "", () => cmd("vial_profile_save", { name: $("#su-vp-name").value, source: "typed",
+          btn("Add", "", () => cmd("vial_profile_save", { name: $("#su-vp-name").value, source: "typed",
             xyz_mm: ["x", "y", "z"].map((a) => +$(`#su-vp-${a}`).value), radius_mm: $("#su-vp-r").value || null,
             height_mm: $("#su-vp-h").value || null }).then((r) => r.ok && this.vialProfiles(r.vials)),
             "A vial whose position you know: centre of its bottom in the robot base frame"),
-          btn("Save current fixture…", "quiet", async () => {
+          btn("Save current", "quiet", async () => {
             const f = $("#su-vp-as").value || "vial";
             const n = (await askText(`Save the fixture "${f}" as a vial profile named:`, ""));
             if (n) cmd("vial_profile_save", { name: n, source: "fixture", fixture: f }).then((r) => r.ok && this.vialProfiles(r.vials));
           }, "Keep the vial that is taught now (e.g. before teaching another one)")),
-        note("Use makes a profile the fixture (\"vial\") that programs, keep-out boxes and the preview use.",
-          "Centre of the vial bottom in the robot base frame, base axes. baseline is built in: scraping.py's target_xyz " +
-          "(only right if your vial is really there). Saved profiles are kept per robot; Use is refused while a program runs.")));
+        note("Save several vials and choose which one is in use.")));
     this.vsave = this.views["Vial"].querySelector(".btn.primary");
     this.views["Vial"].querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
     // Keep-out zones: MoveIt collision boxes (planning scene objects gui_keepout/<name>)
-    const v3 = (id, step) => h("div", { class: "row" }, [0, 1, 2].map((i) =>
+    const v3 = (id, step) => h("div", { class: "xyz" }, [0, 1, 2].map((i) =>
       h("input", { type: "number", id: `${id}${i}`, value: "0", step, style: "width:80px" })));
     this.views["Keep-out zones"] = h("div", { class: "col su-main" },
       h("div", { class: "card" },
         h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Keep-out zones"),
           (() => { const b = btn("Re-apply", "quiet", () => cmd("keepout_apply"),
             "Send every enabled box to MoveIt again (e.g. after restarting move_group)"); b.id = "su-ko-apply"; return b; })()),
-        note("Boxes MoveIt plans around (table, holders, camera mounts). They never move the robot.",
-          "Each box hangs on the base frame or a fixture (it follows the fixture when that is re-taught). A box " +
-          "around the current TCP or the robot base is refused: MoveIt would start in collision and every plan would fail."),
+        note("Boxes the planner avoids."),
         h("div", { class: "ko-status", id: "su-ko-status" }, "—"),
         h("div", { class: "list", id: "su-ko-list" })),
       h("div", { class: "card" },
@@ -2755,8 +2755,7 @@ pages.SETUP = {
           h("span", { class: "k" }, "Centre X Y Z mm"), v3("su-ko-p", "1"),
           h("span", { class: "k" }, "R P Y °"), v3("su-ko-r", "1"),
           h("span", { class: "k" }, ""), h("label", { class: "chk" }, h("input", { type: "checkbox", id: "su-ko-en", checked: true }), "Enabled")),
-        note("Position is the box centre.", "Under TCP: touch the surface with the TCP, then the box is centred " +
-          "under it with its top face 5 mm below the TCP (keeps the size)."),
+        note("Set the box centre, size and frame."),
         h("div", { class: "row" },
           (() => { const b = btn("Under TCP", "", () => this.koFromTcp(), "Fill the centre so the box top is 5 mm below the current TCP"); b.id = "su-ko-tcp"; return b; })(),
           h("div", { class: "grow" }),
@@ -2766,45 +2765,41 @@ pages.SETUP = {
     this.views["Keep-out zones"].querySelector("#su-ko-apply").dataset.lease = "1";
     // Payload
     this.views["F/T + payload"] = h("div", { class: "cols" },
-      h("div", { class: "card", style: "flex:0 0 330px" }, h("div", { class: "section" }, "Calibration poses"),
+        h("div", { class: "card", style: "flex:0 0 330px" }, h("div", { class: "section" }, "Payload calibration"),
         h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Pose"), h("th", {}, "Fx N"), h("th", {}, "Fy N"), h("th", {}, "Fz N"))),
           h("tbody", { id: "su-ptab" })),
         h("div", { class: "bar" }, h("div", { id: "su-pbar" })),
         h("div", { class: "row" },
           btn("◀", "", () => this.pStep(-1), "Previous pose (ghost only, nothing moves)"),
           btn("▶", "", () => this.pStep(1), "Next pose (ghost only, nothing moves)"),
-          (() => { const b = btn("Move & collect", "primary", () => this.pCollect(),
+          (() => { const b = btn("Measure this pose", "primary", () => this.pCollect(),
             "Move to the selected pose (the blue ghost) and sample the F/T there. Only this pose"); b.id = "su-pcollect"; return b; })(),
           h("span", { class: "muted", id: "su-pstat" })),
         h("div", { class: "row" },
-          (() => { const b = btn("Collect all poses", "", async () => {
+          (() => { const b = btn("Measure all", "", async () => {
             const p = S && S.payload, n = p ? p.poses.length : 0;
             if (INFO.fake || (await ask(`Move through all ${n} calibration poses in order and evaluate?\n\n` +
                 "This starts over (collected poses are cleared). Check the poses with ◀ ▶ first and that the " +
                 "workspace is clear. Keep a hand near STOP.")))
               return cmd("payload_collect");
           }, "Start over and collect every pose in order, then evaluate"); b.id = "su-pall"; return b; })(),
-          (() => { const b = btn("Evaluate", "", () => cmd("payload_evaluate"),
+          (() => { const b = btn("Compute", "", () => cmd("payload_evaluate"),
             "Fit mass and CoG from the poses collected so far (3 or more; more and more different is better)"); b.id = "su-peval"; return b; })(),
           (() => { const b = btn("Start over", "quiet", async () => (await ask("Clear the collected poses?")) && cmd("payload_reset"),
             "Clear every collected pose"); b.id = "su-preset"; return b; })()),
-        note("One pose at a time (select, check the ghost, Move & collect), or Collect all poses.", "Click a pose or use ◀ ▶: the blue " +
-          "ghost shows it and nothing moves. Move & collect goes there with MoveIt at 10% (GUI SPEED applies), " +
-          "waits 2 s and samples. The ghost is the target, not the path to it. Skip any pose that is not safe; " +
-          "Evaluate needs 3 or more, with the tool pointing in clearly different directions.")),
+        note("Measure one pose at a time, or measure all.")),
       h("div", { class: "card", style: "width:360px" },
-        h("div", { class: "section" }, "Saved (kept across restarts)"),
+        h("div", { class: "section" }, "Saved"),
         h("div", { class: "grid", id: "su-psaved" }, "—"),
         h("div", { class: "muted small", id: "su-psaved-note" }),
-        h("div", { class: "section" }, "Result (this session)"),
+        h("div", { class: "section" }, "Latest result"),
         h("div", { class: "title", id: "su-pverdict" }, "Not evaluated"), h("div", { class: "grid", id: "su-pres" }),
         h("div", { class: "muted", id: "su-pissues" }),
-        h("div", { class: "section" }, "Admittance gravity compensation"),
+        h("div", { class: "section" }, "Tool weight compensation"),
         h("pre", { class: "log", id: "su-pyaml", style: "max-height:none" }, "—"),
-        note("Apply (outside Admittance) sets it, reads it back and saves it.",
-          "The GUI puts saved values back by itself after a controller restart and before switching to Admittance."),
+        note("Apply this result when the robot is out of compliance mode."),
         h("div", { class: "row" }, btn("Save result", "", () => cmd("payload_save")),
-          h("div", { class: "grow" }), btn("Apply to admittance", "primary", () => this.applyPayload()))));
+          h("div", { class: "grow" }), btn("Use for compliance", "primary", () => this.applyPayload()))));
     this.pcollect = $("#su-pcollect", this.views["F/T + payload"]);
     const pb = this.views["F/T + payload"].querySelectorAll(".card:last-child .btn");
     [this.psave, this.papply] = pb;
@@ -2826,6 +2821,72 @@ pages.SETUP = {
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
     this.views["Camera"] = h("div", { class: "cols" }, hc.left, hc.right);
     this.views["Setups"] = h("div", { class: "cols" }, st.card, st.side);
+    // Policy library: the card helper is an external subprocess. The browser only chooses a folder and a file;
+    // PolicyLibrary validates roots, writes the manifest and keeps a missing helper non-fatal.
+    const proots = h("datalist", { id: "su-pol-roots" });
+    const pfolder = h("input", { id: "su-pol-folder", class: "grow", list: "su-pol-roots",
+      placeholder: "policy folder (pick an allowed one, or a folder inside it)" });
+    const pcheck = h("select", { id: "su-pol-check", class: "grow" }, h("option", {}, "Load a folder first"));
+    const pname = h("input", { id: "su-pol-name", placeholder: "policy_name" });
+    const pdesc = h("input", { id: "su-pol-desc", class: "grow", placeholder: "short description" });
+    const pback = h("select", { id: "su-pol-back" }, h("option", { value: "servo_admittance" }, "Servo + Admittance"),
+      h("option", { value: "impedance" }, "Impedance"));
+    const pmode = h("select", { id: "su-pol-mode" }, ...INFO.modes.filter((m) => !m.hidden).map((m) => h("option", { value: m.name }, m.label)));
+    const choosePolicyMode = () => {
+      const wanted = pback.value === "impedance" ? "impedance" : "admittance";
+      if ([...pmode.options].some((o) => o.value === wanted)) pmode.value = wanted;
+    };
+    pback.addEventListener("change", choosePolicyMode);
+    choosePolicyMode();
+    const ptcp = h("select", { id: "su-pol-tcp" });
+    const pmsg = h("div", { id: "su-pol-msg", class: "muted small" });
+    const plist = h("div", { id: "su-pol-list", class: "list" });
+    const pfill = (r) => {
+      pcheck.replaceChildren(...(r.checkpoints?.length ? r.checkpoints.map((x) => h("option", { value: x }, x)) :
+        [h("option", { value: "" }, r.error || "No checkpoints found")]));
+      if (r.checkpoints?.length) {
+        const base = r.checkpoints[0].split("/").pop().replace(/\.[^.]+$/, "").toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+        pname.value = base.replace(/^[^a-z]+/, "") || "policy";
+      }
+      pmsg.textContent = r.error || (r.roots ? `Allowed roots: ${r.roots.join(", ")}` : "");
+    };
+    const loadPolicies = async () => {
+      const r = await cmd("policy_list");
+      if (!r.ok) return;
+      plist.replaceChildren(...(r.policies.length ? r.policies.map((p) => {
+        const nn = h("input", { value: p.name, style: "width:150px" }), dd = h("input", { value: p.description || "", class: "grow" });
+        const save = lease(btn("Save", "quiet", async () => {
+          let q = await cmd("policy_rename", { name: p.name, new_name: nn.value.trim(), description: dd.value });
+          if (!q.ok && /confirm overwrite/.test(q.msg || "") && await ask(q.msg))
+            q = await cmd("policy_rename", { name: p.name, new_name: nn.value.trim(), description: dd.value, overwrite: true });
+          if (q.ok) loadPolicies();
+          return q;
+        }));
+        return h("div", { class: "row" }, nn, dd, save);
+      }) : [h("div", { class: "muted" }, "No policy manifests yet.")]));
+    };
+    const loadFolder = () => cmd("policy_sources", { folder: pfolder.value.trim() }).then((r) => r.ok && pfill(r));
+    const importPolicy = () => cmd("policy_import", { folder: pfolder.value.trim(), checkpoint: pcheck.value,
+      name: pname.value.trim(), description: pdesc.value.trim(), backend: pback.value, required_mode: pmode.value,
+      required_tcp: ptcp.value }).then((r) => { if (r.ok) { pmsg.textContent = r.msg; setTimeout(() => location.reload(), 700); } return r; });
+    ptcp.replaceChildren(h("option", { value: "" }, "manifest default TCP"));
+    this.views["Policies"] = h("div", { class: "col su-main" },
+      h("div", { class: "card" }, h("div", { class: "section" }, "Import policy"),
+        note("Choose a checkpoint under an allowed root. The card helper is optional.", "The GUI calls export_policy_card.py as a subprocess and never loads the model."),
+        h("div", { class: "row" }, pfolder, proots, btn("List checkpoints", "quiet", loadFolder)),
+        h("div", { class: "row" }, h("span", { class: "k" }, "Checkpoint"), pcheck),
+        h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
+          h("span", { class: "k" }, "Name"), pname, h("span", { class: "k" }, "Description"), pdesc,
+          h("span", { class: "k" }, "Backend"), pback, h("span", { class: "k" }, "Mode"), pmode,
+          h("span", { class: "k" }, "TCP"), ptcp),
+        h("div", { class: "row" }, lease(btn("Import", "primary", importPolicy)), pmsg)),
+      h("div", { class: "card" }, h("div", { class: "section" }, "Saved policies"), plist));
+    loadPolicies();
+    cmd("policy_sources", {}).then((r) => {                      // the allowed folders, as suggestions
+      if (!r.ok) return;
+      proots.replaceChildren(...(r.roots || []).map((x) => h("option", { value: x })));
+      if (!pfolder.value && r.roots?.length) pfolder.value = r.roots[r.roots.length - 1];
+    });
     // Flask Geometry + flask scrape: flask.js
     this.fl = flaskPage({ h, btn, note, cmd, pcmd, toast, ask, askText, lease, freedriveButton, gate, fake: () => INFO.fake,
       repaint: () => this.sub === "Flask" && this.svPaint(true),
@@ -2834,10 +2895,9 @@ pages.SETUP = {
     this.views["Flask"] = this.fl.view;
     this.show("TCPs");
   },
-  SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Parts": "the robot with its parts (saved ones)", "Vial": "touched points and the fitted rim",
-    "Flask": "the flask, touches (blue rim, violet bulb, teal neck), next touch and pivot (orange), poses (green/red)",
-    "Keep-out zones": "keep-out boxes (red = enabled)",
-    "F/T + payload": "calibration poses: the blue ghost is the selected pose" },
+  SV_PAGES: { "TCPs": "Active tool point and saved points", "Parts": "Robot and saved parts", "Vial": "Touched points and fitted rim",
+    "Flask": "Flask geometry and reachable poses", "Keep-out zones": "Planner keep-out boxes",
+    "F/T + payload": "Payload calibration poses" },
   async svInit() {
     if (this.svv) return;
     this.svv = true;
@@ -2848,7 +2908,7 @@ pages.SETUP = {
       for (let i = 0; i < 20; i++) {
         const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => ({ ok: false, msg: "no answer" }));
         if (r.ok) { await v.load(r); $("#su-v3-msg", this.sv)?.remove(); this.view = v; this.svPaint(true); return; }
-        $("#su-v3-msg", this.sv).textContent = "Robot model: " + r.msg;
+        $("#su-v3-msg", this.sv).textContent = "Robot model not loaded. Is the robot running?";
         await new Promise((res) => setTimeout(res, 3000));
       }
     } catch (e) { $("#su-v3-msg", this.sv).textContent = "3D view unavailable: " + e.message; }
@@ -2922,14 +2982,9 @@ pages.SETUP = {
       "config's own F/T settings.")) && cmd("ftmatch_clear")));
     M.rows = h("tbody", { id: "su-fm-rows" });
     this.fmCard = h("div", { class: "card" },
-      h("div", { class: "section" }, "Match simulation"),
-      note("Push the tool tip along each arrow, about 10 N, hold 2 s. The GUI works out how the sensor's axes map to " +
-        "the policy's.", "The robot holds still in Position; nothing is commanded to move. Each push is taken by " +
-        "itself when it is over 5 N and steady for 1 s, or press Record. Before each push, keep hands off the tool for " +
-        "a moment (the no-contact reading). The result is matched to the simulation, not to physics, so its signs are " +
-        "what the policy saw in training. Torque signs come from the same pushes (push at the very tip). It is kept in " +
-        "your profile and every policy run uses it (ft_obs_axes and ft_obs_scale)."),
-      h("div", { class: "row" }, h("span", { class: "k" }, "Sim reference of"), M.pol, M.start, M.stop),
+      h("div", { class: "section" }, "Sensor axes for policies"),
+      note("Push the tip along each arrow (~10 N, 2 s)."),
+      h("div", { class: "row" }, h("span", { class: "k" }, "Policy"), M.pol, M.start, M.stop),
       h("div", { class: "title", id: "su-fm-msg" }, ""),
       h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, h("th", {}, "Push"), h("th", {}, "Sensor change N"),
         h("th", {}, ""), h("th", {}, ""))), M.rows),
@@ -2965,7 +3020,7 @@ pages.SETUP = {
           "or set sim_ft_reference in the manifest." : f.refusal ? `Not ready: ${f.refusal}.` : "Press Start, then follow the arrows.";
     } else if (f.error) msg.textContent = `Waiting: ${f.error}.`;
     else if (cur) msg.textContent = cur.state === "baseline" ? `${ax}: hands off the tool…` :
-      `${ax}: push the spatula tip along the arrow, about 10 N, hold 2 s. ${cur.note}`;
+      `${ax}: push the tool tip along the arrow, about 10 N, hold 2 s. ${cur.note}`;
     else msg.textContent = f.fit && f.fit.ok ? "Matched. Check the result and Save." : "Done. See below.";
     // the arrow at the tip, along base +X / +Y / +Z (10 N long)
     if (this.view) {
@@ -3001,8 +3056,7 @@ pages.SETUP = {
           kids.push(h("div", { class: "section" }, fit.ok ? "Result" : "Best match (not good enough)"),
             h("div", {}, fit.explain.slice(0, 3).join(", ") + "."),
             fit.explain.length > 3 ? h("div", {}, fit.explain.slice(3).join(", ") + ".") : null,
-            h("div", { class: "mono small" }, "ft_obs_axes: " + JSON.stringify(fit.M) + "   ft_obs_scale: " +
-              (fit.scale ? JSON.stringify(fit.scale) : "— (torque signs not matched)")),
+            h("div", { class: "muted small", title: "Sensor-axis mapping saved for policy runs" }, "Sensor axes saved"),
             h("div", { class: "muted small" }, `Best free rotation is ${fit.rotation_deg}° from it.`));
           const row = (a) => fit.rows[a], t3 = (v) => v3(v.slice(3));
           const cell = (v) => h("td", { class: "mono" }, "F " + v3(v), h("br"), "T " + t3(v));
@@ -3015,7 +3069,7 @@ pages.SETUP = {
             .map((v) => `${n} ${v.push}: ${v.measured >= 0 ? "+" : ""}${v.measured.toFixed(2)} vs sim ${v.sim >= 0 ? "+" : ""}${v.sim.toFixed(2)} Nm` +
               (v.sign === 1 ? " (same sign)" : v.sign === -1 ? " (opposite: scale -1)" : " (too small)")).join(", ")).filter(Boolean).join("; ") +
             (tq.tz ? `. ${tq.tz[0].toUpperCase()}${tq.tz.slice(1)}.` : "")));
-          if (fit.old_scale == null) kids.push(h("div", { class: "muted small" }, "Now: the robot config has no ft_obs_scale (the runner's own flags apply)."));
+          if (fit.old_scale == null) kids.push(h("div", { class: "muted small" }, "No previous sensor scale was found."));
           const t = fit.suggested_tip;
           if (t) kids.push(h("div", { class: "muted small" }, `Suggested ${t.tip} orientation (not applied): rpy ` +
             (t.rpy_deg_parent ? `[${t.rpy_deg_parent.join(", ")}]° in ${t.parent}` : `[${t.rpy_deg_sensor.join(", ")}]° in ${t.sensor_frame}`) +
@@ -3044,8 +3098,7 @@ pages.SETUP = {
     this.ftl = h("div", { class: "card" },
       h("div", { class: "row" }, h("div", { class: "section grow" }, "Force limit"),
         h("label", { class: "row" }, on, "On")),
-      h("div", { class: "muted small" }, "On the F/T reading as shown above. Soft: a warning. Hard: the GUI's motion " +
-        "stops at once (program, move, policy, jog, applied force). In freedrive it only warns. 0 or empty: that limit off."),
+      h("div", { class: "muted small" }, "Soft warns. Hard stops GUI motion. Empty = off."),
       h("div", { class: "row" }, h("span", { style: "width:40px" }, "|F|"), "soft", num("su-ftl-sf", "N"), "hard", num("su-ftl-hf", "N"), "N"),
       h("div", { class: "row" }, h("span", { style: "width:40px" }, "|T|"), "soft", num("su-ftl-st", "Nm"), "hard", num("su-ftl-ht", "Nm"), "Nm"),
       h("div", { class: "row" }, h("span", { class: "grow mono small", id: "su-ftl-now" }, ""),
@@ -3068,16 +3121,17 @@ pages.SETUP = {
   show(n) {
     if (this.sub === "Parts" && n !== "Parts" && this.view) this.view.clearPartDraft();
     this.sub = n;
+    const title = h("div", { class: "page-title" }, this.label(n));
     this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
     if (this.SV_PAGES[n]) {
       if (n === "F/T + payload") {            // the poses, their ghost, the result side by side under the bias
         this.pcols.insertBefore(this.sv, this.pcols.lastChild);
-        this.body.replaceChildren(this.views[n]);
+        this.body.replaceChildren(title, this.views[n]);
         this.views[n].insertBefore(this.ftLimitCard(), this.pcols);
-      } else this.body.replaceChildren(h("div", { class: "cols" }, this.views[n], this.sv));
+      } else this.body.replaceChildren(title, h("div", { class: "cols" }, this.views[n], this.sv));
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
-    } else this.body.replaceChildren(this.views[n]);
+    } else this.body.replaceChildren(title, this.views[n]);
     if (n === "Cameras") this.dr.load(); else this.dr.leave();
     if (n === "Vial") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
     if (n === "Flask") this.fl.load();
@@ -3102,28 +3156,27 @@ pages.SETUP = {
         ...(Object.keys(people).length ? [] : [h("div", { class: "muted" }, "Nobody listed: everyone gets the default role.")]));
       fill();
       const online = ((S && S.users) || []).filter((u) => u.key && !(u.key in people) && !/^(127\.|::1$|localhost)/.test(u.key));
-      const add = h("input", { type: "text", placeholder: "Tailscale login or IP", style: "min-width:220px" });
+      const add = h("input", { type: "text", placeholder: "Name or address", style: "min-width:220px" });
       const mine = INFO.role === "admin";
       const save = btn("Save", "primary", async () => {
         const res = await cmd("roles_save", { default: dflt, people });
         if (res.ok) draw(res);
       });
       save.dataset.lease = "1";
-      box.replaceChildren(
-        h("div", { class: "section" }, "Roles"),
-        h("div", { class: "muted" }, "Viewer: watches. Operator: runs the robot. Admin: also changes SETUP and roles. " +
-          "This PC is always Admin." + (r.saved ? "" : " Not saved yet: everyone is Admin.")),
-        h("div", { class: "muted" }, `You are ${INFO.role[0].toUpperCase() + INFO.role.slice(1)}` +
-          (INFO.key ? ` (${INFO.key})` : "") + "."),
+      box.replaceChildren(h("div", { class: "card" },
+        h("div", { class: "section" }, "Access"),
+        h("div", { class: "muted" }, "Viewer watches. Operator runs the robot. Admin can also change setup and access." +
+          (r.saved ? "" : " Not saved: everyone is Admin.")),
+        h("div", { class: "muted" }, `You are ${INFO.role[0].toUpperCase() + INFO.role.slice(1)}.`),
         h("div", { class: "row" }, h("span", { class: "grow" }, "Anyone not listed"), pick(dflt, (v) => { dflt = v; })),
         rows,
         h("div", { class: "row" }, add, btn("Add", "", () => {
           const k = add.value.trim(); if (k) { people[k] = people[k] || "operator"; add.value = ""; fill(); }
         })),
         online.length ? h("div", { class: "col" }, h("div", { class: "muted small" }, "Open now:"),
-          ...online.map((u) => h("div", { class: "row" }, h("span", { class: "grow" }, `${u.name} · ${u.key}`),
+          ...online.map((u) => h("div", { class: "row" }, h("span", { class: "grow", title: u.key }, u.name),
             btn("Add", "quiet", () => { people[u.key] = u.role || "operator"; fill(); })))) : "",
-        mine ? h("div", { class: "row" }, save) : h("div", { class: "muted" }, "Only an Admin can change roles."));
+        mine ? h("div", { class: "row" }, save) : h("div", { class: "muted" }, "Only an Admin can change access.")));
     };
     cmd("roles_get").then((r) => r.ok && draw(r));
     return box;
@@ -3140,11 +3193,11 @@ pages.SETUP = {
     this.gYaml = h("pre", { class: "log", id: "su-g-yaml", style: "max-height:240px" }, "—");
     const left = h("div", { class: "card grow" },
       h("div", { class: "row" }, this.gTabs, h("div", { class: "grow" }),
-        btn("↻ Read", "quiet", () => this.gLoad(true), "Read the values from the running controller")),
+        btn("↻ Refresh", "quiet", () => this.gLoad(true), "Read the values from the running controller")),
       this.gStatus, this.gTable,
       h("div", { class: "row" },
-        btn("Undo edits", "quiet", () => this.gFill(this.gLive()), "Back to the controller's current values"),
-        btn("Values at GUI start", "quiet", () => this.gFill(this.gData.modes[this.gMode].baseline),
+        btn("Undo", "quiet", () => this.gFill(this.gLive()), "Back to the controller's current values"),
+        btn("Defaults", "quiet", () => this.gFill(this.gData.modes[this.gMode].baseline),
             "The values the controller had when this GUI first read it (not applied until you press Apply)"),
         h("div", { class: "grow" }), this.gApply));
     const right = h("div", { class: "card", style: "width:340px" },
@@ -3152,7 +3205,7 @@ pages.SETUP = {
       h("div", { class: "row" }, this.gPreset,
         btn("Save…", "quiet", () => this.gSavePreset(), "Save the table as a named preset"),
         btn("✕", "quiet", () => this.gDelPreset(), "Delete the selected preset")),
-      note("Loading a preset only fills the table."),
+      note("A preset fills the table; Apply saves it."),
       h("div", { class: "section" }, "Saved"),
       this.gSaved = h("div", { id: "su-g-saved" }),
       h("div", { class: "row" },
@@ -3207,10 +3260,11 @@ pages.SETUP = {
     });
     this.gTable.replaceChildren(h("thead", {}, head), h("tbody", {}, ...rows));
     const when = m.read_at ? new Date(m.read_at * 1000).toLocaleTimeString() : "never";
+    this.gStatus.title = m.node || "";
     this.gStatus.replaceChildren(
       h("span", { class: "badge" + (m.active ? " warn" : "") }, m.active ? "ACTIVE" : "NOT ACTIVE"), " ",
       m.error ? h("span", { class: "error" }, m.error) :
-        `${m.node} · read ${when} · ` + (m.active ? `changes ramp in over ${m.ramp_s} s, at most ${this.gData.max_factor}× per apply`
+        `Read ${when} · ` + (m.active ? `changes ramp in over ${m.ramp_s} s, at most ${this.gData.max_factor}× per apply`
                                                    : "changes take effect when the mode is next switched on"),
       m.note ? h("div", {}, m.note) : "");
     this.gYaml.textContent = this.gData.yaml?.[this.gMode] || "—";
@@ -3221,9 +3275,7 @@ pages.SETUP = {
     this.gSaved.replaceChildren(
       n ? h("div", { class: "good" }, `✓ ${savedRows.join(", ") || "values"} · saved ${m.saved_at || ""}`)
         : h("div", { class: "muted" }, "Nothing saved: the controller uses its YAML values."),
-      note("Apply saves them; the GUI puts them back by itself.", "Saved values are restored after a controller " +
-        `restart and just before switching to ${modeLabel(this.gMode)}. An active controller is never changed without you: ` +
-        "a difference there is shown here with Restore saved."),
+      note("Apply saves the values and restores them after a restart."),
       m.unsynced ? h("div", { class: "error small" }, "⚠ " + m.unsynced) : "");
     this.gSavedN = n;
     const names = Object.keys(this.gData.presets).filter((n) => this.gData.presets[n].mode === this.gMode);
@@ -3315,16 +3367,17 @@ pages.SETUP = {
   vialProfiles(list) {
     if (!list) return;
     const as = () => $("#su-vp-as").value || "vial";
+    const sourceLabel = (e) => e.builtin ? "Provided" : ({ touch: "Measured", typed: "Entered", fixture: "Saved" }[e.source] || "Saved");
     $("#su-vp-list").replaceChildren(...list.map((e) => h("tr", { class: e.in_use_as.length ? "on" : "" },
       h("td", {}, e.name + (e.builtin ? " ★" : "")),
       h("td", { class: "num mono" }, e.xyz_mm.map((x) => x.toFixed(1)).join(", ")),
       h("td", { class: "num" }, e.radius_mm != null ? (+e.radius_mm).toFixed(1) : "—"),
       h("td", { class: "num" }, e.height_mm != null ? (+e.height_mm).toFixed(1) : "—"),
-      h("td", { class: "muted small" }, (e.builtin ? "built in · " : "") + (e.source || "") + (e.saved ? " · " + e.saved : "")),
+      h("td", { class: "muted small", title: [e.source, e.saved].filter(Boolean).join(" · ") }, sourceLabel(e)),
       h("td", { class: e.in_use_as.length ? "good" : "muted" }, e.in_use_as.join(", ") || "—"),
       h("td", {}, (() => { const b = btn("Use", "primary", async () => {
-          if ((await ask(`Use vial profile "${e.name}" as "${as()}"?\n\nCentre ${e.xyz_mm.join(", ")} mm in ${INFO.base_link}` +
-              (e.builtin ? `\n(${e.source}: only right if your vial is really there)` : "") + "\n\nPrograms move relative to it."))) 
+          if ((await ask(`Use vial profile "${e.name}" as "${as()}"?\n\nCentre ${e.xyz_mm.join(", ")} mm in the robot frame` +
+              (e.builtin ? "\nOnly use this if your vial is really there." : "") + "\n\nPrograms move relative to it.")))
             cmd("vial_profile_use", { name: e.name, fixture: as() }).then((r) => { if (r.ok) { this.vialProfiles(r.vials); this.svPaint(true); } });
         }, `Make "${e.name}" the fixture programs use`); b.dataset.lease = "1"; return b; })(),
         e.builtin ? "" : (() => { const b = btn("Delete", "quiet", async () => (await ask(`Delete vial profile "${e.name}"? Fixtures made from it stay.`)) &&
@@ -3468,14 +3521,14 @@ pages.SETUP = {
     B.inputs = AXES.map((a, i) => h("input", { type: "number", step: i < 3 ? "0.01" : "0.001", id: `su-fb-in${i}`,
       style: "width:84px", title: `${a} bias to set (${i < 3 ? "N" : "Nm"})` }));
     const lb = (b) => (b.dataset.lease = "1", b);
-    B.zero = lb(btn("Zero now", "primary", () => this.biasZero(),
+    B.zero = lb(btn("Zero", "primary", () => this.biasZero(),
       "Removes only the sensor drift. With a payload loaded on the admittance controller, the reading keeps that "
       + "tool weight (as the payload fit, the controller and the MuJoCo training expect); without one, it reads 0"));
     B.zeroAll = lb(btn("Zero all", "", () => this.biasZero(true),
       "Make the current load read 0, tool weight included. Admittance with a loaded payload would then subtract "
       + "the weight twice"));
-    B.clear = lb(btn("Clear (raw)", "", () => this.biasClear(), "Bias 0: the reading is the sensor's raw value"));
-    B.set = lb(btn("Set these values", "", () => this.biasSet(), "Set the bias to the values typed in the last column"));
+    B.clear = lb(btn("Reset to raw", "", () => this.biasClear(), "Set the bias to zero"));
+    B.set = lb(btn("Set values", "", () => this.biasSet(), "Set the bias to the values typed in the last column"));
     B.fill = btn("Copy current", "quiet", () => this.biasFill(this.S_fb && this.S_fb.bias), "Copy the current bias into the fields");
     B.reapply = lb(btn("Re-apply", "", () => this.biasSet(this.S_fb.last.bias, "the last bias")));
     B.reapply.id = "su-fb-reapply";
@@ -3485,8 +3538,8 @@ pages.SETUP = {
       "Copy the selected set into the fields (not applied)");
     B.del = btn("Delete", "quiet", async () => B.presetSel.value && (await ask(`Delete the F/T bias set '${B.presetSel.value}'?`)) &&
       cmd("ft_bias_preset_delete", { name: B.presetSel.value }));
-    B.save = btn("Save fields as set…", "quiet", async () => {
-      const name = (await askText("Name of this F/T bias set (e.g. 'gripper, no part'):", ""));
+    B.save = btn("Save set…", "quiet", async () => {
+      const name = (await askText("Name for this zero offset set:", ""));
       if (name) cmd("ft_bias_preset_save", { name, bias: this.biasFields() });
     });
     B.del.dataset.lease = B.save.dataset.lease = "1";
@@ -3497,7 +3550,7 @@ pages.SETUP = {
     this.fbChart.el.open = true;
     const chartBox = h("div", { class: "fb-chart" }, this.fbChart.el);
     return h("div", { class: "card", id: "su-fb" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "F/T bias (software)"),
+      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Zero offset"),
         h("span", { class: "muted small", id: "su-fb-node" }, "")),
       h("div", { class: "ko-status", id: "su-fb-state" }, "—"),
       h("div", { class: "row", style: "align-items:flex-start;gap:var(--l)" },
@@ -3511,14 +3564,7 @@ pages.SETUP = {
           h("div", { class: "row" }, B.save),
           h("div", { class: "muted small", id: "su-fb-why" }, ""))),
         chartBox),
-      note("Reading = raw sensor − bias. The ATI box itself is never biased.",
-        "The bias is the offset of the F/T broadcaster, so the GUI, payload calibration, policies and the admittance " +
-        "controller all see the same values. It changes at once, so it is refused while anything uses the reading " +
-        "(Admittance, an applied force, a program, policy or motion). The broadcaster starts with no bias each " +
-        "time the robot stack starts; the GUI puts the last one back by itself as soon as nothing uses the reading (logged). " +
-        "Zero now keeps the payload loaded on the admittance controller in the reading (it removes only the drift), " +
-        "so the gravity compensation stays right at every pose and a sensor that drifted is fixed by one Zero, " +
-        "no re-calibration. Zero all also removes the tool weight: Admittance would then subtract it twice."));
+      note("Reading = raw sensor minus offset."));
   },
   biasFields() { return this.fb.inputs.map((x) => +x.value || 0); },
   biasFill(b) { if (b) this.fb.inputs.forEach((x, i) => (x.value = String(b[i]))); },
@@ -3559,7 +3605,8 @@ pages.SETUP = {
       [B.zero, B.zeroAll, B.clear, B.set, B.use, B.reapply].forEach((b) => gate(b, false));
       return;
     }
-    $("#su-fb-node").textContent = f.node;
+    $("#su-fb-node").textContent = "Sensor";
+    $("#su-fb-node").title = f.node || "";
     const st = $("#su-fb-state");
     st.className = "ko-status";
     B.reapply.remove();
@@ -3573,7 +3620,7 @@ pages.SETUP = {
         : "Re-applying it automatically…  ";
       st.classList.add("bad");
       st.append(B.reapply);
-    } else if (f.raw) { st.textContent = "RAW: no bias, the reading is the sensor's own value."; st.classList.add("good"); }
+    } else if (f.raw) { st.textContent = "Not zeroed"; st.classList.add("good"); }
     else st.textContent = `BIASED${f.last ? ` (${f.last.how} ${f.last.at}${f.last.restored ? `, re-applied ${f.last.restored} after a restart` : ""})` : ""}: ` +
       "the reading is raw − bias." + (f.last && f.last.how === "zeroed, payload kept"
         ? " Payload kept: the tool weight stays in the reading (Fz ≈ the tool weight at rest); Admittance removes it." : "");
@@ -3728,13 +3775,13 @@ pages.SETUP = {
         ...[0, 1, 2].map((k) => h("td", { class: "num" }, p.samples[i] ? (p.samples[i][k] >= 0 ? "+" : "") + p.samples[i][k].toFixed(2) : "")))));
       $("#su-pbar").style.width = (100 * have / (p.poses.length || 1)) + "%";
       const sel = p.poses[this.pPick] || "";
-      this.pcollect.textContent = p.running ? "Collecting…" : p.samples[this.pPick] ? `Collect ${sel} again` : `Move & collect ${sel}`;
+      this.pcollect.textContent = p.running ? "Measuring…" : p.samples[this.pPick] ? `Measure ${sel} again` : `Measure ${sel}`;
       $("#su-pstat").textContent = p.running ? (p.total > 1 ? `pose ${p.done + 1} of ${p.total}: ` : "") +
         `moving to ${p.poses[p.pose]} and sampling…` : p.error || `${have} of ${p.poses.length} collected`;
       gate(this.pcollect, !p.running && s.idle && !s.motion_refusal);
       gate($("#su-peval"), !p.running && have >= 3);
       gate($("#su-pall"), !p.running && s.idle && !s.motion_refusal);
-      $("#su-peval").textContent = `Evaluate (${have})`;
+      $("#su-peval").textContent = `Compute (${have})`;
       gate($("#su-preset"), !p.running && have > 0);
       this.pSaved(p.saved, s);
       const r = p.result;
@@ -3747,7 +3794,7 @@ pages.SETUP = {
       $("#su-pyaml").textContent = r ? r.yaml : "—";
       gate(this.psave, !!r);
       gate(this.papply, !!(r && r.can_apply) && s.mode !== "admittance");
-      this.papply.textContent = s.mode === "admittance" ? "Apply (leave Admittance first)" : "Apply to admittance";
+    this.papply.textContent = s.mode === "admittance" ? "Use (leave compliance first)" : "Use for compliance";
     }
     if (this.sub === "Cameras") this.dr.update(s);
   },
@@ -3990,9 +4037,10 @@ pages.DIAGNOSTICS = {
 pages.SETTINGS = {
   sub: "Layouts",
   ITEMS: ["Layouts", "Profiles", "Roles"],
+  LABELS: { Layouts: "Screen layouts", Profiles: "Profiles", Roles: "Access" },
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.ITEMS.map((n) =>
-      h("div", { class: "item", "data-name": n, onclick: () => this.show(n) }, h("span", { class: "grow" }, n))));
+      h("div", { class: "item", "data-name": n, onclick: () => this.show(n) }, h("span", { class: "grow" }, this.LABELS[n]))));
     this.body = h("div", { class: "grow col" });
     el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), this.body));
     this.show("Layouts");
@@ -4001,18 +4049,19 @@ pages.SETTINGS = {
     if (!this.ITEMS.includes(n)) n = "Layouts";
     this.sub = n;
     this.nav.querySelectorAll(".item").forEach((it) => it.classList.toggle("on", it.dataset.name === n));
-    if (n === "Roles") this.body.replaceChildren(pages.SETUP.rolesView());
-    else if (n === "Profiles") this.profiles();
+    const title = h("div", { class: "page-title" }, this.LABELS[n]);
+    if (n === "Roles") this.body.replaceChildren(title, pages.SETUP.rolesView());
+    else if (n === "Profiles") { this.body.replaceChildren(title); this.profiles(); }
     else {                                  // made by OPERATE's workspace (views.js)
       this.lay = this.lay || pages.OPERATE.vg.setupView();
       this.lay.refresh();
-      this.body.replaceChildren(h("div", { class: "col su-main" }, this.lay.el));
+      this.body.replaceChildren(title, h("div", { class: "col su-main" }, this.lay.el));
     }
   },
   // ---- Profiles: one per person; it keeps your setups and your screen layout
   async profiles() {
     const box = h("div", { class: "col su-main" });
-    this.body.replaceChildren(box);
+    this.body.append(box);
     const draw = (r) => {
       if (this.sub !== "Profiles") return;
       const me = localStorage.getItem("operator") || "";
@@ -4028,8 +4077,7 @@ pages.SETTINGS = {
               const name = await askText("Name of the new profile (your name):", "");
               if (name && name.trim()) { const c = await cmd("profile_create", { name: name.trim() }); if (c.ok) draw(c); }
             })),
-          note("A profile keeps one person's setups and screen layout.",
-            "Pick who you are with the name in the header. A profile can be deleted only when it has no setups."),
+          note("A profile keeps its setups and screen layout."),
           h("div", { class: "list" }, ...list.map((p) => h("div", { class: "item" },
             h("span", { class: "grow" }, p.name + (p === mine ? " (you)" : "")),
             h("span", { class: "muted small" }, `${p.setups} setup${p.setups === 1 ? "" : "s"}${p.layout ? " · layout" : ""}`),
@@ -4040,10 +4088,10 @@ pages.SETTINGS = {
             }, p.setups ? "Has setups: not empty" : "Delete this empty profile")))),
           list.length ? "" : h("div", { class: "muted" }, "No profiles yet.")),
         h("div", { class: "card" },
-          h("div", { class: "section" }, "Copy a layout"),
+          h("div", { class: "section" }, "Copy layout"),
           !mine ? h("div", { class: "muted" }, "Pick your profile first (the name in the header).")
             : !others.length ? h("div", { class: "muted" }, "No other profile has a saved layout.")
-              : [note(`Replaces the layout of ${mine.name} with a copy of another one. The page reloads.`),
+              : [note("Copying replaces this profile's layout and reloads the page."),
                 h("div", { class: "row" }, "From", src,
                   btn("Copy", "primary", async () => {
                     if (!(await ask(`Replace the layout of ${mine.name} with ${src.value}'s?`))) return;
@@ -4222,7 +4270,7 @@ function renderHeader(s) {
     b.classList.toggle("on", s.freedrive);
     gate(b, s.freedrive || s.idle);
   });
-  document.querySelectorAll("[data-lease]").forEach((b) => gate(b, true));
+  document.querySelectorAll("[data-lease]").forEach((b) => gate(b, b.dataset.policyBusy !== "1"));
   document.querySelectorAll("[data-grip]").forEach((b) => {
     gate(b, !s.manual_refusal);
     if (holds) b.title = s.manual_refusal ? "Not now: " + s.manual_refusal : b.dataset.tip || "";

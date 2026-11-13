@@ -223,6 +223,21 @@ class FakeBridge:
             t += 0.01
         return out
 
+    def policy_step_samples(self, since: float) -> List[dict]:
+        """Moving /policy_runner/step data for the web fake mode (no ROS topic is needed)."""
+        now = time.time()
+        start = max(float(since), now - 1.0)
+        t = (int(start * 5) + 1) / 5.0
+        out = []
+        while t <= now:
+            action = [0.03 * math.sin(t), 0.02 * math.cos(t * 0.7), 0.01 * math.sin(t * 0.4)]
+            ft = self._fake_wrench()
+            out.append({"_received": t, "t": t, "step": int(t * 5), "action": action, "command": action,
+                        "ft": ft, "ft_obs": ft, "tcp_z": float(self.T_base_tool0[2, 3] + 0.15),
+                        "obs_sigma": {"ft_sensor": max(abs(v) for v in ft) / 10.0}, "out_of_range": []})
+            t += 0.2
+        return out
+
     def _fake_wrench(self) -> List[float]:
         """A fixed fake payload seen through the current sensor orientation, plus noise."""
         with self._lock:
@@ -767,6 +782,7 @@ class FakeBridge:
                    ("/ft_data", "geometry_msgs/msg/WrenchStamped"),
                    ("/robotiq_gripper_controller/gripper_cmd/_action/status", "action_msgs/msg/GoalStatusArray"),
                    ("/policy_runner/status", "std_msgs/msg/String"),
+                   ("/policy_runner/step", "std_msgs/msg/String"),
                    ("/display_planned_path", "moveit_msgs/msg/DisplayTrajectory")]
 
     def topic_types(self):

@@ -89,6 +89,7 @@ class PolicyExecutor:
         self._cancelled = threading.Event()
         # (mode, {param: value}) -> (ok | None, detail): live controller gains vs. the trained ones (RobotCore)
         self.gains_check: Optional[Callable[[str, dict], tuple]] = None
+        self.range_check: Optional[Callable[[PolicyManifest], List[str]]] = None
 
     # ------------------------------------------------------------ library view
     @property
@@ -174,6 +175,13 @@ class PolicyExecutor:
             ok, detail = self.gains_check(m.required_mode, m.controller_gains)
             out.append(Requirement("Controller gains", OK if ok else FAIL,
                                    detail if ok is not None else f"could not read them: {detail}"))
+        if self.range_check is not None:
+            try:
+                warnings = self.range_check(m)
+            except Exception as e:  # range warnings never make the readiness page fail
+                warnings = [f"range check unavailable: {e}"]
+            if warnings:
+                out.append(Requirement("Policy ranges", WARN, "; ".join(warnings)))
         if not m.command:
             out.append(Requirement("Observation contract", RUNNER, "validated by the runner at start"))
         return out

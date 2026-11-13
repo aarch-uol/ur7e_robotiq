@@ -47,7 +47,9 @@ from ..geometry import ACTIVE_TCP, GeometryError, PoseSpec
 from ..geometry_calibration import VialGeometryError, estimate_vial
 from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
-from ..policies import RecordingOptions
+from ..policies import (PolicyImportError, RecordingOptions, allowed_policy_roots, list_policy_checkpoints,
+                        policy_range_warnings, policy_path_allowed)
+from ..policy_action import RunPolicyResult
 from ..activity import KINDS as ACTIVITY_KINDS, ActivityLog, summarize_args
 from .users import Users, public_id
 from .roles import Roles, RolesError, at_least
@@ -89,6 +91,7 @@ ADMIN_COMMANDS = frozenset((
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "robot_setup", "setup_save", "setup_delete", "setup_load", "setup_copy",
     "profile_delete",
+    "policy_import", "policy_rename",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
     "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN,
     *FTMATCH_ADMIN))
@@ -99,7 +102,7 @@ ACTIVITY_COMMANDS = {
     **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
                               "program_scrape_baseline", "program_flask_scrape", "program_save", "program_open", "program_new",
                               "program_copy", "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
-    **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_stop")},
+    **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_start", "policy_stop")},
     **{c: "record" for c in ("record_start", "record_stop")},
     **{c: "mode" for c in ("switch_mode", "freedrive", "recover")},
     **{c: "power" for c in ("power_on", "power_off", "brake_release")},
@@ -202,6 +205,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         self.program_rev = 0                              # +1 on every change: browsers refetch, stale edits refused
         self._hold: Optional[dict] = None                 # hold-to-run motion: {"seen", "label"}
         self.prepared_policy: Optional[str] = None
+        self._policy_step_cursor = time.time() - 0.2
+        self._policy_last_step = None
         self.vial_points: Dict[str, List[float]] = {}
         self._pivot_parent = ""
         self._pivot_samples: List[np.ndarray] = []
@@ -2031,6 +2036,57 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         return self._ok(self.core.ft_bias.delete_preset(name)[1], ft_bias=self.core.ft_bias.view())
 
     # ----------------------------------------------------------------- policy
+    def cmd_policy_list(self):
+        return self._ok(policies=[self._policy_info(m) for m in self.core.policies.manifests.values()],
+                        errors=dict(self.core.policies.errors))
+
+    @staticmethod
+    def _policy_info(m):
+        card = m.card() or {}
+        return {"name": m.name, "description": m.description, "algorithm": m.algorithm or card.get("algorithm", ""),
+                "backend": m.backend, "mode": m.required_mode, "tcp": m.required_tcp, "hz": m.control_hz,
+                "duration": m.duration, "policy_card": bool(card)}
+    cmd_policy_list.read_only = True
+
+    def cmd_policy_sources(self, folder=""):
+        lib = self.core.policies.library
+        roots = [str(x) for x in lib.allowed_roots]
+        if not folder:
+            return self._ok(roots=roots, folder="", checkpoints=[])
+        p = Path(folder).expanduser().resolve()
+        if not policy_path_allowed(p, lib.allowed_roots):
+            raise CommandError("that folder is outside the allowed policy roots")
+        try:
+            checkpoints = [str(x) for x in list_policy_checkpoints(p, lib.card_command)]
+            return self._ok(roots=roots, folder=str(p), checkpoints=checkpoints)
+        except PolicyImportError as e:
+            return self._ok(roots=roots, folder=str(p), checkpoints=[], error=str(e))
+    cmd_policy_sources.read_only = True
+
+    def cmd_policy_import(self, folder, checkpoint, name, description="", backend="", required_mode="",
+                          required_tcp="", overwrite=False):
+        lib = self.core.policies.library
+        folder = str(Path(folder).expanduser().resolve())
+        checkpoint = str(Path(checkpoint).expanduser().resolve())
+        def job():
+            try:
+                out = lib.import_policy(folder, checkpoint, name, description, backend, required_mode, required_tcp,
+                                        overwrite=bool(overwrite))
+            except PolicyImportError as e:
+                return False, str(e)
+            return True, out["msg"]
+        return self._submit("policy import", job)
+
+    def cmd_policy_rename(self, name, new_name=None, description=None, overwrite=False):
+        lib = self.core.policies.library
+        if name in (self.prepared_policy, self.core.policies.current):
+            raise CommandError(f"'{name}' is prepared or running: stop it first")
+        try:
+            out = lib.edit_manifest(name, new_name, description, overwrite=bool(overwrite))
+        except PolicyImportError as e:
+            raise CommandError(str(e)) from None
+        return self._ok(out["msg"], **out)
+
     def cmd_policy_requirements(self, name):
         return self._ok(requirements=[{"label": r.label, "state": r.state, "detail": r.detail,
                                        "fix": self._requirement_fix(name, r) if r.state in ("fail", "warn") else None}
@@ -2084,6 +2140,31 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             return res.success, "ready" if res.success else res.stop_reason
         return self._submit(f"prepare {name}", job)
 
+    def cmd_policy_start(self, name, duration=None, recording=None):
+        """Prepare and start through PolicyExecutor for the OPERATE policy window."""
+        if name not in self.core.policies.manifests:
+            raise CommandError(f"unknown policy '{name}'")
+        if not self.core.idle():
+            raise CommandError("robot is busy")
+        goal = self.core.policies.goal(name, duration=float(duration) if duration not in (None, "") else None,
+                                       recording=_recording(recording))
+        def job():
+            done, out = threading.Event(), {}
+            if not self.core.policies.prepare(goal, lambda res: (out.setdefault("prepare", res), done.set())):
+                return False, out.get("prepare", RunPolicyResult(False, "preflight failed")).stop_reason
+            if not done.wait(120):
+                return False, "prepare timed out"
+            prepared = out["prepare"]
+            if not prepared.success:
+                return False, prepared.stop_reason
+            self.core.policy_result, self.core.policy_feedback = None, None
+            self.core.command_source = f"policy {name}"
+            if not self.core.policies.start(goal):
+                self.core.command_source = "idle"
+                return False, self.core.policy_result.stop_reason if self.core.policy_result else "not started"
+            return True, f"{name} started"
+        return self._submit(f"start policy {name}", job)
+
     def cmd_policy_run(self, name, recording=None):
         if self.prepared_policy != name:
             raise CommandError("prepare this policy first")
@@ -2101,6 +2182,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         self.core.note_stop(self._actor()["name"] or "the operator")
         self.core.policies.cancel()
         return self._ok("stopping policy")
+    cmd_policy_stop.read_only = True
 
     # ------------------------------------------------------ keep-out zones
     # Boxes MoveIt must plan around (planning-scene collision objects `gui_keepout/<name>`). Editing changes what
@@ -2524,10 +2606,7 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                         "can_reactivate": bool(p.gripper.get("reactivate_service")),
                         "can_reconnect": bool(p.gripper.get("controller_manager"))},
             "cameras": p.cameras,
-            "policies": [{"name": m.name, "description": m.description, "algorithm": m.algorithm,
-                          "backend": m.backend, "mode": m.required_mode, "tcp": m.required_tcp,
-                          "hz": m.control_hz, "duration": m.duration}
-                         for m in c.policies.manifests.values()],
+            "policies": [self._policy_info(m) for m in c.policies.manifests.values()],
             "vial_points": list(VIAL_POINTS),
             "jog": {"step_mm": c.jog_cfg["step_mm"], "step_deg": c.jog_cfg["step_deg"]},
             "force": {k: c.force_cfg[k] for k in ("max_force_n", "max_torque_nm", "ramp_force_nps",
@@ -2616,6 +2695,15 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
             tcp_sig = str(c.store.active_tcp)
         fb = c.policy_feedback
         pr = c.policy_result
+        policy_steps = self._policy_steps()
+        range_warnings = []
+        if c.policies.current:
+            m = c.policies.manifests.get(c.policies.current)
+            if m and c.policies.range_check:
+                try:
+                    range_warnings = c.policies.range_check(m)
+                except Exception as e:
+                    range_warnings = [f"range check unavailable: {e}"]
         return {
             "t": time.time(), "boot": BOOT_ID,
             "robot_mode": s.robot_mode, "safety_mode": s.safety_mode, "program_running": s.program_running,
@@ -2646,7 +2734,10 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
                        "feedback": vars(fb) if fb else None,
                        "result": {"success": pr.success, "reason": pr.stop_reason, "log_dir": pr.log_dir}
                        if pr else None,
-                       "supports_feedback": c.policies.supports_feedback},
+                       "supports_feedback": c.policies.supports_feedback,
+                       "range_warnings": range_warnings,
+                       "step_warnings": (self._policy_last_step or {}).get("out_of_range", [])},
+            "policy_steps": policy_steps,
             "payload": self.payload_view(),
             "ftmatch": self.ftmatch_view(),
             "ft_bias": self.core.ft_bias.view(),
@@ -2676,6 +2767,24 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands, 
         if out:
             self._ft_t = out[-1][0]
         return out
+
+    def _policy_steps(self) -> list:
+        fn = getattr(self.core.bridge, "policy_step_samples", None)
+        if fn is None:
+            return []
+        try:
+            rows = fn(self._policy_step_cursor)
+        except Exception as e:
+            self.core.bridge.log(f"web: policy step stream failed: {e}")
+            return []
+        if not rows:
+            return []
+        self._policy_step_cursor = max(float(r.get("_received", self._policy_step_cursor)) for r in rows)
+        clean = []
+        for row in rows:
+            self._policy_last_step = row
+            clean.append({k: v for k, v in row.items() if k != "_received"})
+        return clean
 
     def _plan_summary(self):
         p = self.core.plan_view()

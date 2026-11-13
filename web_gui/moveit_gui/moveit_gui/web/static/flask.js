@@ -54,11 +54,8 @@ export function flaskPage(ctx) {
   const fakeBtn = lease(btn("Fake touches", "quiet", () => run("flask_fake_touches"),
     "Simulated robot only: touches on a 250 ml flask 5 cm below the TCP"));
   const touchCard = h("div", { class: "card" },
-    h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Touch points"), freedriveButton()),
-    note("In freedrive, touch the flask from outside with the TCP tip and capture each point.",
-      "Use the active TCP: its point must be the centre of the ball tip. Rim: the outside of the rim. Bulb: all around " +
-      "and down to the bottom, not only one side. Neck side points make the neck size better; without them the neck is " +
-      "taken from the rim."),
+    h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Touch the flask"), freedriveButton()),
+    note("In freedrive, touch the flask with the tool tip and capture each point."),
     h("div", { class: "row wrap" }, h("span", { class: "k" }, "Tip radius mm"), tip, h("span", { class: "k" }, "Wall mm"), wall,
       h("span", { class: "k", title: "Measure it with a caliper if you can; otherwise it is the outer neck minus the wall" }, "Neck ID mm"), neckId),
     hint, ...groups,
@@ -67,26 +64,24 @@ export function flaskPage(ctx) {
 
   // ---- fit result + save
   const res = h("div", { class: "grid" }), warns = h("div", { class: "col", style: "gap:2px" }), err = h("div", { class: "error" });
-  const pname = h("input", { type: "text", placeholder: "flask name, e.g. 250 ml A", style: "flex:1" });
+  const pname = h("input", { type: "text", placeholder: "flask name", style: "flex:1" });
   const save = lease(btn("Save flask", "primary", async () => {
-    const n = pname.value.trim() || (await askText("Name of this flask (kept in the flask profiles list):", ""));
+    const n = pname.value.trim() || (await askText("Name for this flask:", ""));
     if (!n) return;
     const w = (F.data && F.data.result && F.data.result.warnings) || [];
     if (w.length && !(await ask(`The fit has warnings:\n\n${w.join("\n")}\n\nSave it anyway?`))) return;
     return run("flask_save", { name: n });
   }, "Save as a flask profile and make it the fixture \"flask\" that scrape programs use"));
   const fitCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask"), res, warns, err,
-    note("Saved, the flask is the fixture \"flask\": its origin is the bulb centre, Z up the neck.",
-      "Sizes are outside sizes minus the tip radius; the inner radius is the bulb minus the wall. The closest size is a " +
-      "typical catalogue size, not a check. RMS is how far the touches are from the fitted shape."),
+    note("Save the fitted flask for use."),
     h("div", { class: "row" }, pname, save));
 
   // ---- profiles
   const plist = h("tbody", {});
-  const profCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask profiles"),
+  const profCard = h("div", { class: "card" }, h("div", { class: "section" }, "Saved flasks"),
     h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, ["Name", "Size", "OD mm", "Neck ID mm", "Centre mm", "Source", "In use", ""]
       .map((x) => h("th", {}, x)))), plist),
-    note("Use makes a profile the fixture \"flask\". Refused while a program runs.", "Saved per robot. Deleting a profile keeps the fixture."));
+    note("Choose which saved flask is in use."));
 
   // ---- scrape generator
   const toolSel = h("select", { onchange: () => bentRow.classList.toggle("hidden", toolSel.value !== "bent") },
@@ -124,14 +119,7 @@ export function flaskPage(ctx) {
       ...r.reasons.map(([why, n]) => h("div", { class: "muted" }, `${n} × ${why}`)));
   };
   const scrapeCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask scrape"),
-    note("Like the vial scrape: one stroke down the wall every step ° around (360°), each from the highest polar " +
-      "angle down to the lowest. The tool goes in through the neck and pivots there.",
-      "0° is the bottom of the bulb. Points per stroke: how many poses from max down to min. Press depth is how far past the inner wall the tip is aimed. Speed limits every " +
-      "linear move. Force (optional, in a force mode): a straight tool's TCP X faces the wall and the force is along +X; " +
-      "a bent tool's end points into the wall and the force is along +Z. Pitch (straight tool): its tilt from vertical, " +
-      "toward the wall, at the top and the bottom of each stroke (one value: the same all the way); empty: automatic, the " +
-      "shaft through the middle of the neck, which reaches highest. The neck and the glass are checked either way: " +
-      "Check reach shows what they block (red). A wider neck reaches higher; a bent tool too (Suggest bend)."),
+    note("Create a program that follows the flask wall."),
     h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
       h("span", { class: "k" }, "Tool"), h("div", { class: "row" }, toolSel, "shaft r", shaftR, "length", shaftL, "mm"),
       h("span", { class: "k" }, ""), h("div", { class: "col", style: "gap:2px" }, bentRow, sugOut),

@@ -354,6 +354,7 @@ class RosBridge(CameraTopics):
         self._t_spin = time.monotonic()                 # executor heartbeat
         self._shutting_down = False
         self.wrench_history = WrenchHistory()           # 100 Hz F/T for the web chart
+        self._policy_step_buf: deque = deque(maxlen=2000)
         self.on_wrench = None                           # every F/T sample, for the F/T limit (core: ft_guard.feed)
         self._joints_received = False
         self._velocities_ok = False
@@ -443,6 +444,10 @@ class RosBridge(CameraTopics):
         self._robot_description: Optional[str] = None
         n.create_subscription(String, t.get("robot_description", "/robot_description"), self._on_robot_description,
                               LATCHED, callback_group=self.cb)
+        # The policy runner publishes one JSON String per control step. Keep the bridge as the only ROS-facing
+        # subscriber; the web page receives polled batches from WebService.state().
+        n.create_subscription(String, "/policy_runner/step", self._on_policy_step,
+                              QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE), callback_group=self.cb)
         # --- Cartesian force targets (OPERATE > Force), one publisher per controller topic
         self._wrench_pubs: Dict[str, object] = {}
         for m in profile.modes.values():
@@ -721,6 +726,22 @@ class RosBridge(CameraTopics):
     def _on_robot_description(self, msg):
         with self._lock:
             self._robot_description = msg.data
+
+    def _on_policy_step(self, msg):
+        try:
+            import json
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                return
+            data["_received"] = time.time()
+            with self._lock:
+                self._policy_step_buf.append(data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.log("policy runner sent an invalid /policy_runner/step message")
+
+    def policy_step_samples(self, since: float) -> List[dict]:
+        with self._lock:
+            return [dict(x) for x in self._policy_step_buf if float(x.get("_received", 0)) > float(since)]
 
     def robot_description(self) -> Optional[str]:
         with self._lock:

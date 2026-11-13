@@ -26,13 +26,11 @@ export function drivers(ctx) {
   const D = { data: null, sel: null, topic: null, edit: null, sig: "", logT: 0 };
 
   const left = h("div", { class: "card", style: "width:340px" },
-    h("div", { class: "section" }, "Drivers & pipelines"),
-    note("Camera drivers and vision pipelines the GUI starts and stops for you.",
-      "Each one is a ROS process in the robot container. Start starts what it needs first (a pipeline's camera); Stop " +
-      "stops what needs it first. Ready = all its topics publish. A GUI restart leaves them running."),
+    h("div", { class: "section" }, "Camera sources"),
+    note("Start and stop camera sources here."),
     list,
     h("div", { class: "row" }, lease(btn("+ Add…", "primary", () => openEditor(null)))),
-    h("div", { class: "section" }, "Other image topics"),
+    h("div", { class: "section" }, "Other streams"),
     others,
     h("div", { class: "row" }, h("input", { type: "text", id: "dr-topic", list: "dr-topics", placeholder: "any image topic…",
       style: "flex:1", onchange: (e) => pickTopic(e.target.value.trim()) }), h("datalist", { id: "dr-topics" }),
@@ -60,7 +58,7 @@ export function drivers(ctx) {
     others.replaceChildren(...(rest.length ? rest.map((c) => h("div", { class: "item" + (D.topic === c.topic ? " on" : ""),
       onclick: () => pickTopic(c.topic) },
       h("span", { class: "dot" + (c.publishers > 0 ? " ok" : ""), style: "margin-top:5px" }),
-      h("div", { class: "grow" }, h("div", {}, c.name), h("div", { class: "muted small" }, c.topic)))) :
+      h("div", { class: "grow", title: c.topic }, h("div", {}, c.name), h("div", { class: "muted small" }, "Image stream")))) :
       [h("div", { class: "muted small" }, "none")]));
     document.getElementById("dr-topics")?.replaceChildren(...r.topics.map((t) => h("option", { value: t })));
   }
@@ -98,11 +96,11 @@ export function drivers(ctx) {
     D.shown = topic || null;
     if (!topic) return preview.replaceChildren(h("span", { class: "muted" }, "No picture: start it first"));
     preview.replaceChildren(h("img", { src: "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&t=" + Date.now(), alt: "",
-      onerror: () => preview.replaceChildren(h("span", { class: "muted" }, `${topic}: no picture yet`)) }));
+      onerror: () => preview.replaceChildren(h("span", { class: "muted" }, "No picture yet")) }));
   }
   function fillRight() {
     if (D.topic) {
-      right.replaceChildren(h("div", { class: "row" }, h("span", { class: "title grow" }, D.topic)), info, preview);
+      right.replaceChildren(h("div", { class: "row" }, h("span", { class: "title grow", title: D.topic }, "Image stream")), info, preview);
       if (D.shown !== D.topic) show(D.topic);
       return;
     }
@@ -113,8 +111,7 @@ export function drivers(ctx) {
     if (!imgs.some((o) => o.topic === D.view)) D.view = imgs[0]?.topic || null;
     const live = on && D.view && s.outputs.find((o) => o.topic === D.view)?.publishers > 0;
     right.replaceChildren(
-      h("div", { class: "row" }, h("span", { class: "title grow" }, s.label || s.name, h("span", { class: "muted" }, " · " + s.type_label +
-        (s.label && s.label !== s.name ? " · topics /…/" + s.name : ""))),
+      h("div", { class: "row" }, h("span", { class: "title grow", title: s.name }, s.label || s.name, h("span", { class: "muted" }, " · " + s.type_label)),
         chip(txt + (s.state === "running" && s.up_s != null ? " " + upTime(s.up_s) : ""), cls)),
       s.msg ? h("div", { class: s.state === "failed" ? "bad small" : "muted small" }, s.msg) : "",
       h("div", { class: "row" },
@@ -131,11 +128,11 @@ export function drivers(ctx) {
       h("div", { class: "section" }, "Topics"),
       h("div", { class: "list" }, ...s.outputs.map((o) => h("div", { class: "item" },
         h("span", { class: "dot" + (o.publishers > 0 ? " ok" : ""), style: "margin-top:5px" }),
-        h("div", { class: "grow" }, h("div", {}, o.label, o.required ? "" : h("span", { class: "muted small" }, " (optional)")),
-          h("div", { class: "muted small" }, o.topic))))),
+        h("div", { class: "grow", title: o.topic }, h("div", {}, o.label, o.required ? "" : h("span", { class: "muted small" }, " (optional)")),
+          h("div", { class: "muted small" }, "Image stream"))))),
       s.needs.length ? h("div", { class: "muted small" }, "Needs: " + s.needs.join(", ")) : "",
       h("details", { id: "dr-logbox", ontoggle: (e) => e.target.open && log(true) }, h("summary", {}, "Log"), logBox,
-        h("div", { class: "muted small" }, "Command: ", h("code", {}, s.command))));
+        h("div", { class: "muted small", title: s.command }, "Service details")));
     const want = live ? D.view : null;
     if (D.shown !== want || !preview.firstChild) show(want);
   }

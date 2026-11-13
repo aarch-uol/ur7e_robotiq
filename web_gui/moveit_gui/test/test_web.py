@@ -64,6 +64,11 @@ def test_commands_need_the_lease_but_stop_does_not(env):
     assert ("cancel",) in bridge.calls
 
 
+def test_policy_stop_does_not_need_the_lease(env):
+    s, _, _, _ = env
+    assert s.command("without-control", "policy_stop", {})["ok"]
+
+
 def test_takeover_is_refused_while_the_robot_moves(env):
     s, bridge, clock, _ = env
     a = s.take_lease("", "alice")["token"]

@@ -71,3 +71,26 @@ test('layout autosave stays bound to the loaded tab profile', async () => {
   assert.equal(saved[1][1].name, 'Loaded');
 });
 
+test('initial profile layout sync waits for control', async () => {
+  const saved = [], ctx = context({
+    holds: false, prefsProfile: null, prefsSynced: null,
+    localPrefs: () => ({ 'v3-show': '{}' }),
+    scmd: async (name, args) => {
+      saved.push([name, args]);
+      return name === 'profile_prefs_get' ? { ok: true, prefs: {} } : { ok: true };
+    },
+  });
+  const start = source.indexOf('async function profilePrefs(');
+  const end = source.indexOf('\nlet prefsSaving', start);
+  vm.runInContext(`${source.slice(start, end)}; globalThis.profilePrefs = profilePrefs;`, ctx);
+
+  await ctx.profilePrefs('Viewer', false);
+  assert.equal(JSON.stringify(saved), JSON.stringify([['profile_prefs_get', { name: 'Viewer' }]]));
+  assert.equal(ctx.prefsSynced, null);
+
+  vm.runInContext('holds = true;', ctx);
+  await ctx.profilePrefs('Viewer', false);
+  assert.equal(saved[2][0], 'profile_prefs_save');
+  assert.equal(saved[2][1].name, 'Viewer');
+});
+

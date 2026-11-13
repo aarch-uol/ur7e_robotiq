@@ -8,7 +8,7 @@
   --accent: #2b5fb8; --accent-hover: #244f9c; --accent-disabled: #a9bcdc;
   --ok: #1e8a57; --warn: #b7700b; --warn-bg: #f8eeda; --danger: #c23b32; --danger-hover: #a5312a;
   --danger-bg: #f8e6e4; --off: #a2aab3;
-  --s: 8px; --m: 12px; --l: 16px; --r: 3px; --h: 28px;
+  --s: 8px; --m: 12px; --l: 16px; --r: 4px; --h: 28px;
   --mono: ui-monospace, "SF Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
@@ -91,9 +91,9 @@ main { flex: 1; overflow: auto; padding: var(--s); min-width: 0; }
 /* -------------------------------------------------------------------- cards */
 .card { background: var(--surface); border-radius: var(--r); padding: var(--m); display: flex; flex-direction: column;
         gap: var(--s); min-width: 0; }
-.section { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
+.section { font-size: 15px; line-height: 1.25; font-weight: 600; letter-spacing: 0; color: var(--text); text-transform: none; }
 .title { font-size: 15px; font-weight: 600; }
-.muted { color: var(--muted); font-size: 11px; }
+.muted { color: var(--muted); font-size: 12px; }
 .secondary { color: var(--text2); }
 .error { color: var(--danger); }
 .warn { color: var(--warn); }
@@ -965,6 +965,17 @@ main .btn:disabled, .dlg .btn:disabled { background: var(--sunken); border-color
 .page[data-page="PROGRAMS"] { padding-bottom: 8px; }
 .page[data-page="PROGRAMS"] .pg-cols { margin-bottom: 4px; }
 #pg-t-insert, .pg-right { scroll-padding-bottom: 64px; }
+
+/* Setup/settings cleanup: clear hierarchy, one radius set, and a bounded sticky model view. */
+.page-title { font-size: 18px; line-height: 1.25; font-weight: 600; margin: 4px 0 2px; }
+.su-v3card { position: sticky; top: var(--s); align-self: flex-start; max-height: 70vh; }
+.view3d.su-v3 { height: min(430px, 58vh); min-height: 260px; max-height: calc(70vh - 48px); }
+.xyz { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s); }
+.xyz input { width: 100% !important; min-width: 0; }
+.seg, .mseg, .tseg, .jvseg, .dr-type, .planrow, .reload-bar, .lrow { border-radius: var(--r); }
+.planrow { background: var(--selected); border-color: var(--line); }
+.reload-bar { background: var(--warn-bg); border-color: var(--line); }
+.card .chip { border-radius: 999px; }
 /* OPERATE › Robot: the pendant buttons go under the state line when the card is narrow, never squeeze it */
 .rhead { flex-wrap: wrap; row-gap: 6px; }
 .rhead > .grow { min-width: 150px; }

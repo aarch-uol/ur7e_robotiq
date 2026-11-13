@@ -27,7 +27,7 @@ from .geometry import Geometry, PoseSpec
 from .history import RunHistory
 from .jog import JogCommand, JogVelocity
 from .keepout import KeepoutScene, KeepoutStore
-from .policies import PolicyLibrary
+from .policies import PolicyLibrary, policy_range_warnings
 from .policy_action import MockPolicyRunner, RunPolicyFeedback, RunPolicyResult, SubprocessPolicyRunner
 from .policy_executor import PolicyExecutor
 from .profile import RobotProfile, reorder_joints
@@ -45,7 +45,7 @@ Result = Tuple[bool, str]
 
 class RobotCore:
     def __init__(self, bridge, profile: RobotProfile, profiles_dir: Path, programs_dir: Path, policies_dir: Path,
-                 fake: bool = False):
+                 fake: bool = False, policy_import_roots=None, policy_card_command=None):
         self.bridge, self.profile, self.fake = bridge, profile, fake
         self.profiles_dir, self.programs_dir, self.policies_dir = Path(profiles_dir), Path(programs_dir), \
             Path(policies_dir)
@@ -73,7 +73,7 @@ class RobotCore:
             policy_running=lambda: self.policies.busy,
             program_running=lambda: self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active))
         # One policy runtime path: AUTOMATION and the program `policy` step both go through this.
-        library = PolicyLibrary(policies_dir)
+        library = PolicyLibrary(policies_dir, allowed_roots=policy_import_roots, card_command=policy_card_command)
         # SETUP > F/T + payload > Match simulation: the result in use goes into every policy run's robot config
         self.ft_match = FtMatchStore(ft_match_path(_config_dir(), profile.name))
         self.settings_owner: Callable[[], str] = lambda: ""      # whose settings are in use (set by the web GUI)
@@ -83,6 +83,11 @@ class RobotCore:
                                        MockPolicyRunner() if fake else SubprocessPolicyRunner(library, self.modes),
                                        active_tcp=lambda: self.store.active_tcp,
                                        frame_exists=lambda f: f in self.store.frame_names())
+        self.policies.range_check = lambda m: policy_range_warnings(
+            m, raw_ft=(self.last_snap.wrench if hasattr(self, "last_snap") else None),
+            tcp_z=(self.geo.current_T_base_tcp(self.store.active_tcp)[2, 3]
+                   if self.store.active_tcp else None),
+            ft_result=self.ft_match.load())
         # MoveIt Servo is paused while no jog or policy uses it (servo_pause.py)
         self.servo_pause = ServoPause(bridge, (profile.servo.get("routes") or {}).keys(), bridge.log)
         self.policies.servo_pause = self.servo_pause

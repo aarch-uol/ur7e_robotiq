@@ -270,3 +270,94 @@ export function ftChart(storage = globalThis.localStorage) {
     },
   };
 }
+
+/** Keep runner samples for a rolling policy window. The buffer is exported so the small chart can be tested
+ * without a browser canvas. Samples are the shared /policy_runner/step JSON objects. */
+export function policyStepBuffer(windowSeconds = 30) {
+  let rows = [];
+  return {
+    get length() { return rows.length; },
+    get rows() { return rows.slice(); },
+    push(samples) {
+      for (const sample of Array.isArray(samples) ? samples : []) {
+        if (!sample || !Number.isFinite(Number(sample.t))) continue;
+        rows.push(sample);
+      }
+      if (rows.length) {
+        const cut = Number(rows[rows.length - 1].t) - windowSeconds;
+        let first = 0;
+        while (first < rows.length && Number(rows[first].t) < cut) first++;
+        if (first) rows = rows.slice(first);
+      }
+      return rows.length;
+    },
+    clear() { rows = []; },
+  };
+}
+
+/** Live policy chart: actions and F/T on their own scales; observation sigma is shown as bars. */
+export function policyChart() {
+  const buf = policyStepBuffer(30);
+  const canvas = el("canvas", { class: "ftc-canvas", style: "height:260px", role: "img", "aria-label": "Live policy actions and force chart" });
+  const note = el("div", { class: "ftc-read muted small" });
+  const sigmaBox = el("div", { class: "policy-sigma" });
+  const root = el("div", { class: "card policy-chart" },
+    el("div", { class: "section" }, "Policy chart · last 30 s"), canvas, sigmaBox, note);
+  let dirty = true;
+  // Two plots, each on its own scale: policy actions (~0.01) would be a flat line next to F/T (~10 N)
+  const PLOTS = [
+    { label: "action", names: ["dx", "dz", "dpitch"], get: (r, i) => r.action?.[i], colors: ["#d1495b", "#2e8b57", "#2f5fb3"] },
+    { label: "F/T (N)", names: ["Fx", "Fy", "Fz"], get: (r, i) => r.ft?.[i], colors: ["#c77d12", "#7b4fb3", "#14879c"] },
+  ];
+  function draw() {
+    dirty = false;
+    const W = canvas.clientWidth || 520, H = canvas.clientHeight || 260, dpr = globalThis.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    }
+    const g = canvas.getContext("2d");
+    if (!g) return;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const rows = buf.rows, L = 40, R = 8, B = 16, gap = 14, now = rows.length ? Number(rows.at(-1).t) : 0;
+    const ph = (H - B - gap * PLOTS.length) / PLOTS.length, pw = W - L - R;
+    const X = (t) => L + pw * (1 - (now - t) / 30);
+    g.font = "10px system-ui, sans-serif";
+    PLOTS.forEach((P, n) => {
+      const T = gap + n * (ph + gap);
+      const vals = rows.flatMap((r) => P.names.map((_, i) => P.get(r, i))).filter(Number.isFinite);
+      const a = axisRange(vals, n ? 1 : 0.01), Y = (v) => T + ph * (1 - (v - a.lo) / (a.hi - a.lo));
+      g.textAlign = "right"; g.textBaseline = "middle"; g.strokeStyle = "#e2e5e9"; g.lineWidth = 1;
+      const dec = a.step >= 1 ? 0 : Math.min(4, Math.ceil(-Math.log10(a.step)));
+      for (let v = a.lo; v <= a.hi + a.step / 2; v += a.step) {
+        const y = Math.round(Y(v)) + .5; g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+        g.fillStyle = "#515a65"; g.fillText(v.toFixed(dec), L - 4, y);
+      }
+      g.textAlign = "left"; g.textBaseline = "alphabetic"; let lx = L;
+      g.fillStyle = "#515a65"; g.fillText(P.label, lx, T - 3); lx += g.measureText(P.label).width + 10;
+      P.names.forEach((name, i) => { g.fillStyle = P.colors[i]; g.fillText("— " + name, lx, T - 3); lx += g.measureText("— " + name).width + 8; });
+      g.save(); g.beginPath(); g.rect(L, T, pw, ph); g.clip();
+      P.names.forEach((_, i) => {
+        g.strokeStyle = P.colors[i]; g.lineWidth = 1.4; g.beginPath(); let first = true;
+        rows.forEach((r) => { const v = P.get(r, i); if (!Number.isFinite(v)) return; const x = X(Number(r.t)), y = Y(v); first ? g.moveTo(x, y) : g.lineTo(x, y); first = false; });
+        g.stroke();
+      });
+      g.restore();
+    });
+    g.fillStyle = "#515a65"; g.textAlign = "center"; g.textBaseline = "alphabetic";
+    for (let s = 30; s >= 0; s -= 10) g.fillText(s ? `-${s} s` : "now", Math.min(Math.max(L + pw * (1 - s / 30), L + 12), L + pw - 12), H - 3);
+    const latest = rows.at(-1), sigma = latest?.obs_sigma || {};
+    const bad = latest?.out_of_range || [];
+    sigmaBox.replaceChildren(...Object.entries(sigma).map(([name, value]) => {
+      const n = Number(value), width = Math.max(0, Math.min(100, n / 4 * 100));
+      return el("div", { class: "policy-sigma-row", title: `${name}: ${n.toFixed(1)} sigma` },
+        el("span", { class: "muted small" }, name), el("div", { class: "bar grow" },
+          el("div", { style: `width:${width}%;${n > 4 ? "background:var(--danger)" : ""}` })),
+        el("span", { class: "mono small" }, n.toFixed(1)));
+    }));
+    note.textContent = latest ? `dx ${Number(latest.action?.[0] || 0).toFixed(3)} · dz ${Number(latest.action?.[1] || 0).toFixed(3)} · dpitch ${Number(latest.action?.[2] || 0).toFixed(3)} · ` +
+      `obs sigma ${Object.entries(sigma).map(([k, v]) => `${k} ${Number(v).toFixed(1)}`).join(", ") || "—"}` +
+      (bad.length ? ` · out of range: ${bad.join(", ")}` : "") : "No policy step data";
+  }
+  return { el: root, get length() { return buf.length; }, get rows() { return buf.rows; }, draw,
+    push(state) { const n = buf.push(state?.policy_steps || []); if (n) draw(); }, clear() { buf.clear(); draw(); } };
+}

@@ -24,7 +24,7 @@ export function workcell(ctx) {
   const roots = [];
   const $ = (sel) => document.querySelector(sel) || roots.map((r) => r.querySelector(sel)).find(Boolean) || null;
   const num = (id, value, step = "1", w = "76px") => h("input", { type: "number", id, value, step, style: `width:${w}` });
-  const v3 = (id, vals, step) => h("div", { class: "row" }, vals.map((v, i) => num(`${id}${i}`, v, step)));
+  const v3 = (id, vals, step) => h("div", { class: "xyz" }, vals.map((v, i) => num(`${id}${i}`, v, step)));
   const read3 = (id) => [0, 1, 2].map((i) => +$(`#${id}${i}`).value || 0);
   const set3 = (id, v) => [0, 1, 2].forEach((i) => ($(`#${id}${i}`).value = +(+v[i]).toFixed(3)));
   const chip = (text, cls, title = "") => h("span", { class: "chip " + cls, title }, text);
@@ -42,7 +42,7 @@ export function workcell(ctx) {
     if (s.type === "box") return `box ${s.size_mm.map((x) => +x.toFixed(1)).join("×")} mm`;
     if (s.type === "cylinder") return `cylinder r${+s.radius_mm.toFixed(1)} × ${+s.length_mm.toFixed(1)} mm`;
     if (s.type === "sphere") return `sphere r${+s.radius_mm.toFixed(1)} mm`;
-    if (s.type === "mesh") return `mesh ${s.file}`;
+    if (s.type === "mesh") return "mesh";
     return "frame only";
   }
   const COLL = { auto: "automatic light convex pieces (recommended for meshes)", visual: "uses the full visual shape",
@@ -135,19 +135,14 @@ export function workcell(ctx) {
     const parentSel = h("select", { id: "pt-parent", style: "min-width:180px", title: "What it is bolted to: a link of the robot, or another part" });
     const presetSel = h("select", { id: "pt-preset", onchange: () => { const k = presetSel.value; presetSel.value = ""; if (k) startFrom(P.data.presets[k], k); } });
     const card = h("div", { class: "card su-main" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Parts"),
+      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Parts & tools"),
         btn("+ New part", "quiet", () => startFrom({ parent: P.lastParent || "tool0", shape: { type: "box", size_mm: [40, 40, 20] } })),
         btn("Import mesh…", "quiet", () => {
           if (P.drafting) P.lastParent = parentSel.value || P.lastParent;   // no draft yet: the select shows its first option
           P.importing = true;
           fileIn.click();
         }, "Upload a CAD mesh and start placing it immediately")),
-      note("Things bolted to the robot or the cell, built piece on piece like the real tool. MoveIt plans around them at once.",
-        "A part is a box, cylinder, sphere or mesh (.stl, .obj, .dae) on a parent (a robot link or another part), at an offset in mm / deg. " +
-        "A shape sits on its frame and grows along +Z, so a part put on another one starts on its far face. Saved parts are " +
-        "live at once: a TF frame, a MoveIt collision object (carried by the arm link they ride on) and the 3D views. " +
-        "Restart the robot stack to write them into the robot model too (URDF / SRDF: RViz, recordings, self-collision). " +
-        "Changing the tool changes the payload: redo SETUP › F/T + payload."),
+      note("Objects on the robot or in the cell. The planner avoids them."),
       h("table", { class: "su-ptable" }, h("thead", {}, h("tr", {}, ["Part", "On", "Shape", "Offset mm, °", "", ""].map((x) => h("th", {}, x)))),
         h("tbody", { id: "pt-list" })),
       h("div", { class: "muted small", id: "pt-sync" }),
@@ -166,7 +161,7 @@ export function workcell(ctx) {
         btn("Reset", "quiet", () => resetPose(), "Return to the saved/start pose"),
         btn("Cancel", "quiet", () => cancelDraft(), "Discard this draft and show the saved part again")),
       h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
-        h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "pt-name", placeholder: "spatula_holder" }),
+        h("span", { class: "k" }, "Name"), h("input", { type: "text", id: "pt-name", placeholder: "part name" }),
         h("span", { class: "k" }, "On"), h("div", { class: "row" }, parentSel,
           btn("on far face", "quiet", () => { const p = P.data.parts.find((x) => x.name === parentSel.value); set3("pt-xyz", [0, 0, p ? p.far_face_mm : 0]); draftChanged(); },
             "Put it on the far face of the parent part (where a stacked piece starts)")),
@@ -197,7 +192,7 @@ export function workcell(ctx) {
         h("div", { class: "grow" }), h("span", { class: "muted small", id: "pt-hint" })),
       h("div", { class: "muted small", style: "margin-top:6px" },
         h("div", {}, "Active now: draft in 3D; after Save: TF + MoveIt collision + 3D view."),
-        h("div", { id: "pt-model-state" }, "Robot model (URDF): after Restart robot stack.")),
+        h("div", { id: "pt-model-state" }, "Robot model: after Restart robot.")),
       fileIn);
     shapeFields();
     editor.addEventListener("input", () => draftChanged());
@@ -366,7 +361,7 @@ export function workcell(ctx) {
         const [lbl, cls, tip] = STATUS[p.status] || [p.status, "", ""];
         return h("tr", { class: P.editing === p.name ? "on" : "" },
           h("td", {}, h("span", { class: "dot", style: `background:${p.color}` }), " ", p.name, p.kind === "camera" ? " 📷" : ""),
-          h("td", { class: "mono" }, p.parent), h("td", { title: COLL[p.collision] || "" }, shapeText(p),
+          h("td", { class: "mono", title: p.parent }, "mounted"), h("td", { title: [COLL[p.collision], p.shape?.file].filter(Boolean).join("\n") }, shapeText(p),
             p.collision && p.collision !== "visual" && p.shape.type !== "none" ? h("span", { class: "muted small" }, ` · ${p.collision === "none" ? "no collision" : p.collision}`) : ""),
           h("td", { class: "mono small", style: "white-space:nowrap" }, `${p.xyz_mm.map((x) => +x.toFixed(1)).join(", ")}`, h("br"), `${p.rpy_deg.map((x) => +x.toFixed(1)).join(", ")}°`),
           h("td", {}, chip(lbl, cls, tip), p.meta?.source === "handeye" ? chip("calibrated", "ok", p.note || "") : ""),
@@ -376,7 +371,7 @@ export function workcell(ctx) {
             lease(btn("✕", "quiet", () => del(p), "Delete")))));
       }) : [h("tr", {}, h("td", { colspan: 6, class: "muted" }, "No parts yet. + New part, or start from a preset."))]));
       d.removed.forEach((n) => $("#pt-list").append(h("tr", {}, h("td", { class: "muted" }, n), h("td", { colspan: 3, class: "muted" }, "deleted"), h("td", {}, chip(...STATUS.removed.slice(0, 2), STATUS.removed[2])), h("td"))));
-      $("#pt-problems").textContent = [d.error, ...d.problems, d.model_ok ? "" : "Robot model: " + d.model_msg].filter(Boolean).join(" · ");
+      $("#pt-problems").textContent = [d.error, ...d.problems, d.model_ok ? "" : "Robot model not loaded. Is the robot running?"].filter(Boolean).join(" · ");
       sync(d.sync, d.restart_for);
     }
     function draft() {
@@ -395,8 +390,8 @@ export function workcell(ctx) {
       $("#pt-sync").textContent = sy ? `MoveIt / TF: ${sy.msg}` : "";
       $("#pt-sync").classList.toggle("error", sy && /error|unverified/.test(sy.state));
       $("#pt-model-state").textContent = rf && rf.length
-        ? "Robot model (URDF): pending Restart robot stack."
-        : "Robot model (URDF): matches the saved Parts.";
+        ? "Robot model: pending Restart robot."
+        : "Robot model: matches the saved parts.";
     }
     roots.push(card, editor);
     W.parts = { card, editor, load: () => cmd("parts_get").then((r) => r.ok && fill(r.parts)), fill,
@@ -436,11 +431,7 @@ export function workcell(ctx) {
     const stepBtn = (b, step) => { b.dataset.step = step; return b; };
     const left = h("div", { class: "col su-main" },
       h("div", { class: "card" }, h("div", { class: "section" }, "1 · Camera"),
-        note("Finds where a camera is on the robot (or in the cell) from 10-15 pictures of a printed ChArUco board.",
-          "Eye-in-hand: the board lies still in the cell, the camera on the tool looks at it from different angles. Eye-to-hand: " +
-          "the board is fixed on the tool, the camera on its stand. The intrinsics come from the camera's own CameraInfo " +
-          "(RealSense / ZED are factory calibrated). OpenCV solves it with Park's method; four other methods are shown as a cross-check. " +
-          "The result becomes a camera part, so the camera's frames hang on the robot in TF (and in the robot model after a stack restart)."),
+        note("Locate a camera from 10–15 pictures of a printed board."),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
           h("span", { class: "k" }, "Camera"), h("div", { class: "row" }, camSel, h("input", { type: "text", id: "he-topic", placeholder: "or an image topic", style: "flex:1" })),
           h("span", { class: "k" }, "Mounted"), mount),
@@ -453,13 +444,13 @@ export function workcell(ctx) {
           h("div", { class: "row wrap" }, ...bf("he-bx", "squares X", "1"), ...bf("he-by", "Y", "1"), ...bf("he-bs", "square mm", "0.1"), ...bf("he-bm", "marker mm", "0.1"),
             h("select", { id: "he-bd" }, ["DICT_4X4_50", "DICT_5X5_100", "DICT_6X6_250"].map((d) => h("option", { value: d }, d)))),
           h("div", { class: "row" }, lease(btn("Save board", "", () => saveBoard(), "Enter the square size you MEASURE on the print"))))),
-      h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3 · Pictures of the board"),
+      h("div", { class: "card" }, h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3 · Capture"),
           btn("Look", "quiet", () => look(), "Grab a frame and show what the board detector sees (records nothing)")),
         h("div", { class: "grid", style: "grid-template-columns:auto 1fr;align-items:center" },
           h("span", { class: "k" }, "Automatic"),
           h("div", { class: "row wrap" }, h("span", { class: "muted small" }, "the robot moves to 12 poses around this one, tilted"), num("he-tilt", 20, "1", "56px"), h("span", { class: "muted small" }, "°"),
-            lease(btn("Plan poses", "quiet", () => plan(), "Poses around this one, turned about the board (eye-in-hand) or the tool tip (eye-to-hand). Nothing moves yet")),
-            lease(stepBtn(btn("Collect all…", "", () => collect(), "Move to each planned pose (MoveIt, collision-aware) and take a picture there"), 2))),
+            lease(btn("Plan", "quiet", () => plan(), "Plan poses around the board; nothing moves yet")),
+            lease(stepBtn(btn("Run all", "", () => collect(), "Move to each planned pose and take a picture"), 2))),
           h("span", { class: "k" }, "By hand"),
           h("div", { class: "row wrap" }, h("span", { class: "muted small" }, "move the arm yourself, then"), ctx.freedriveButton(),
             lease(btn("Capture here", "", () => capture(), "Take a picture where the arm is now (freedrive or jog between pictures)")))),
@@ -467,13 +458,13 @@ export function workcell(ctx) {
         h("div", { class: "row wrap", id: "he-samples" }),
         h("div", { class: "row" }, lease(btn("Clear pictures", "quiet", () => cmd("handeye_drop").then((r) => r.ok && fill(r.he)))))));
     const right = h("div", { class: "card", style: "width:380px" },
-      h("div", { class: "section" }, "4 · Solve and save"),
+      h("div", { class: "section" }, "4 · Solve"),
       h("div", { class: "row" }, stepBtn(btn("Solve", "", () => cmd("handeye_solve").then((r) => r.ok && fill(r.he))), 3)),
       h("div", { id: "he-result" }),
-      h("div", { class: "row" }, h("input", { type: "text", id: "he-name", placeholder: "camera name, e.g. wrist_rs", style: "flex:1" }),
-        lease(stepBtn(btn("Save + add to robot", "", () => saveCam(), "Keep the calibration and put the camera's frame on the robot as a part"), 4))),
-      note("Saving puts the camera on the robot now (TF, 3D view, SETUP › Parts). The robot model gets it at the next robot stack restart."),
-      h("div", { class: "section" }, "Saved calibrations"), h("div", { class: "list", id: "he-saved" }));
+      h("div", { class: "row" }, h("input", { type: "text", id: "he-name", placeholder: "camera name", style: "flex:1" }),
+        lease(stepBtn(btn("Save", "", () => saveCam(), "Save the calibration and add the camera"), 4))),
+      note("Save adds the camera to the robot."),
+      h("div", { class: "section" }, "Saved cameras"), h("div", { class: "list", id: "he-saved" }));
 
     async function start() {
       const opt = C.data?.cameras.find((c) => c.topic === camSel.value);
@@ -506,7 +497,7 @@ export function workcell(ctx) {
     }
     async function saveCam() {
       const n = $("#he-name").value.trim();
-      if (!n) return toast("name the camera (e.g. wrist_rs)", false);
+      if (!n) return toast("name the camera first", false);
       const r = await cmd("handeye_save", { name: n });
       if (r.ok) { fill(r.he); W.parts?.fill(r.parts); }
     }
@@ -531,7 +522,7 @@ export function workcell(ctx) {
       const step = !d.intrinsics ? 1 : d.samples.length < d.min_samples ? 2 : !d.result ? 3 : 4;
       [left, right].forEach((el) => el.querySelectorAll("[data-step]").forEach((x) => x.classList.toggle("primary", +x.dataset.step === step)));
       const i = d.intrinsics;
-      $("#he-intr").textContent = i ? `${d.topic} · frame ${d.frame} · fx ${i.fx.toFixed(1)} fy ${i.fy.toFixed(1)} · cx ${i.cx.toFixed(1)} cy ${i.cy.toFixed(1)}` +
+      $("#he-intr").textContent = i ? `Camera ready · fx ${i.fx.toFixed(1)} fy ${i.fy.toFixed(1)} · cx ${i.cx.toFixed(1)} cy ${i.cy.toFixed(1)}` +
         (i.D.some((x) => Math.abs(x) > 1e-9) ? " · distortion " + i.D.map((x) => x.toFixed(3)).join(" ") : " · no distortion") : "Not started";
       status(d.last);
       $("#he-samples").replaceChildren(...d.samples.map((s, k) => h("span", { class: "chip", title: `${s.corners} corners, ${s.reproj_px} px` },
@@ -554,7 +545,7 @@ export function workcell(ctx) {
       $("#he-saved").replaceChildren(...(d.saved.length ? d.saved.map((c) => h("div", { class: "item" },
         h("div", { class: "grow" }, h("div", {}, `${c.name} · ${c.mount.replace(/_/g, "-")}`),
           h("div", { class: "muted small" }, `${c.verdict} · ${c.rms_mm} mm / ${c.rms_deg}° · ${c.samples} samples · ${c.saved}`),
-          h("div", { class: "mono small" }, `${c.parent} → ${c.optical_frame}: ${c.xyz_mm.join(", ")} mm`)),
+          h("div", { class: "mono small", title: `${c.parent} → ${c.optical_frame}` }, `${c.xyz_mm.join(", ")} mm`)),
         lease(btn("Add to robot", "quiet", () => cmd("handeye_apply", { name: c.name }).then((r) => r.ok && W.parts?.fill(r.parts)))),
         lease(btn("✕", "quiet", async () => (await ask(`Delete calibration ${c.name}?`)) && cmd("handeye_delete", { name: c.name }).then((r) => r.ok && fill(r.he))))))
         : [h("div", { class: "muted small" }, "None yet.")]));
@@ -586,21 +577,17 @@ export function workcell(ctx) {
     const ownerName = (o) => o || "Shared";
     const isCur = (s) => CUR?.name === s.name && (CUR.owner || "") === (OWNER || "");
     const steps = h("div", { class: "list", id: "st-steps" });
-    const guide = h("details", { class: "st-guide" }, h("summary", { class: "section", style: "cursor:pointer" }, "Make a new setup, step by step"), steps,
-      h("div", { class: "muted small", style: "margin-top:6px" }, "To switch later: Load… on a setup. Its camera holder, calibration and cameras come back."));
+    const guide = h("details", { class: "st-guide" }, h("summary", { class: "section", style: "cursor:pointer" }, "Getting started"), steps);
     const card = h("div", { class: "card su-main" },
-      h("div", { class: "section" }, "Setups"),
-      note("One setup per tool or camera holder, saved by name. Load one to switch.",
-        "A setup keeps the parts (your holder in the robot model), TCPs, camera calibrations and which cameras run, F/T bias, " +
-        "payload, gains, keep-out zones and vials. Programs and policies are shared by every setup. Loading one restarts the GUI " +
-        "(and the robot stack when its parts or base differ from the running robot model); the files in use before are kept as an automatic backup."),
+      h("div", { class: "section" }, "Tool setups"),
+      note("Load a saved tool setup, or save the current one."),
       cur,
       h("div", { class: "row" }, h("span", { class: "muted" }, "Profile"), ownerSel, h("span", { class: "grow" }),
-        lease(btn("Copy from another profile…", "quiet", () => copyFrom(), "Copy someone's setup into this profile"))),
+        lease(btn("Copy from…", "quiet", () => copyFrom(), "Copy a setup into this profile"))),
       list,
       guide,
-      h("div", { class: "section" }, "Save what is on the robot now"),
-      h("div", { class: "row" }, h("input", { type: "text", id: "st-name", placeholder: "name, e.g. scraping spatula", style: "width:200px" }),
+      h("div", { class: "section" }, "Save current setup"),
+      h("div", { class: "row" }, h("input", { type: "text", id: "st-name", placeholder: "e.g. gripper + wrist camera", style: "width:200px" }),
         h("input", { type: "text", id: "st-note", placeholder: "note (what is mounted)", style: "flex:1" }),
         lease(btn("Save", "primary", () => save(false)))),
       h("div", { class: "muted small", id: "st-present" }),
@@ -608,21 +595,16 @@ export function workcell(ctx) {
     const baseBox = h("div", { class: "list", id: "st-base" }), robotBox = h("div", { id: "st-robot" });
     const side = h("div", { class: "card", style: "width:320px" },
       h("div", { class: "section" }, "Robot"),
-      note("What this PC runs: the arm (real or fake), gripper, F/T sensor and cameras.",
-        "Hardware… lists what the GUI knows: what is ready on this PC can be picked, the rest says what is missing. " +
-        "Switching restarts the robot stack (about a minute). Kept for the next starts; ur7e_gui.sh --fake or --robot-ip win for one start."),
+      note("The hardware selected for this robot."),
       robotBox,
-      h("div", { class: "section" }, "On the flange (base)"),
-      note("The fixed hardware in the robot model. Your parts go on top of it.",
-        "Each base has its own URDF, SRDF (MoveIt's collision rules and groups) and controllers. Switching restarts the robot " +
-        "stack. A setup remembers its base: loading the setup puts it back."),
+      h("div", { class: "section" }, "Mounted hardware"),
+      note("Fixed hardware in the robot model; your parts go on top."),
       baseBox,
       h("div", { class: "section" }, "Restart"),
-      h("div", { class: "row" }, lease(btn("Restart GUI…", "", () => restart("gui"), "The GUI only: the robot stack keeps running")),
-        lease(btn("Restart robot stack…", "", () => restart("stack"), "Driver, controllers, MoveIt and the GUI: puts the parts into the robot model"))),
-      h("div", { class: "row" }, lease(btn("Stop robot stack…", "", () => stackStop(), "Nobody uses the robot: stop everything, leave a Start page"))),
-      note("Refused while the robot moves, a program or policy runs, or a force is applied.",
-        "The launcher (ur7e_gui.sh) does the restart; a GUI started by hand cannot restart itself."));
+      h("div", { class: "row" }, lease(btn("Restart GUI…", "", () => restart("gui"), "The GUI only: the robot keeps running")),
+        lease(btn("Restart robot…", "", () => restart("stack"), "Restart the robot and the GUI"))),
+      h("div", { class: "row" }, lease(btn("Stop robot…", "", () => stackStop(), "Stop the robot and leave a Start page"))),
+      note("Restart is unavailable while the robot is busy."));
     let B = null, CUR = null;
     let RB = null;
     const robotLabel = (n) => (RB?.robots.find((r) => r.name === n) || { label: n }).label;
@@ -638,9 +620,9 @@ export function workcell(ctx) {
               lease(btn("Hardware…", "primary", () => setupRobot(false)))),
             h("div", { class: "muted small" }, `Gripper: ${optLabel(v.grippers, v.gripper)} · F/T: ${optLabel(v.ft_sensors, v.ft)} · ` +
               `Cameras: ${v.cameras.length ? v.cameras.map((c) => c.name).join(", ") : "none"}`),
-            h("div", { class: "muted small", title: "Your own ROS 2 programs need  export ROS_DOMAIN_ID=" + run.domain }, `ROS domain ${run.domain} · ` +
-              optLabel(v.nets, run.net) + ` · continuous jog ${run.servo || "off"}`))
-        : h("div", { class: "muted small" }, "Started by hand, not by ur7e_gui.sh: set the robot up there."));
+            h("div", { class: "muted small", title: "ROS domain " + run.domain + "; your own ROS 2 programs may need this value" },
+              "Network configured · " + optLabel(v.nets, run.net) + ` · continuous jog ${run.servo || "off"}`))
+        : h("div", { class: "muted small" }, "Robot hardware is not configured here."));
     }
     // Set up this robot: arm (real / fake, IP), gripper, F/T sensor, cameras; one Apply, one restart
     async function setupRobot(first) {
@@ -714,7 +696,7 @@ export function workcell(ctx) {
       paint();
       const form = h("div", {}, body, foot);
       const title = first ? "Set up this robot" : "Robot hardware";
-      const text = (first ? "Nothing is set up on this PC yet. Pick what you have; you can change it later in SETUP › Setups.\n" : "") +
+      const text = (first ? "Nothing is set up on this PC yet. Pick what you have; you can change it later in SETUP › Tool setups.\n" : "") +
         "Fake: no robot, nothing is sent anywhere. Real: nothing moves until you command it.";
       const c = await ask(`${title}\n${text}`, { content: form, wide: true, ok: "Apply", cancel: first ? "Later" : "Cancel",
         result: () => ({ robot: arm, mode, ip: ip.value.trim(), gripper, ft, ft_ip: ftIp.value.trim(), domain: String(domain.value).trim(), net,
@@ -829,13 +811,13 @@ export function workcell(ctx) {
       const run = g.cameras.filter((c) => g.on.includes(c.name));
       steps.replaceChildren(
         step(1, "Put your camera holder in the robot model", g.parts.length > 0,
-          g.parts.length ? "Parts now: " + g.parts.join(", ") : "Import its mesh (.stl, .obj, .dae) on the tool. Then Restart robot stack.", "SETUP", "Parts"),
+          g.parts.length ? "Parts now: " + g.parts.join(", ") : "Add the holder in Parts & tools, then restart the robot.", "SETUP", "Parts"),
         step(2, "Add your camera and start it", run.length > 0,
-          run.length ? "Running: " + run.map((c) => c.label).join(", ") : g.cameras.length ? "Start yours (others: Stop)." : "Add it with + Add…", "SETUP", "Cameras"),
+          run.length ? "Running: " + run.map((c) => c.label).join(", ") : g.cameras.length ? "Start a camera." : "Add a camera source.", "SETUP", "Cameras"),
         step(3, "Calibrate the camera", g.calibrations.length > 0,
-          g.calibrations.length ? "Calibrated: " + g.calibrations.join(", ") : "Eye-in-hand: Start, Plan poses, Collect all…, Solve, Save + add to robot.", "SETUP", "Camera"),
+          g.calibrations.length ? "Calibrated: " + g.calibrations.join(", ") : "Start, plan, capture, solve, then save.", "SETUP", "Camera"),
         step(4, "Save it under your name", !!CUR?.name && !(CUR.changed?.length || CUR.base_changed),
-          CUR?.name ? `In use: ${CUR.name}` : "Type a name below (e.g. alice_d405) and press Save.", "", ""));
+          CUR?.name ? `In use: ${CUR.name}` : "Type a name below and press Save.", "", ""));
     }
     function fillOwners(profiles, owner) {
       PROFILES = profiles || PROFILES;

@@ -6,7 +6,7 @@
 //   drv   Camera drivers: each driver from SETUP › Cameras with its state and Start / Stop
 // The server owns every rule: these only show the state and send the same commands as the other pages.
 import { icon } from "/static/icons.js";
-import { axisRange } from "/static/monitors.js";
+import { axisRange, policyChart } from "/static/monitors.js";
 import { STATE, ON } from "/static/drivers.js";
 
 const COLORS = ["#d1495b", "#2e8b57", "#2f5fb3", "#c77d12", "#7b4fb3", "#14879c", "#6b7280"];
@@ -192,5 +192,52 @@ export function extraViews({ h, btn, cmd, pcmd, INFO, getS, op, navTo, logs }) {
     },
   };
 
-  return { plan, jchart, prog, log, drv };
+  // ---------------------------------------------------------------- Policy window
+  const polChart = policyChart();
+  const polSel = h("select", { class: "grow", "aria-label": "Policy" },
+    ...INFO.policies.map((p) => h("option", { value: p.name }, p.name)));
+  const polDur = h("input", { type: "number", min: "0", step: "0.5", placeholder: "manifest default", style: "width:110px" });
+  const polReq = h("div", { class: "col", style: "gap:4px" });
+  const polReqSum = h("summary", { class: "small" }, "Checks");
+  const polWarn = h("div", { class: "banner-warn hidden" });
+  const polState = h("span", { class: "muted small" });
+  const polStart = lease(btn("Start", "primary", () => cmd("policy_start", {
+    name: polSel.value, duration: polDur.value === "" ? null : +polDur.value,
+  }), "Prepare and start the selected policy"));
+  const polStop = btn("■ Stop", "danger", () => cmd("policy_stop"), "Stop the policy; no control lease is needed");
+  let polReqAt = 0, polReqKey = "";
+  const policy = {
+    label: "Policy", min: 320, fill: true,
+    // Start/Stop first: the window can be short, and Stop must never scroll out of sight
+    el: box("xpolicy", h("div", { class: "row" }, polSel, polDur, h("span", { class: "muted small" }, "s")),
+      h("div", { class: "row" }, polStart, polStop, polState, h("span", { class: "grow" }),
+        btn("Library", "quiet", () => navTo("SETUP", "Policies"))),
+      polWarn, polChart.el, h("details", {}, polReqSum, polReq)),
+    async update(s) {
+      polChart.push(s);
+      const p = s.policy || {}, busy = !!p.busy, current = p.current || "";
+      polState.textContent = busy ? (current ? `Running · ${current}` : "Preparing…") : "Idle";
+      polStart.dataset.policyBusy = busy ? "1" : "";
+      polStart.disabled = busy;
+      polStop.disabled = !busy;
+      polWarn.classList.toggle("hidden", !(p.range_warnings?.length || p.step_warnings?.length));
+      polWarn.textContent = [...new Set([...(p.range_warnings || []), ...(p.step_warnings || []).map((x) => `runner: ${x}`)])].join("\n");
+      if (!polSel.value && INFO.policies.length) polSel.value = INFO.policies[0].name;
+      if (!polSel.value || Date.now() - polReqAt < 3000) return;
+      polReqAt = Date.now();
+      const r = await cmd("policy_requirements", { name: polSel.value });
+      if (!r.ok) return;
+      const key = JSON.stringify(r.requirements);
+      if (key === polReqKey) return;
+      polReqKey = key;
+      const nBad = r.requirements.filter((q) => q.state === "fail").length, nWarn = r.requirements.filter((q) => q.state === "warn").length;
+      polReqSum.textContent = nBad ? `Checks: ${nBad} not ready` : nWarn ? `Checks: ${nWarn} warning${nWarn > 1 ? "s" : ""}` : "Checks: all ready";
+      polReqSum.className = "small " + (nBad ? "bad" : nWarn ? "warn" : "ok");
+      polReq.replaceChildren(...r.requirements.map((q) => h("div", { class: "row", title: q.detail || "" },
+        h("span", { class: "dot " + (q.state === "ok" ? "ok" : q.state === "fail" ? "bad" : "warn") }),
+        h("span", {}, q.label), h("span", { class: "muted small grow" }, q.detail || ""))));
+    },
+  };
+
+  return { plan, jchart, prog, log, drv, policy };
 }

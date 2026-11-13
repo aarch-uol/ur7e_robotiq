@@ -15,11 +15,11 @@ import { ask } from "/static/dialog.js";
 
 const KEY = "op-layouts1";
 const MAIN_H = 560;
-const MINW = { "3d": 420, ft: 260, cam: 240, empty: 220, plan: 300, jchart: 300, prog: 260, log: 300, drv: 240 }, MINH = 160, MAIN_MINH = 260;
+const MINW = { "3d": 420, ft: 260, cam: 240, empty: 220, plan: 300, jchart: 300, prog: 260, log: 300, drv: 240, policy: 320 }, MINH = 160, MAIN_MINH = 260;
 const SIDE_MIN = 280, SIDE_MAX = 600, FOLD_W = 36, GAP = 8, MAX_VIEWS = 6, MAX_LAYOUTS = 9;
 const TYPES = [["cam", "Camera"], ["ft", "F/T chart"], ["plan", "Motion planner"], ["jchart", "Joint chart"],
-  ["prog", "Program run"], ["log", "Log"], ["drv", "Camera drivers"], ["empty", "Empty"]];
-const ONE = ["ft", "plan", "jchart", "prog", "log", "drv"];                   // one window of each in a layout
+  ["prog", "Program run"], ["log", "Log"], ["drv", "Camera drivers"], ["policy", "Policy"], ["empty", "Empty"]];
+const ONE = ["ft", "plan", "jchart", "prog", "log", "drv", "policy"];                   // one window of each in a layout
 const QUALITY = [["low", "Low", "640 px, 10 fps"], ["med", "Med", "960 px, 15 fps"], ["high", "High", "1280 px, 30 fps"]];   // server.PREVIEW
 const typeName = (k) => (TYPES.find((x) => x[0] === k) || [k, k])[1];
 const CARDS = ["manual", "fts", "robot", "arm", "grip", "joints"];
@@ -29,7 +29,9 @@ const base = (o) => Object.assign({ name: "", fixed: false, l: ["manual", "fts"]
   w: { l: 360, r: 340 }, h: {} }, o);
 // 1 Main (the page as it always was): what you command left with the F/T chart, the 3D view, the robot right.
 // The chart "att"ached to the F/T sensor card: it sits right under it, moves with it, never minimises.
-const MAIN = base({ name: "Main", fixed: true, l: ["manual", "fts", "chart"], tiles: { chart: { type: "ft", att: true } }, h: { chart: 300 } });
+const MAIN = base({ name: "Main", fixed: true, l: ["manual", "fts", "chart"],
+  r: ["robot", "arm", "grip", "joints", "policy"],
+  tiles: { chart: { type: "ft", att: true }, policy: { type: "policy" } }, h: { chart: 300, policy: 640 } });
 // 2 and 3: ready-made layouts of your own (edit, rename or delete them in SETTINGS › Layouts)
 const PRESETS = [
   base({ name: "Force", l: ["manual", "fts", "chart"], r: ["robot", "arm", "joints", "grip"], right: ["c1"], rw: [1], f: 0.66,
@@ -742,7 +744,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, n
           h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Layouts"),
             h("button", { class: "btn primary", type: "button", disabled: W.list.length >= MAX_LAYOUTS,
               onclick: () => { newLayout(MAIN); draw(); renderHeader(); } }, "+ New layout")),
-          h("div", { class: "muted small" }, "Window layouts for OPERATE. 1 (Main) is fixed. With two or more, their numbers show in the top bar to switch. Kept in this browser."),
+          h("div", { class: "muted small" }, "Layouts for OPERATE. Saved in this browser."),
           h("div", { class: "llist" }, rows)));
     };
     draw();

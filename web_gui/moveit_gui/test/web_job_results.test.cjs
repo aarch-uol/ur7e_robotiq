@@ -88,6 +88,7 @@ function profilePrefsHelper(saveOk) {
   const b = source.indexOf("let prefsSaving =", a);
   assert.ok(a >= 0 && b > a);
   const context = {
+    holds: true,
     prefsSynced: null,
     localPrefs: () => ({ "v3-show": "camera" }),
     scmd: async (name) => name === "profile_prefs_get"
@@ -103,11 +104,11 @@ function profilePrefsHelper(saveOk) {
 
 test("new profile preferences are not marked synced when the first save fails", async () => {
   const failed = profilePrefsHelper(false);
-  await failed.profilePrefs("Cenk", false);
+  await failed.profilePrefs("Viewer", false);
   assert.equal(failed.synced(), null);
 
   const saved = profilePrefsHelper(true);
-  await saved.profilePrefs("Cenk", false);
+  await saved.profilePrefs("Viewer", false);
   assert.equal(saved.synced(), JSON.stringify({ "v3-show": "camera" }));
 });
 

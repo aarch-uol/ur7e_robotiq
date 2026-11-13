@@ -571,6 +571,10 @@ def main(argv=None):
     ap.add_argument("--profiles-dir", default=str(root / "profiles"))
     ap.add_argument("--programs-dir", default=str(Path.home() / "moveit_gui_programs"))
     ap.add_argument("--policies-dir", default=str(Path.home() / "moveit_gui_policies"))
+    ap.add_argument("--policy-import-root", action="append", default=[], metavar="DIR",
+                    help="allowed model folder for SETUP > Policies (repeatable)")
+    ap.add_argument("--policy-card-command", default=None,
+                    help="command used for export_policy_card.py (default: python3 tools/export_policy_card.py)")
     ap.add_argument("--fake", action="store_true", help="no ROS: simulated robot")
     ap.add_argument("--urdf", help="--fake only: a URDF file for the 3D view")
     ap.add_argument("--real-cameras", action="store_true",
@@ -603,7 +607,9 @@ def main(argv=None):
     else:
         from ..ros_bridge import RosBridge
         bridge = RosBridge(profile)
-    core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake)
+    core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake,
+                     policy_import_roots=args.policy_import_root or None,
+                     policy_card_command=args.policy_card_command)
     service = WebService(core)
     server = Server(service, args.host, args.port, args.allow_host, args.also_host)
     print(f"MoveIt GUI web: {'  '.join('http://' + a + '/' for a in server.addresses)}  ({profile.display_name}"
