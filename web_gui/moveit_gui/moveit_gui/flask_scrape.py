@@ -102,10 +102,13 @@ class BendSuggestion:
                         self.recommended_angle_deg, tip_radius)
 
 
+PATTERNS = ("down", "rings")      # down: strokes from high on the wall to the bottom, like the vial scrape
+
+
 @dataclass
 class ScrapePose:
     name: str
-    ring: int
+    ring: int                    # the group the pose is scraped in: a ring, or one top-to-bottom stroke
     theta_deg: float
     azimuth_deg: float
     pose: PoseSpec
@@ -149,6 +152,7 @@ class FlaskScrape:
     pivot_depth_m: Optional[float] = None
     reference_orientation: Optional[np.ndarray] = None
     contact_preference: str = "normal"
+    pattern: str = "down"
 
     def generate(self) -> ScrapePlan:
         return generate_scrape_poses(
@@ -156,7 +160,7 @@ class FlaskScrape:
             self.rings, self.step_deg, press_depth_mm=self.press_depth_mm,
             margin_m=self.margin_mm / 1000.0, pivot_depth_m=self.pivot_depth_m,
             reference_orientation=self.reference_orientation,
-            contact_preference=self.contact_preference)
+            contact_preference=self.contact_preference, pattern=self.pattern)
 
 
 def _flask_values(g: FlaskGeometry) -> tuple[np.ndarray, np.ndarray, float, float]:
@@ -390,8 +394,12 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
                           step_deg: float, *, press_depth_mm: float = 0.0,
                           margin_m: float = 0.001, pivot_depth_m: Optional[float] = None,
                           reference_orientation: Optional[np.ndarray] = None,
-                          contact_preference: str = "normal") -> ScrapePlan:
-    """Generate alternating rings.
+                          contact_preference: str = "normal", pattern: str = "down") -> ScrapePlan:
+    """Generate the contact poses, ``rings`` polar angles from theta_min to theta_max, ``step_deg`` apart around.
+
+    ``down`` (default), like the vial scrape: one stroke per azimuth, from the highest polar angle down to the
+    lowest (toward the bottom), named stroke_<azimuth>_<level>. ``rings``: alternating rings around the axis from
+    the bottom up, named ring_<ring>_<index>.
 
     Normal contact is the default because it gives a predictable force and
     avoids scraping on a tip edge. ``tangent`` is available for blade-like ends.
@@ -412,6 +420,8 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
         raise FlaskScrapeError("press depth and clearance margin must be non-negative")
     if contact_preference not in ("normal", "tangent"):
         raise FlaskScrapeError("contact preference must be 'normal' or 'tangent'")
+    if pattern not in PATTERNS:
+        raise FlaskScrapeError(f"pattern must be one of {', '.join(PATTERNS)}")
     press = float(press_depth_mm) / 1000.0
     radius = geometry.R_inner + press
     pivot = _tool_pivot(geometry, tool, pivot_depth_m)
@@ -420,10 +430,15 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
     reachable, unreachable = [], []
     previous = reference
     insertion = insertion_clearance_reason(geometry, tool, margin_m)
-    for ring, theta_deg in enumerate(np.linspace(theta_min_deg, theta_max_deg, rings)):
-        order = azimuths if ring % 2 == 0 else azimuths[::-1]
-        theta = math.radians(float(theta_deg))
-        for index, azimuth_deg in enumerate(order):
+    thetas = [float(t) for t in np.linspace(theta_min_deg, theta_max_deg, rings)]
+    if pattern == "rings":
+        groups = [("ring", [(t, a) for a in (azimuths if ring % 2 == 0 else azimuths[::-1])])
+                  for ring, t in enumerate(thetas)]
+    else:                         # one stroke per azimuth, top (largest polar angle) to bottom
+        groups = [("stroke", [(t, a) for t in thetas[::-1]]) for a in azimuths]
+    for ring, (prefix, order) in enumerate(groups):
+        for index, (theta_deg, azimuth_deg) in enumerate(order):
+            theta = math.radians(theta_deg)
             phi = math.radians(float(azimuth_deg))
             normal = np.array([math.sin(theta) * math.cos(phi),
                                math.sin(theta) * math.sin(phi), -math.cos(theta)])
@@ -437,7 +452,7 @@ def generate_scrape_poses(geometry: FlaskGeometry, tool: ToolModel,
                 unreachable.append(UnreachablePose(ring, float(theta_deg), float(azimuth_deg), reason))
                 continue
             pose = PoseSpec.from_T("flask", tool.tcp, T)
-            name = f"ring_{ring + 1:02d}_{index + 1:03d}"
+            name = f"{prefix}_{ring + 1:02d}_{index + 1:03d}"
             reachable.append(ScrapePose(name, ring, float(theta_deg), float(azimuth_deg), pose))
             previous = T[:3, :3]
     return ScrapePlan(reachable, unreachable, pivot, geometry, tool, margin_m, press, reference)
@@ -544,7 +559,8 @@ def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
                   approach_m: float = 0.05, velocity: float = 0.05,
                   contact_velocity: float = 0.02, force_n: Optional[float] = None,
                   motion_mode: str = "position", force_mode: str = "admittance") -> Program:
-    """Build named flask waypoints, retracting through the safe pose per ring."""
+    """Build named flask waypoints, retracting through the safe pose per ring or stroke: in at the group's first
+    pose (the top of a stroke), scrape, back out at its last."""
     plan = scrape.generate() if isinstance(scrape, FlaskScrape) else scrape
     if not isinstance(plan, ScrapePlan):
         raise FlaskScrapeError("build_program needs a ScrapePlan or FlaskScrape")
@@ -570,8 +586,9 @@ def build_program(scrape: ScrapePlan | FlaskScrape, name: str, robot: str, *,
     rings = []
     for ring in sorted({target.ring for target in plan.reachable}):
         targets = [target for target in plan.reachable if target.ring == ring]
-        entry = f"ring_{ring + 1:02d}_entry_safe"
-        exit_name = f"ring_{ring + 1:02d}_exit_safe"
+        group = targets[0].name.rsplit("_", 1)[0]          # ring_01 / stroke_01
+        entry = f"{group}_entry_safe"
+        exit_name = f"{group}_exit_safe"
         waypoints[entry] = ProgramWaypoint(
             entry, pose=_retracted_pose(targets[0], plan.pivot, plan.tool, plan.geometry))
         waypoints[exit_name] = ProgramWaypoint(

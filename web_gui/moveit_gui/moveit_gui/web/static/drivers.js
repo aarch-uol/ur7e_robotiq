@@ -1,12 +1,16 @@
 // SETUP > Drivers & cameras: start / stop camera drivers and (later) vision pipelines, see their pictures and logs.
 // Built by app.js with its helpers (ctx). The server (services.py) owns every rule; this only shows and asks.
 
-const STATE = {   // state -> [chip text, chip class, dot class]
+export const STATE = {   // state -> [chip text, chip class, dot class]
   stopped: ["Stopped", "", ""], waiting: ["Waiting…", "warn", "warn"], starting: ["Starting…", "warn", "warn"],
   running: ["Running", "ok", "ok"], no_data: ["No data", "warn", "warn"], stopping: ["Stopping…", "warn", "warn"],
   failed: ["Failed", "bad", "bad"], missing: ["Not installed", "", ""],
 };
-const ON = new Set(["waiting", "starting", "running", "no_data"]);
+export const ON = new Set(["waiting", "starting", "running", "no_data"]);
+
+// "ZED X Nano" -> "zed_x_nano", "D405" -> "d405": a ROS namespace from a display name
+export const rosName = (s) => { const n = s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+  return /^[a-z]/.test(n) ? n : n ? "cam_" + n : ""; };
 
 export function upTime(s) {
   if (s == null) return "";
@@ -70,7 +74,7 @@ export function drivers(ctx) {
       const [, , dot] = STATE[s.state] || STATE.stopped, on = ON.has(s.state);
       return h("div", { class: "item" + (D.sel === s.name && !D.topic ? " on" : ""), "data-name": s.name, onclick: () => pick(s.name) },
         h("span", { class: "dot " + dot, style: "margin-top:5px" }),
-        h("div", { class: "grow" }, h("div", {}, s.name),
+        h("div", { class: "grow" }, h("div", {}, s.label || s.name),
           h("div", { class: "muted small" }, s.type_label, " · ", (STATE[s.state] || STATE.stopped)[0].toLowerCase(),
             s.state === "running" && s.up_s != null ? ` ${upTime(s.up_s)}` : "")),
         s.state === "missing" ? "" : lease(btn(on || s.state === "stopping" ? "Stop" : "Start", on ? "" : "quiet",
@@ -109,7 +113,8 @@ export function drivers(ctx) {
     if (!imgs.some((o) => o.topic === D.view)) D.view = imgs[0]?.topic || null;
     const live = on && D.view && s.outputs.find((o) => o.topic === D.view)?.publishers > 0;
     right.replaceChildren(
-      h("div", { class: "row" }, h("span", { class: "title grow" }, s.name, h("span", { class: "muted" }, " · " + s.type_label)),
+      h("div", { class: "row" }, h("span", { class: "title grow" }, s.label || s.name, h("span", { class: "muted" }, " · " + s.type_label +
+        (s.label && s.label !== s.name ? " · topics /…/" + s.name : ""))),
         chip(txt + (s.state === "running" && s.up_s != null ? " " + upTime(s.up_s) : ""), cls)),
       s.msg ? h("div", { class: s.state === "failed" ? "bad small" : "muted small" }, s.msg) : "",
       h("div", { class: "row" },
@@ -142,7 +147,7 @@ export function drivers(ctx) {
     if (r.ok) { logBox.textContent = r.text || "(empty)"; logBox.scrollTop = logBox.scrollHeight; }
   }
   async function del(s) {
-    if (!(await ask(`Delete "${s.name}"? (Its log files stay.)`))) return;
+    if (!(await ask(`Delete "${s.label || s.name}"? (Its log files stay.)`))) return;
     const r = await cmd("drivers_delete", { name: s.name });
     if (r.ok) { D.sel = null; took(r); }
   }
@@ -159,7 +164,7 @@ export function drivers(ctx) {
       class: "dr-type" + (x.type === E.type ? " on" : ""), title: x.pkg ? "ROS package " + x.pkg : "",
       onclick: () => { E.type = x.type; editor(s); } },
       h("div", {}, x.label), h("div", { class: "muted small" }, x.help), x.installed ? "" : h("div", { class: "warn small" }, "not installed"))));
-    const kids = [h("div", { class: "row" }, h("span", { class: "title grow" }, E.replace ? `Edit ${E.replace}` : "Add a driver or pipeline")),
+    const kids = [h("div", { class: "row" }, h("span", { class: "title grow" }, E.replace ? `Edit ${s?.label || E.replace}` : "Add a driver or pipeline")),
       h("div", { class: "section" }, "1 · What is it?"), pickType];
     if (t) {
       const p = s?.type === t.type ? s.params : {};
@@ -167,8 +172,12 @@ export function drivers(ctx) {
       kids.push(h("div", { class: "section" }, "2 · Settings"),
         !t.installed ? h("div", { class: "warn small" }, "Not in the robot image: " + t.install + ". You can set it up now; Start works once it is installed.") : "",
         h("div", { class: "dr-form" },
-          h("label", {}, "Name"), h("input", { type: "text", id: "dr-name", value: s?.name || "", placeholder: t.kind === "camera" ? "e.g. wrist" : "e.g. midpoints" }),
-          h("div", { class: "muted small span2" }, "lower_snake_case; it becomes the ROS namespace of its topics"),
+          h("label", {}, "Name"), h("input", { type: "text", id: "dr-label", value: s?.display || "", maxlength: 40,
+            placeholder: t.kind === "camera" ? "e.g. D405, ZED X Nano" : "e.g. Midpoints",
+            oninput: (e) => { const n = document.getElementById("dr-name"); if (!n.dataset.own) n.value = rosName(e.target.value); } }),
+          h("label", {}, "Topic name"), h("input", { type: "text", id: "dr-name", value: s?.name || "", "data-own": s ? "1" : "",
+            oninput: (e) => { e.target.dataset.own = e.target.value ? "1" : ""; } }),
+          h("div", { class: "muted small span2" }, "a-z, 0-9 and _: its topics are /…/<topic name>/…; filled in from the name"),
           ...(t.kind ? [] : [h("label", {}, "Kind"), h("select", { id: "dr-kind" }, ...Object.entries(D.data.kinds).map(([k, l]) =>
             h("option", { value: k, selected: (s?.kind || "pipeline") === k }, l)))]),
           ...t.fields.flatMap((f) => {
@@ -180,7 +189,7 @@ export function drivers(ctx) {
           })),
         others.length ? h("div", {}, h("div", { class: "section" }, "3 · Start after (needs)"),
           h("div", { class: "row wrap" }, ...others.map((o) => h("label", { class: "chk" },
-            h("input", { type: "checkbox", class: "dr-need", value: o.name, checked: (s?.needs || []).includes(o.name) }), o.name)))) : "",
+            h("input", { type: "checkbox", class: "dr-need", value: o.name, checked: (s?.needs || []).includes(o.name) }), o.label || o.name)))) : "",
         h("label", { class: "chk" }, h("input", { type: "checkbox", id: "dr-auto", checked: !!s?.autostart }), "start with the GUI"));
     }
     kids.push(h("div", { class: "row" }, t ? lease(btn("Save", "primary", () => saveEdit())) : "",
@@ -192,7 +201,7 @@ export function drivers(ctx) {
     const E = D.edit, t = D.data.types.find((x) => x.type === E.type);
     const val = (id) => document.getElementById(id);
     const params = Object.fromEntries(t.fields.map((f) => [f.key, typeof f.default === "boolean" ? val("dr-f-" + f.key).checked : val("dr-f-" + f.key).value]));
-    const service = { name: val("dr-name").value.trim(), type: t.type, params, autostart: val("dr-auto").checked,
+    const service = { name: val("dr-name").value.trim() || rosName(val("dr-label").value), label: val("dr-label").value.trim(), type: t.type, params, autostart: val("dr-auto").checked,
       kind: val("dr-kind")?.value, needs: [...right.querySelectorAll(".dr-need")].filter((c) => c.checked).map((c) => c.value) };
     const r = await cmd("drivers_save", { service, replace: E.replace });
     if (r.ok) { D.edit = null; D.sel = service.name; D.topic = null; took(r); scan(); }
@@ -205,8 +214,8 @@ export function drivers(ctx) {
     else if (!D.edit && D.data) {                          // uptime and topics tick on
       if (Date.now() - (D.viewT || 0) > 3000) { D.viewT = Date.now(); load(); }
     }
-    const c = s.camera, t = D.shown;
-    info.textContent = c && t && c.topic === t
+    const t = D.shown, c = t && s.cameras?.[t];
+    info.textContent = c
       ? (c.width ? `${c.width}×${c.height} · ` : "") + `${c.encoding || "—"} · ${c.rate != null ? c.rate.toFixed(1) : "—"} Hz` +
         (c.age != null && c.age > 2 ? ` · last picture ${c.age.toFixed(0)} s ago` : "") + (c.error ? " · " + c.error : "") : "";
     log(false);
@@ -222,5 +231,5 @@ export function driversBadge(rows) {
   const on = rows.filter((r) => r.state === "running").length;
   const bad = rows.filter((r) => r.state === "failed" || r.state === "no_data");
   return [`${on}/${rows.length}`, bad.length ? "warn" : on ? "ok" : "",
-    bad.length ? `problem: ${bad.map((r) => r.name).join(", ")}` : `${on} of ${rows.length} drivers running`];
+    bad.length ? `problem: ${bad.map((r) => r.label || r.name).join(", ")}` : `${on} of ${rows.length} drivers running`];
 }

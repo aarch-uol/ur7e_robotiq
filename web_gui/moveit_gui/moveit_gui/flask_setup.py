@@ -249,7 +249,8 @@ def make_tool(d: Optional[dict], tcp: str):
 
 
 # ------------------------------------------------------- reach and program
-def scrape_args(theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0, press_mm=0.5, margin_mm=1.0) -> dict:
+def scrape_args(theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0, press_mm=0.5, margin_mm=1.0,
+                pattern="down") -> dict:
     try:
         out = {"theta_min_deg": float(theta_min_deg), "theta_max_deg": float(theta_max_deg),
                "rings": int(rings), "step_deg": float(step_deg), "press_depth_mm": float(press_mm),
@@ -258,6 +259,9 @@ def scrape_args(theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0, p
         raise FlaskSetupError("the scrape needs numbers: angles, rings, step, press depth") from None
     if out["rings"] > 50 or out["step_deg"] < 1.0:
         raise FlaskSetupError("at most 50 rings and a step of 1° or more")
+    if pattern not in fs.PATTERNS:
+        raise FlaskSetupError(f"the pattern is one of {', '.join(fs.PATTERNS)}, not '{pattern}'")
+    out["pattern"] = pattern
     return out
 
 

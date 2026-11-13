@@ -107,12 +107,13 @@ export function flaskPage(ctx) {
     }, "A bend that passes the neck and reaches far up the bulb, for this shaft and your polar range")));
   const tcpSel = h("select", {});
   const thMin = num("0", "1"), thMax = num("15", "1"), rings = num("3", "1"), step = num("15", "1");
+  const pattern = h("select", {}, h("option", { value: "down" }, "Top to bottom"), h("option", { value: "rings" }, "Rings"));
   const press = num("0.5", "0.1"), force = num("", "0.5", "70px", "off"), speed = num("10", "1"), appr = num("50", "5");
   const reachOut = h("div", { class: "col small", style: "gap:2px" });
   const scrapeArgs = () => ({ tool: { kind: toolSel.value, shaft_radius_mm: +shaftR.value, shaft_length_mm: +shaftL.value,
       ...(toolSel.value === "bent" ? { bend_length_mm: +bendL.value, bend_angle_deg: +bendA.value } : {}) },
     tcp: tcpSel.value, theta_min_deg: +thMin.value, theta_max_deg: +thMax.value, rings: +rings.value, step_deg: +step.value,
-    press_mm: +press.value || 0 });
+    pattern: pattern.value, press_mm: +press.value || 0 });
   const showReach = (r) => {
     F.reach = r; ctx.repaint();
     const total = r.reachable + r.unreachable;
@@ -122,8 +123,9 @@ export function flaskPage(ctx) {
       ...r.reasons.map(([why, n]) => h("div", { class: "muted" }, `${n} × ${why}`)));
   };
   const scrapeCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask scrape"),
-    note("The tool goes in through the neck and pivots there; poses are rings at polar angles from the bottom.",
-      "0° is the bottom of the bulb. Press depth is how far past the inner wall the tip is aimed. Speed limits every " +
+    note("The tool goes in through the neck and pivots there. Top to bottom (like the vial): one stroke per angle " +
+      "around, from the highest polar angle down to the lowest. Rings: round the axis, from the bottom up.",
+      "0° is the bottom of the bulb. Heights is how many polar angles from min to max. Press depth is how far past the inner wall the tip is aimed. Speed limits every " +
       "linear move. Force (optional) presses along the tool in a force mode. A straight tool only reaches a small band " +
       "near the bottom; a bent tool (bend length and angle of the end) reaches higher. Suggest bend proposes one."),
     h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
@@ -131,7 +133,8 @@ export function flaskPage(ctx) {
       h("span", { class: "k" }, ""), h("div", { class: "col", style: "gap:2px" }, bentRow, sugOut),
       h("span", { class: "k" }, "TCP"), tcpSel,
       h("span", { class: "k" }, "Polar ° min / max"), h("div", { class: "row" }, thMin, thMax),
-      h("span", { class: "k" }, "Rings / step °"), h("div", { class: "row" }, rings, step),
+      h("span", { class: "k" }, "Pattern"), pattern,
+      h("span", { class: "k" }, "Heights / step °"), h("div", { class: "row" }, rings, step),
       h("span", { class: "k" }, "Press mm / force N"), h("div", { class: "row" }, press, force),
       h("span", { class: "k" }, "Speed mm/s / approach mm"), h("div", { class: "row" }, speed, appr)),
     h("div", { class: "row" },

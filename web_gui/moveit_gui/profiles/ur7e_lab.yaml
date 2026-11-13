@@ -336,9 +336,8 @@ waypoints:
 cameras:
   - {name: RealSense colour, topic: /camera/camera/color/image_rect_raw, info: /camera/camera/color/camera_info}
   - {name: RealSense depth,  topic: /camera/camera/depth/image_rect_raw}
-  # ZED: not installed yet. Default zed-ros2-wrapper names for camera_name "zed" [unverified here]; if the wrapper
-  # version or camera_name differs, correct these after its first launch (SETUP > Cameras lists what exists).
-  - {name: ZED left (rect), topic: /zed/zed_node/rgb/image_rect_color, info: /zed/zed_node/rgb/camera_info}
+  # ZED: zed-ros2-wrapper 5.x names for camera_name "zed" (SETUP > Drivers & cameras, checked on the Jetson)
+  - {name: ZED left (rect), topic: /zed/zed_node/rgb/color/rect/image, info: /zed/zed_node/rgb/color/rect/camera_info}
   - {name: ZED depth,       topic: /zed/zed_node/depth/depth_registered}
   - {name: Vision annotated, topic: /scraping_vision/annotated_image}
   - {name: Vision midpoints, topic: /scraping_vision/midpoints_image}

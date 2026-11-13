@@ -32,6 +32,7 @@ import numpy as np
 import yaml
 
 from .. import bases as B
+from .. import robots as R
 from .. import cart_speed
 from .. import transforms as tf
 from ..bridge_api import wrench_fresh
@@ -56,6 +57,7 @@ from ..vials import VialLibrary, VialProfileError
 from ..handeye import HandEyeError
 from ..parts import PartError, merged_model as parts_merged
 from ..setups import SetupError
+from ..user_profiles import ProfileError
 from ..services import ServiceError
 from .workcell import WorkcellCommands
 from .teaching import TeachCommands
@@ -82,7 +84,8 @@ ADMIN_COMMANDS = frozenset((
     "vial_capture", "vial_reset", "vial_save", "vial_use_example", "vial_profile_save", "vial_profile_delete",
     "payload_collect", "payload_evaluate", "payload_reset", "payload_save", "payload_apply", "record_configure",
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
-    "parts_make_tcp", "base_switch", "setup_save", "setup_delete", "setup_load",
+    "parts_make_tcp", "base_switch", "robot_setup", "setup_save", "setup_delete", "setup_load", "setup_copy",
+    "profile_delete",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
     "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
@@ -498,8 +501,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError,
-                    TeachError, BatchError, FlaskGeometryError, FlaskScrapeError, FlaskSetupError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError, R.RobotError,
+                    TeachError, BatchError, ProfileError, FlaskGeometryError, FlaskScrapeError, FlaskSetupError) as e:
                 raise CommandError(str(e)) from None
             if before is not None and self._record_edit(before, undoable=cmd in PROGRAM_EDITS):
                 if isinstance(out, dict) and "program" in out:
@@ -2314,11 +2317,12 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             topics, err = [], str(e)
         else:
             err = ""
-        cams = list(self.core.profile.cameras)
+        cams = []
         for r in self.drivers.view()["services"]:              # the image outputs of SETUP > Drivers & cameras
             info = next((o["topic"] for o in r["outputs"] if o["topic"].endswith("camera_info")), "")
-            cams += [{"name": f"{r['name']} {o['label']}", "topic": o["topic"], "info": info, "driver": r["name"]}
-                     for o in r["outputs"] if o["image"] and all(c["topic"] != o["topic"] for c in cams)]
+            cams += [{"name": f"{r['label']} {o['label']}", "topic": o["topic"], "info": info, "driver": r["name"]}
+                     for o in r["outputs"] if o["image"]]
+        cams += [c for c in self.core.profile.cameras if all(c["topic"] != d["topic"] for d in cams)]   # the profile's
         return self._ok(error=err, topics=[t for t, _ in topics],
                         cameras=[{**c, "publishers": b.topic_publishers(c["topic"])} for c in cams])
     cmd_camera_status.read_only = True
@@ -2383,6 +2387,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 "active_tcp": st.active_tcp, "frames": st.frame_names(),
                 "fixtures": [n for n in st.fixtures]}
 
+    TCP_HOLD_S = 2.0                     # the TCP pose shown while TF is late, at most this long
+
     def state(self) -> dict:
         c = self.core
         s = c.last_snap
@@ -2391,8 +2397,13 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             T = c.geo.current_pose(c.profile.base_link, c.store.active_tcp).T()
             xyz, rpy = tf.T_to_mm_deg(T)
             tcp = {"xyz_mm": [round(v, 2) for v in xyz], "rpy_deg": [round(v, 2) for v in rpy]}
+            self._tcp_last = (time.monotonic(), c.store.active_tcp, tcp)
         except Exception:
-            pass
+            # TF a moment late (a loaded PC): show the last pose, marked stale, rather than blanking the view.
+            # Display only: moves and Record pose still need fresh TF.
+            t0, name, last = getattr(self, "_tcp_last", (0.0, None, None))
+            if last and name == c.store.active_tcp and time.monotonic() - t0 < self.TCP_HOLD_S:
+                tcp = {**last, "stale": True}
         tcp_off = None
         try:                                   # changes when the active TCP or its definition does (preview cache key)
             link, _, T_lt = c.geo.tcp_anchor(c.store.active_tcp)

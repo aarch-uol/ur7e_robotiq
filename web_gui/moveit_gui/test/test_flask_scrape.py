@@ -56,7 +56,7 @@ def _sized_geometry(od, bore, neck_length=0.050):
 
 def test_generated_poses_are_on_sphere_through_pivot_clear_and_smooth():
     g, tool = _geometry(), _tool()
-    plan = generate_scrape_poses(g, tool, 0.0, 12.0, 4, 30.0)
+    plan = generate_scrape_poses(g, tool, 0.0, 12.0, 4, 30.0, pattern="rings")
     assert plan.reachable and not plan.unreachable
     previous = None
     for target in plan.reachable:
@@ -106,7 +106,7 @@ def test_press_depth_and_input_errors():
 
 def test_program_is_plain_named_flask_waypoints_and_validates():
     g, tool = _geometry(), _tool()
-    plan = generate_scrape_poses(g, tool, 0, 10, 3, 45)
+    plan = generate_scrape_poses(g, tool, 0, 10, 3, 45, pattern="rings")
     program = build_program(plan, "flask scrape", "ur7e_lab", force_n=4.0)
     assert all(w.pose.frame == "flask" and w.pose.tcp == tool.tcp for w in program.waypoints.values())
     types = [step.type for step in program.steps]
@@ -165,7 +165,7 @@ def test_bent_program_retracts_between_rings_and_validates():
     g = _sized_geometry(0.085, 0.021)
     suggestion = suggest_bend(g)
     tool = suggestion.tool("bent_tip", 0.001, 0.25, 0.001)
-    plan = generate_scrape_poses(g, tool, 0.0, 40.0, 3, 90.0)
+    plan = generate_scrape_poses(g, tool, 0.0, 40.0, 3, 90.0, pattern="rings")
     program = build_program(plan, "bent flask scrape", "ur7e_lab")
     targets = [s.params.get("target") for s in program.steps if s.type == "move_pose"]
     assert targets.count("pivot_safe") == 4
@@ -176,3 +176,47 @@ def test_bent_program_retracts_between_rings_and_validates():
     assert all(clearance_reason(w.pose.T(), g, tool, plan.pivot) is None for w in ring_safe)
     profile = RobotProfile.load(os.path.join(ROOT, "profiles", "ur7e_lab.yaml"))
     assert program.validate(profile) == []
+
+
+def test_default_pattern_scrapes_each_stroke_from_the_top_down():
+    """Like the vial scrape: per angle around the axis, from the highest polar angle down to the bottom."""
+    g, tool = _geometry(), _tool()
+    plan = generate_scrape_poses(g, tool, 2.0, 12.0, 3, 90.0)
+    assert not plan.unreachable and len(plan.reachable) == 12
+    for k in range(4):
+        stroke = [p for p in plan.reachable if p.ring == k]
+        assert [p.theta_deg for p in stroke] == [12.0, 7.0, 2.0]
+        assert len({p.azimuth_deg for p in stroke}) == 1
+        z = [p.pose.T()[2, 3] for p in stroke]
+        assert z[0] > z[1] > z[2]                                      # down the wall
+        assert [p.name for p in stroke] == [f"stroke_{k + 1:02d}_{i:03d}" for i in (1, 2, 3)]
+    assert [p.azimuth_deg for p in plan.reachable[::3]] == [0.0, 90.0, 180.0, 270.0]
+    with pytest.raises(FlaskScrapeError):
+        generate_scrape_poses(g, tool, 2.0, 12.0, 3, 90.0, pattern="spiral")
+
+
+def test_down_program_enters_at_the_top_presses_scrapes_down_and_retracts_per_stroke():
+    g, tool = _geometry(), _tool()
+    plan = generate_scrape_poses(g, tool, 2.0, 12.0, 3, 90.0)
+    program = build_program(plan, "flask scrape", "ur7e_lab", force_n=3.0)
+    t = [(s.type, s.params.get("target")) for s in program.steps]
+    i = t.index(("move_pose", "stroke_01_entry_safe"))
+    assert t[i:i + 7] == [("move_pose", "stroke_01_entry_safe"), ("move_pose", "stroke_01_001"), ("force", None),
+                          ("move_pose", "stroke_01_002"), ("move_pose", "stroke_01_003"), ("force_off", None),
+                          ("move_pose", "stroke_01_exit_safe")]
+    assert [x for _, x in t].count("pivot_safe") == 5                 # in, between the 4 strokes, out
+    entry = program.waypoints["stroke_01_entry_safe"].pose.T()
+    assert entry[2, 3] > program.waypoints["stroke_01_001"].pose.T()[2, 3]    # comes in from above
+    profile = RobotProfile.load(os.path.join(ROOT, "profiles", "ur7e_lab.yaml"))
+    assert program.validate(profile) == []
+
+
+def test_the_rbf_example_scrapes_top_to_bottom():
+    import yaml
+    d = yaml.safe_load(open(os.path.join(ROOT, "programs", "example_rbf_scrape_speed.yaml")))
+    order = [s["target"] for s in d["steps"] if s["type"] == "move_pose" and s["target"].startswith("stroke_")
+             and not s["target"].endswith("_safe")]
+    assert len(order) == 36
+    for k in range(12):
+        z = [d["waypoints"][n]["pose"]["position"][2] for n in order[3 * k:3 * k + 3]]
+        assert z[0] > z[1] > z[2], order[3 * k]

@@ -123,6 +123,8 @@ class FakeBridge:
         self.fake_published = set()        # other topics a fake driver 'publishes' (SETUP > Drivers & cameras)
         self._image_watch = None
         self._image_stop = threading.Event()
+        self._streams, self._streams_lock = {}, threading.Lock()   # browser camera windows: topic -> [stop, watch, n]
+        self.real = None                    # ros_bridge.RealCameras (--real-cameras): real topics next to the fake ones
         self.ft_live = True
         g = profile.gripper
         self.gripper_hw = {g["hardware"]: "active"} if g.get("hardware") else {}
@@ -700,20 +702,36 @@ class FakeBridge:
                    ("/display_planned_path", "moveit_msgs/msg/DisplayTrajectory")]
 
     def topic_types(self):
-        return sorted(self.FAKE_TOPICS + [(t, "sensor_msgs/msg/Image") for t in self.fake_cameras]
-                      + [(t + "/compressed", "sensor_msgs/msg/CompressedImage") for t in self.fake_cameras])
+        return sorted(set(self.FAKE_TOPICS + [(t, "sensor_msgs/msg/Image") for t in self.fake_cameras]
+                          + [(t + "/compressed", "sensor_msgs/msg/CompressedImage") for t in self.fake_cameras]
+                          + (self.real.topic_types() if self.real else [])))
 
     # ---------------------------------------------------------------- cameras
+    # With --real-cameras, a topic that is not simulated here is read from ROS (self.real): a fake robot with the
+    # cameras that are really plugged in.
+    def _is_real(self, topic) -> bool:
+        base = topic[:-len("/compressed")] if topic and topic.endswith("/compressed") else topic
+        return self.real is not None and bool(topic) and base not in self.fake_cameras
+
     def image_topics(self):
-        return sorted((t, "sensor_msgs/msg/Image") for t in self.fake_cameras)
+        return sorted(set([(t, "sensor_msgs/msg/Image") for t in self.fake_cameras]
+                          + (self.real.image_topics() if self.real else [])))
 
     def topic_publishers(self, topic):
-        return 1 if topic in self.fake_cameras or topic in self.fake_published else 0
+        if topic in self.fake_cameras or topic in self.fake_published:
+            return 1
+        return self.real.topic_publishers(topic) if self.real else 0
 
     def watch_image(self, topic):
         from .camera import ImageWatch
         self._image_stop.set()
         self._image_watch = None
+        if self.real:
+            self.real.watch_image(None)
+            if self._is_real(topic):
+                ok, msg = self.real.watch_image(topic)
+                self._image_watch = self.real.watched_image() if ok else None
+                return ok, msg
         if not topic:
             return True, "preview off"
         if topic not in self.fake_cameras:
@@ -735,6 +753,48 @@ class FakeBridge:
     def watched_image(self):
         return self._image_watch
 
+    def open_image(self, topic):
+        """One camera window in the browser (see ros_bridge.CameraTopics.open_image): a simulated topic renders in
+        its own thread while anyone watches it; a real one (--real-cameras) goes to the real node."""
+        from .camera import ImageWatch
+        if self.real and self._is_real(topic):
+            return self.real.open_image(topic)
+        if topic not in self.fake_cameras:
+            return None, f"{topic}: no image publisher"
+        with self._streams_lock:
+            if topic in self._streams:
+                self._streams[topic][2] += 1
+                return self._streams[topic][1], f"watching {topic}"
+            enc, w, h, hz = self.fake_cameras[topic]
+            watch, stop = ImageWatch(topic), threading.Event()
+
+            def run():
+                k = 0
+                while not stop.wait(1.0 / hz):
+                    data, step = fake_image(enc, w, h, k)
+                    watch.on_image(enc, w, h, step, data, False, "camera_color_optical_frame")
+                    k += 1
+            threading.Thread(target=run, daemon=True, name="fake-camera").start()
+            self._streams[topic] = [stop, watch, 1]
+            return watch, f"watching {topic}"
+
+    def close_image(self, topic):
+        if self.real and topic not in self._streams:
+            return self.real.close_image(topic)
+        with self._streams_lock:
+            e = self._streams.get(topic)
+            if e is None:
+                return
+            e[2] -= 1
+            if e[2] <= 0:
+                e[0].set()
+                del self._streams[topic]
+
+    def open_images(self):
+        with self._streams_lock:
+            out = {t: e[1] for t, e in self._streams.items()}
+        return {**(self.real.open_images() if self.real else {}), **out}
+
     # ---------------------------------------------------------------- parts (SETUP > Parts)
     def parts_publish(self, frames, objects, remove_ids):
         self.calls.append(("parts_publish", len(frames), [o["id"] for o in objects], [i for i, _ in remove_ids]))
@@ -754,10 +814,13 @@ class FakeBridge:
     def tf_parent(self, frame: str) -> Optional[str]:
         if frame == FAKE_CAM_OPTICAL:
             return FAKE_CAM_LINK
-        return self.part_frames.get(frame, (None,))[0]
+        p = self.part_frames.get(frame, (None,))[0]
+        return p if p or not self.real else self.real.tf_parent(frame)
 
     # ---------------------------------------------------------------- camera calibration
     def camera_info(self, topic: str, timeout_s: float = 3.0):
+        if self.real and topic != FAKE_CAM_INFO:
+            return self.real.camera_info(topic, timeout_s)
         if topic != FAKE_CAM_INFO:
             return None, f"{topic}: no CameraInfo within {timeout_s:.0f} s"
         return {"K": list(FAKE_CAM_K), "D": [0.0] * 5, "model": "plumb_bob", "width": 1280, "height": 720,
@@ -766,6 +829,8 @@ class FakeBridge:
     def grab_image(self, topic: str, timeout_s: float = 3.0):
         """The wrist camera's view of the board from where the fake arm is now (rendered, a little noise)."""
         from . import handeye as he
+        if self.real and topic != FAKE_CAM_TOPIC:
+            return self.real.grab_image(topic, timeout_s)
         if topic != FAKE_CAM_TOPIC:
             return None, f"{topic}: no image within {timeout_s:.0f} s"
         b = self.fake_board or he.check_board(None)
@@ -780,6 +845,8 @@ class FakeBridge:
     def grab_photo(self, topic: str, timeout_s: float = 3.0):
         """A generated JPEG of a simulated camera (a program's photo step)."""
         from .camera import decode_image, encode_jpeg
+        if self._is_real(topic):
+            return self.real.grab_photo(topic, timeout_s)
         base = topic[:-len("/compressed")] if topic.endswith("/compressed") else topic
         if base not in self.fake_cameras:
             return None, f"{topic}: no image within {timeout_s:.0f} s"
@@ -790,6 +857,8 @@ class FakeBridge:
 
     def shutdown(self):
         self._image_stop.set()
+        if self.real:
+            self.real.shutdown()
         self.set_freedrive_keepalive(False)
         self.cancel_motion()
         for m in self.profile.modes.values():            # like RosBridge: zero every wrench target on the way out

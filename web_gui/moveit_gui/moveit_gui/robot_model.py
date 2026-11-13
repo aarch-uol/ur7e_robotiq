@@ -144,7 +144,7 @@ def mesh_path(package: str, rel: str, share_lookup: Callable[[str], Optional[Pat
 
 def model_or_error(xml: Optional[str]) -> dict:
     if not xml:
-        return {"ok": False, "msg": "no robot_description yet (is robot_state_publisher running?)"}
+        return {"ok": False, "msg": "Robot model not loaded yet: is the robot stack running? (no robot_description from robot_state_publisher)"}
     try:
         return {"ok": True, **parse_urdf(xml)}
     except (ModelError, ValueError) as e:

@@ -21,8 +21,16 @@ and (optionally) Tailscale.
   back: the UR's External Control URCap connects to this PC.
 * Optional: [Tailscale](https://tailscale.com/download) (`tailscale up`). The GUI then listens on this PC's
   Tailscale address, so devices on your tailnet can open it. Without Tailscale it listens on 127.0.0.1 only, so
-  only this PC's browser can open it. The GUI never listens on all interfaces (0.0.0.0). Don't expose it to the
-  internet (no `tailscale funnel`, no port forwarding): it can move the robot.
+  only this PC's browser can open it. `ur7e_gui.sh --lan` (or `UR7E_GUI_LAN=1`) also listens on this PC's lab
+  network address, so anyone on that network can open it. The GUI never listens on all interfaces (0.0.0.0). Don't
+  expose it to the internet (no `tailscale funnel`, no port forwarding): it can move the robot.
+* A desktop PC (amd64) or an NVIDIA Jetson (arm64, JetPack 6, tested on an Orin NX with JetPack 6.2.1). The
+  launcher picks the image for the CPU: `ur7e_robotiq:jazzy` on a desktop, `ur7e_robotiq:jazzy-arm64` on a
+  Jetson. The Jetson image is built on the Jetson the first time (slow: about an hour).
+
+**Check a PC:** `python3 ~/ws/src/moveit_gui/scripts/pc_setup.py doctor` lists what is fine, what to look at
+(warn) and what is missing (FAIL), each with a hint. It changes nothing. `--robot-ip` sets the robot to look for;
+`--json` gives the same list for scripts.
 
 ## 2. Get the code
 
@@ -61,13 +69,55 @@ by another DNS name (a lab domain name, a CNAME), add `--allow-host robot.lab.ex
    ~/ur7e_gui.sh --robot-ip <ip>                  # another robot
    ~/ur7e_gui.sh -- headless_mode:=true           # extra gui.launch.py arguments after --
    ```
+   Or set it up in the browser: the first time, a pop-up asks what this PC runs (arm, Real or Fake and the IP,
+   gripper, F/T sensor and its IP, cameras); later SETUP › Setups › Robot › **Hardware…**. The launcher remembers
+   it, so a plain `~/ur7e_gui.sh` starts the same way next time.
+   Franka FR3 instead: build its image once (`aarch-uol/fr3_scraping_ws`: `cd docker; docker compose build`, the
+   workspace in `~/franka_scraping_ws` built), then pick Franka FR3 in the pop-up. In Franka Desk unlock the joints
+   and activate FCI first. The launcher starts its MoveIt (position controller) and the Franka Hand node.
    It waits for the controllers, then starts the GUI. Unless you passed `headless_mode:=true`, load and PLAY the
    External Control program on the pendant.
 3. The stack runs on `ROS_DOMAIN_ID=42`, so it doesn't clash with other ROS PCs on the lab network (default
    domain 0). Anything that must talk to it (a policy runner, the `ros2` CLI) needs `export ROS_DOMAIN_ID=42`
-   in that shell (not in `~/.bashrc`). Use `UR7E_ROS_DOMAIN_ID=<n> ~/ur7e_gui.sh` for another domain.
+   in that shell (not in `~/.bashrc`). Change the domain in Hardware… (ROS 2), or with
+   `UR7E_ROS_DOMAIN_ID=<n> ~/ur7e_gui.sh` for one start. **This PC only** there keeps the topics off the
+   network. On the PC itself, `scripts/ros_shell.sh` gives a ROS 2 shell on the right domain (docs/USERS.md).
 4. Gripper missing in OPERATE: the gripper is powered from the tool flange, so if the stack started while the arm
    was off, power the arm on and press **Reconnect** next to the gripper.
+
+## Start with the PC
+
+To have the GUI come up by itself when the PC starts (set the robot up once in the GUI first):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/ws/src/moveit_gui/scripts/ur7e_gui.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now ur7e_gui
+sudo loginctl enable-linger $USER      # start at boot, before anyone logs in
+```
+
+On the lab network too (`--lan`): `systemctl --user edit ur7e_gui`, add `[Service]` and
+`Environment=UR7E_GUI_LAN=1`, save, then `systemctl --user restart ur7e_gui`.
+
+It runs `~/ur7e_gui.sh` with what Hardware… saved, and restarts it if it fails. On a real robot it starts the driver,
+but nothing moves until someone commands it. Log: `journalctl --user -u ur7e_gui -f`. Stop: `systemctl --user stop
+ur7e_gui`. Turn it off: `systemctl --user disable --now ur7e_gui`. While it runs, don't start `~/ur7e_gui.sh` in a
+terminal too.
+
+## Cameras
+
+Plug the cameras in (RealSense on USB, ZED X on the Jetson's GMSL port), then in SETUP › Drivers & cameras press
+**+ Add…**, pick the camera, give it a name and save. **Start** / **Stop** run its driver; tick **start with the
+GUI** to start it every time. The picture and the topics show when you select it. This works with `--fake` too.
+In OPERATE, layout 3 (Cameras) has a **Camera drivers** window with the same Start / Stop buttons.
+
+A ZED needs a Jetson with the ZED SDK installed and its driver image, built once:
+
+```bash
+~/ws/src/moveit_gui/docker/zed/build.sh
+```
+
+The launcher then starts the ZED container by itself.
 
 ## 5. First-time setup in the GUI (SETUP page)
 

@@ -242,7 +242,7 @@ def test_handeye_eye_in_hand_on_the_fake_wrist_camera(env):
     s, b, _ = env
     b.time_scale = 20.0                                                 # fast fake moves
     with pytest.raises(CommandError, match="CameraInfo"):
-        run(s, "handeye_start", topic="/zed/zed_node/rgb/image_rect_color")
+        run(s, "handeye_start", topic="/zed/zed_node/rgb/color/rect/image")
     run(s, "handeye_start", topic=fb.FAKE_CAM_TOPIC)                   # info topic found next to the image
     look = run(s, "handeye_look")
     assert look["detection"]["ok"] and look["jpeg"]
@@ -431,3 +431,24 @@ def test_active_tcp_falls_back_when_its_link_is_gone(env, monkeypatch):
     b.fake_robot_description = URDF.replace('<link name="robotiq_85_base_link"/><link name="robotiq_tcp"/><link name="finger"/>', "") \
         .split('<joint name="grip"')[0] + "</robot>"
     assert wait(lambda: (s.tick() or True) and s.core.store.active_tcp == "tool0", 5)
+
+
+def test_a_setup_brings_its_cameras_back(env):
+    s, _, _ = env
+    s.on_restart = lambda: None
+    run(s, "drivers_save", service={"name": "d405", "label": "D405", "type": "realsense", "params": {}, "autostart": True})
+    run(s, "drivers_save", service={"name": "zed", "label": "ZED X Nano", "type": "zed", "params": {}})
+    run(s, "parts_save", name="holder_a", parent="tool0", shape={"type": "box", "size_mm": [20, 20, 20]})
+    g = run(s, "setup_list")["guide"]
+    assert g["parts"] == ["holder_a"] and g["on"] == ["d405"] and g["calibrations"] == []
+    assert {c["label"] for c in g["cameras"]} == {"D405", "ZED X Nano"}
+    run(s, "setup_save", name="alice")
+    assert s.setups.list()[0]["cameras"] == ["d405"]
+    run(s, "drivers_autostart", name="d405", on=False)            # the colleague's camera instead
+    run(s, "drivers_autostart", name="zed", on=True)
+    run(s, "setup_save", name="bob")
+    run(s, "setup_load", name="alice")
+    auto = {x["name"]: x["autostart"] for x in s.drivers.view()["services"]}
+    assert auto == {"d405": True, "zed": False}
+    backup = next(x for x in s.setups.list() if x["auto"])
+    assert backup["cameras"] == ["zed"]                             # what ran before the load

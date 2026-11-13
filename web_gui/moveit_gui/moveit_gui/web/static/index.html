@@ -9,7 +9,7 @@
 </head>
 <body>
 <header>
-  <div class="grp"><div class="big" id="h-robot">…</div></div>
+  <div class="grp h-name"><div class="big" id="h-robot">…</div></div>
   <div class="sep"></div>
   <div class="grp h-robotstate" id="h-stategrp">
     <div class="cap">Robot</div>
@@ -18,7 +18,7 @@
   </div>
   <div class="grp"><div class="cap">Tool (TCP)</div><select id="h-tcp" data-needs-lease></select></div>
   <div class="grp"><div class="cap">Control</div><div class="val" id="h-mode">—</div></div>
-  <div class="grp h-doing"><div class="cap">GUI is doing</div><div style="display:flex;gap:4px"><a class="pill" id="h-activity" title="What this GUI is doing now. Click to open its page.">Nothing</a><a class="pill rec" id="h-rec" hidden>● Rec</a><button class="btn" id="h-recbtn" type="button" title="Record joints, TCP pose, F/T, gripper, controllers and the live cameras (compressed) into one folder">● Record</button></div></div>
+  <div class="grp h-doing"><div class="cap">GUI is doing</div><div style="display:flex;gap:4px;min-width:0"><a class="pill" id="h-activity" title="What this GUI is doing now. Click to open its page.">Nothing</a><a class="pill rec" id="h-rec" hidden>● Rec</a></div></div>
   <div class="grp hlay" id="h-layouts" hidden></div>
   <div class="spacer"></div>
   <div class="grp hinfo"><span class="hchip warn" id="h-conn" hidden></span></div>
@@ -28,9 +28,10 @@
     <input type="range" id="h-ovr" min="5" max="100" step="5" value="100" data-needs-lease>
   </div>
   <div class="sep"></div>
+  <button class="btn hrec" id="h-recbtn" type="button" title="Record joints, TCP pose, F/T, gripper, controllers and the live cameras (compressed) into one folder">● Record</button>
   <div id="lease">
     <button class="hchip users" id="h-users" type="button" title="Who has this GUI open">—</button>
-    <span class="hchip view" id="lease-view" title="View only: buttons that move or change the robot are greyed out. Press Take control to operate. STOP always works."><svg class="ic" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg> View only</span>
+    <span class="hchip view" id="lease-view" title="View only: buttons that move or change the robot are greyed out. Press Take control to operate. STOP always works."><svg class="ic" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="lbl"> View only</span></span>
     <span class="who" id="lease-who">—</span>
     <button class="btn" id="lease-btn">Take control</button>
     <button class="btn quiet" id="lease-ask" type="button" hidden title="Ask whoever has control to give it to you (they get a pop-up: Give / Keep)">Ask</button>

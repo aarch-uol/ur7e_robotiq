@@ -25,6 +25,8 @@ Methods every bridge provides (besides the UR / gripper / controller calls):
   topic_publishers(topic) -> int
   watch_image(topic | None) -> (ok, msg)     the ONE previewed image topic (camera.ImageWatch)
   watched_image() -> Optional[ImageWatch]
+  open_image(topic) -> (ImageWatch | None, msg)   one browser camera window (shared per topic, several at once)
+  close_image(topic); open_images() -> {topic: ImageWatch}
   grab_photo(topic, timeout_s=3.0) -> (jpeg bytes | None, why)   next frame of an image topic, full size (program photo step)
   scene_set_box(object_id, size_m, T_base_box) -> (ok, msg)   add / replace a world collision box in MoveIt's
                                              planning scene, pose in profile.base_link (keepout.py)

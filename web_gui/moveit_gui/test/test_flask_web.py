@@ -182,6 +182,13 @@ def test_make_program_builds_an_unsaved_program_that_validates(s):
         cmd(s, "program_flask_scrape", tool=TOOL, theta_max_deg=12, speed_mm_s=0)
     with pytest.raises(CommandError, match="no reachable"):
         cmd(s, "program_flask_scrape", tool=TOOL, theta_min_deg=60, theta_max_deg=80, rings=2)
+    # top to bottom is the default (like the vial scrape); rings on request; nothing else
+    cmd(s, "program_flask_scrape", tool=TOOL, theta_min_deg=2, theta_max_deg=12, rings=3, step_deg=90)
+    assert "stroke_01_001" in s.program.waypoints
+    cmd(s, "program_flask_scrape", tool=TOOL, theta_min_deg=2, theta_max_deg=12, rings=3, step_deg=90, pattern="rings")
+    assert "ring_01_001" in s.program.waypoints
+    with pytest.raises(CommandError, match="pattern"):
+        cmd(s, "program_flask_scrape", tool=TOOL, theta_max_deg=12, pattern="spiral")
 
 
 def test_bent_tool_suggest_reach_and_program(s):

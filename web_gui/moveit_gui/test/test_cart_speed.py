@@ -251,7 +251,7 @@ def test_program_editor_and_runner_use_speed_mm_s(web):
 
 
 # --------------------------------------------------------------- RosBridge
-STUBS = ["rclpy", "rclpy.action", "rclpy.callback_groups", "rclpy.executors", "rclpy.node", "rclpy.qos",
+STUBS = ["rclpy", "rclpy.action", "rclpy.callback_groups", "rclpy.executors", "rclpy.node", "rclpy.qos", "rclpy.serialization",
          "rclpy.time", "builtin_interfaces", "builtin_interfaces.msg", "controller_manager_msgs",
          "controller_manager_msgs.srv", "geometry_msgs", "geometry_msgs.msg", "sensor_msgs", "sensor_msgs.msg",
          "std_msgs", "std_msgs.msg", "std_srvs", "std_srvs.srv", "lifecycle_msgs", "lifecycle_msgs.msg",

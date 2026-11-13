@@ -274,4 +274,52 @@ def test_http_camera_mjpeg_and_missing_topic(http):
         assert r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
         chunk = r.read(64 * 1024)
     assert b"--frame" in chunk and b"\xff\xd8" in chunk                  # a JPEG
-    assert wait(lambda: bridge.watched_image() is None, 3.0)            # nobody watches: subscription gone
+    assert wait(lambda: not bridge.open_images(), 3.0)                  # nobody watches: subscription gone
+
+
+def test_http_two_cameras_at_once(http):
+    base, _, bridge = http
+    a, b = "/camera/camera/color/image_rect_raw", "/camera/camera/depth/image_rect_raw"
+    ra = urllib.request.urlopen(base + "/api/camera.mjpeg?q=high&topic=" + a, timeout=5)
+    rb = urllib.request.urlopen(base + "/api/camera.mjpeg?topic=" + b, timeout=5)
+    try:
+        for r in (ra, rb):                                              # both stream, neither stops the other
+            got = b""
+            while got.count(b"\xff\xd8") < 2:
+                got += r.read(4096)
+        assert set(bridge.open_images()) == {a, b}
+        assert bridge.open_images()[a].max_width == 1280
+    finally:
+        ra.close()
+        rb.close()
+    assert wait(lambda: not bridge.open_images(), 3.0)
+
+
+def test_http_on_two_addresses_is_one_gui(env):
+    s, _, _, _ = env
+    srv = Server(s, "127.0.0.1", 0, also_hosts=["127.0.0.2"]).start()
+    try:
+        assert srv.addresses == [f"127.0.0.1:{srv.port}", f"127.0.0.2:{srv.port}"]
+        for ip in ("127.0.0.1", "127.0.0.2"):
+            with urllib.request.urlopen(f"http://{ip}:{srv.port}/api/info", timeout=5) as resp:
+                assert resp.status == 200
+        assert srv.hub.service is s                                          # one GUI behind both
+    finally:
+        srv.stop()
+    with pytest.raises(ValueError):
+        Server(s, "127.0.0.1", 0, also_hosts=["0.0.0.0"])
+
+
+def test_a_late_tf_holds_the_last_tcp_pose_briefly(env, monkeypatch):
+    """TF a moment late on a loaded PC: the 3D view keeps the last TCP pose, marked stale, instead of blanking."""
+    s = env[0]
+    good = s.state()["tcp"]
+    assert good and "stale" not in good
+
+    def late(*a, **k):
+        raise RuntimeError("TF is stale")
+    monkeypatch.setattr(s.core.geo, "current_pose", late)
+    held = s.state()["tcp"]
+    assert held["stale"] is True and held["xyz_mm"] == good["xyz_mm"]
+    s._tcp_last = (s._tcp_last[0] - s.TCP_HOLD_S - 0.1,) + s._tcp_last[1:]
+    assert s.state()["tcp"] is None                    # longer than that: no pose

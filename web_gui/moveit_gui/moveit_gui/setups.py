@@ -10,6 +10,10 @@ A setup also remembers the end-effector base it was made on (bases.py: gripper, 
 puts that base back, so the robot stack restarts when the base differs from the running one.
 
 Programs, policies and recordings are not part of a setup: they are shared by every setup.
+
+Setups are kept per person (user_profiles.py: config_dir()/profiles/<name>/setups/); the older ones in
+config_dir()/setups/ are the "Shared" ones (owner ""). Whoever's setup it is, the one in use is marked in
+config_dir()/setups/current.yaml with its owner.
 """
 from __future__ import annotations
 
@@ -84,9 +88,19 @@ def _same_file(a: Path, b: Path) -> bool:
 
 
 class Setups:
-    def __init__(self, cfg: Path, profile: str):
-        self.cfg, self.profile = Path(cfg), profile
-        self.dir = self.cfg / "setups"
+    def __init__(self, cfg: Path, profile: str, owner: str = "", root: Optional[Path] = None):
+        """owner: the person's profile name ("" = the shared setups); root: where that person's setups are."""
+        self.cfg, self.profile, self.owner = Path(cfg), profile, str(owner or "")
+        self.dir = Path(root) if root is not None else self.cfg / "setups"
+        self.marker = self.cfg / "setups" / CURRENT
+
+    def in_use(self) -> Dict[str, str]:
+        """{"owner", "name"} of the setup last saved or loaded, whoever's it is (the marker only, not checked)."""
+        try:
+            d = yaml.safe_load(self.marker.read_text()) or {}
+        except Exception:
+            return {"owner": "", "name": ""}
+        return {"owner": str(d.get("owner") or ""), "name": str(d.get("name") or "")}
 
     def _path(self, name: str) -> Path:
         name = str(name).strip()
@@ -109,21 +123,49 @@ class Setups:
             out.append({"name": d.name, "auto": d.name.startswith(AUTO_PREFIX), "note": info.get("note", ""),
                         "saved": info.get("saved", ""), "holds": info.get("holds", []),
                         "profile": info.get("profile", ""), "base": info.get("base", ""),
+                        "cameras": info.get("cameras"), "copied_from": info.get("copied_from", ""),
                         "error": info.get("error", "")})
         return out
 
     # ---- which setup is in use, and what differs from it
     def current(self) -> str:
         """The setup last saved or loaded ("" if none, or it was deleted since)."""
-        try:
-            n = str((yaml.safe_load((self.dir / CURRENT).read_text()) or {}).get("name") or "")
-        except Exception:
-            return ""
-        return n if n and (self.dir / n / "setup.yaml").is_file() else ""
+        u = self.in_use()
+        n = u["name"]
+        return n if n and u["owner"].lower() == self.owner.lower() and (self.dir / n / "setup.yaml").is_file() else ""
 
     def _mark(self, name: str):
+        self.marker.parent.mkdir(parents=True, exist_ok=True)
+        d = {"name": name, "at": time.strftime("%Y-%m-%d %H:%M")}
+        if self.owner:
+            d["owner"] = self.owner
+        self.marker.write_text(yaml.safe_dump(d))
+
+    def copy_from(self, other: "Setups", name: str, new_name: str = "", replace: bool = False) -> str:
+        """Copy setup `name` of another profile (or the shared ones) into this one, as `new_name` (default: the
+        same name). The files in use don't change."""
+        src = other._path(name)
+        if not (src / "setup.yaml").is_file():
+            raise SetupError(f"no setup '{name}'" + (f" in profile {other.owner}" if other.owner else " in Shared"))
+        d = self._path(new_name or src.name)
+        if d.name.startswith(AUTO_PREFIX):
+            raise SetupError(f"names starting with {AUTO_PREFIX} are kept for automatic backups")
+        if d.resolve() == src.resolve():
+            raise SetupError("that is the same setup")
+        if d.exists() and not replace:
+            raise SetupError(f"this profile already has a setup '{d.name}' (copy again to replace it)")
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / CURRENT).write_text(yaml.safe_dump({"name": name, "at": time.strftime("%Y-%m-%d %H:%M")}))
+        tmp = d.with_name(d.name + ".partial")
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        shutil.copytree(src, tmp)
+        info = yaml.safe_load((tmp / "setup.yaml").read_text()) or {}
+        info["copied_from"] = f"{other.owner or 'Shared'}/{src.name}"
+        (tmp / "setup.yaml").write_text(yaml.safe_dump(info, sort_keys=False))
+        if d.exists():
+            shutil.rmtree(d)
+        tmp.rename(d)
+        return d.name
 
     def present(self) -> List[str]:
         """What a save would hold now (the keys of members(), plus the last payload calibration)."""
@@ -155,7 +197,8 @@ class Setups:
             raise SetupError(f"no setup '{name}'")
         return yaml.safe_load((d / "setup.yaml").read_text()) or {}
 
-    def _copy_in(self, dest: Path, note: str, base: Optional[str] = None) -> List[str]:
+    def _copy_in(self, dest: Path, note: str, base: Optional[str] = None,
+                 cameras: Optional[List[str]] = None) -> List[str]:
         tmp = dest.with_name(dest.name + ".partial")
         if tmp.exists():
             shutil.rmtree(tmp)
@@ -180,6 +223,8 @@ class Setups:
                 "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}
         if base:
             info["base"] = str(base)
+        if cameras is not None:                          # the camera drivers it runs (SETUP > Drivers & cameras)
+            info["cameras"] = [str(c) for c in cameras]
         (tmp / "setup.yaml").write_text(yaml.safe_dump(info, sort_keys=False))
         if dest.exists():
             old = dest.with_name(dest.name + ".old")
@@ -192,14 +237,15 @@ class Setups:
             tmp.rename(dest)
         return holds
 
-    def save(self, name: str, note: str = "", replace: bool = False, base: Optional[str] = None) -> List[str]:
+    def save(self, name: str, note: str = "", replace: bool = False, base: Optional[str] = None,
+             cameras: Optional[List[str]] = None) -> List[str]:
         d = self._path(name)
         if d.name.startswith(AUTO_PREFIX):
             raise SetupError(f"names starting with {AUTO_PREFIX} are kept for automatic backups")
         if d.exists() and not replace:
             raise SetupError(f"a setup '{d.name}' exists (save again to replace it)")
         self.dir.mkdir(parents=True, exist_ok=True)
-        holds = self._copy_in(d, note, base)
+        holds = self._copy_in(d, note, base, cameras)
         self._mark(d.name)
         return holds
 
@@ -209,9 +255,10 @@ class Setups:
             raise SetupError(f"no setup '{name}'")
         shutil.rmtree(d)
 
-    def load(self, name: str, base: Optional[str] = None) -> dict:
-        """Put the setup's files in place (base: the running one, kept in the automatic backup).
-        Returns {"backup": name, "holds": [...], "base": the setup's base or ""}; the caller restarts."""
+    def load(self, name: str, base: Optional[str] = None, cameras: Optional[List[str]] = None) -> dict:
+        """Put the setup's files in place (base, cameras: the running ones, kept in the automatic backup).
+        Returns {"backup": name, "holds": [...], "base": the setup's base or "", "cameras": its camera drivers, or
+        None for a setup saved before setups kept them}; the caller starts / stops the cameras and restarts."""
         d = self._path(name)
         files = d / "files"
         if not (d / "setup.yaml").is_file():
@@ -221,7 +268,7 @@ class Setups:
             raise SetupError(f"setup '{name}' is for robot profile {info['profile']}, this GUI runs {self.profile}")
         backup = f"{AUTO_PREFIX}{re.sub(r'[^A-Za-z0-9_.-]', '_', d.name)[:16]}_{time.strftime('%m%d_%H%M%S')}"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._copy_in(self.dir / backup, f"automatic: the files in use before '{d.name}' was loaded", base)
+        self._copy_in(self.dir / backup, f"automatic: the files in use before '{d.name}' was loaded", base, cameras)
         for rel in members(self.profile).values():
             dst, src = self.cfg / rel.rstrip("/"), files / rel.rstrip("/")
             if dst.is_dir():
@@ -241,7 +288,9 @@ class Setups:
         self._mark(d.name)
         b = str(info.get("base") or "")
         from .bases import BASES
-        return {"backup": backup, "holds": info.get("holds", []), "base": b if b in BASES else ""}
+        cams = info.get("cameras")
+        return {"backup": backup, "holds": info.get("holds", []), "base": b if b in BASES else "",
+                "cameras": [str(c) for c in cams] if isinstance(cams, list) else None}
 
     def _prune(self):
         autos = sorted((d for d in self.dir.iterdir() if d.name.startswith(AUTO_PREFIX) and d.is_dir()),

@@ -1,0 +1,539 @@
+# Round-bottom flask (RBF) scrape with set TCP speeds (mm/s). Made by the same code as SETUP > Flask > Make
+# program (pattern Top to bottom), for a 250 ml flask (85 mm bulb, 27 mm neck) and a straight spatula (3 mm shaft
+# radius, 150 mm long). Like the vial scrape it scrapes DOWN the wall: 12 strokes, 30 deg apart around the axis,
+# each from 17 deg down to 12 and 6 deg from the bottom (17 deg is the most a straight tool reaches through the
+# neck). Per stroke: in through the neck to the top of the stroke, press, scrape down, release, back out to the neck.
+# Speeds: into the neck, between strokes and out at 15 mm/s; down the wall (the scrape) at 5 mm/s with 3 N pressed
+# along the tool (Admittance). The first move to the neck is a joint move (no mm/s).
+# FIRST: SETUP > Flask: touch your flask and Save, so the fixture "flask" exists. If your flask or tool is not
+# this one, make the program there instead (Make program, set mm/s): these poses only fit a 250 ml flask.
+# TCP: the poses use `tcp: active`: select your spatula tip TCP (top bar).
+# BEFORE THE ROBOT: watch the preview, run with SPEED at 25 % first, and read the MoveL lines in the log
+# (each one says the speed it got, and if the joint limits slowed it).
+version: 2
+name: example_rbf_scrape_speed
+robot: ur7e_lab
+waypoints:
+  approach_neck:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.140299]
+      quat_xyzw: [1.0, 0.0, 0.0, 0.0]
+  pivot_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [1.0, 0.0, 0.0, 0.0]
+  stroke_01_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.012133, 0.0, -0.039687]
+      quat_xyzw: [-0.997168, 0.0, -0.075203, 0.0]
+  stroke_01_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.008274, 0.0, -0.040667]
+      quat_xyzw: [-0.998704, 0.0, -0.050896, 0.0]
+  stroke_01_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.004338, 0.0, -0.041273]
+      quat_xyzw: [-0.999647, 0.0, -0.026562, 0.0]
+  stroke_02_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.010508, 0.006067, -0.039687]
+      quat_xyzw: [-0.997168, 0.000454, -0.06511, 0.037631]
+  stroke_02_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.007165, 0.004137, -0.040667]
+      quat_xyzw: [-0.998704, 0.000712, -0.044059, 0.025479]
+  stroke_02_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.003757, 0.002169, -0.041273]
+      quat_xyzw: [-0.999647, 0.00097, -0.02299, 0.013303]
+  stroke_03_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.006067, 0.010508, -0.039687]
+      quat_xyzw: [-0.997168, 0.000726, -0.037554, 0.065155]
+  stroke_03_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.004137, 0.007165, -0.040667]
+      quat_xyzw: [-0.998704, 0.000983, -0.025404, 0.044102]
+  stroke_03_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.002169, 0.003757, -0.041273]
+      quat_xyzw: [-0.999646, 0.00124, -0.013252, 0.023019]
+  stroke_04_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.012133, -0.039687]
+      quat_xyzw: [-0.997168, -0.000454, -3.4e-05, 0.075203]
+  stroke_04_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.008274, -0.040667]
+      quat_xyzw: [-0.998704, -0.000454, -2.3e-05, 0.050896]
+  stroke_04_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.004338, -0.041273]
+      quat_xyzw: [-0.999647, -0.000454, -1.2e-05, 0.026562]
+  stroke_05_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.006067, 0.010508, -0.039687]
+      quat_xyzw: [-0.997164, -0.002902, 0.037412, 0.065237]
+  stroke_05_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.004137, 0.007165, -0.040667]
+      quat_xyzw: [-0.998699, -0.003161, 0.025308, 0.044157]
+  stroke_05_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.002169, 0.003757, -0.041273]
+      quat_xyzw: [-0.999641, -0.003419, 0.013202, 0.023048]
+  stroke_06_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.010508, 0.006067, -0.039687]
+      quat_xyzw: [-0.997155, -0.005189, 0.064931, 0.03794]
+  stroke_06_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.007165, 0.004137, -0.040667]
+      quat_xyzw: [-0.998689, -0.005457, 0.043937, 0.025688]
+  stroke_06_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.003757, 0.002169, -0.041273]
+      quat_xyzw: [-0.999631, -0.005722, 0.022927, 0.013412]
+  stroke_07_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.012133, 0.0, -0.039687]
+      quat_xyzw: [-0.99715, -0.006043, 0.075201, 0.000456]
+  stroke_07_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.008274, 0.0, -0.040667]
+      quat_xyzw: [-0.998686, -0.00606, 0.050895, 0.000309]
+  stroke_07_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.004338, 0.0, -0.041273]
+      quat_xyzw: [-0.999629, -0.006073, 0.026561, 0.000161]
+  stroke_08_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.010508, -0.006067, -0.039687]
+      quat_xyzw: [0.997153, 0.005605, -0.065338, 0.037235]
+  stroke_08_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.007165, -0.004137, -0.040667]
+      quat_xyzw: [0.99869, 0.00536, -0.044213, 0.025211]
+  stroke_08_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.003757, -0.002169, -0.041273]
+      quat_xyzw: [0.999634, 0.005111, -0.023071, 0.013163]
+  stroke_09_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.006067, -0.010508, -0.039687]
+      quat_xyzw: [0.997154, 0.005311, -0.037948, 0.064926]
+  stroke_09_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.004137, -0.007165, -0.040667]
+      quat_xyzw: [0.998691, 0.005059, -0.025671, 0.043947]
+  stroke_09_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [-0.002169, -0.003757, -0.041273]
+      quat_xyzw: [0.999636, 0.004804, -0.013391, 0.022939]
+  stroke_10_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, -0.012133, -0.039687]
+      quat_xyzw: [0.997147, 0.006453, -0.000487, 0.075201]
+  stroke_10_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, -0.008274, -0.040667]
+      quat_xyzw: [0.998683, 0.006455, -0.000329, 0.050894]
+  stroke_10_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, -0.004338, -0.041273]
+      quat_xyzw: [0.999626, 0.006453, -0.000171, 0.026561]
+  stroke_11_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.006067, -0.010508, -0.039687]
+      quat_xyzw: [0.997129, 0.008884, 0.03702, 0.06546]
+  stroke_11_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.004137, -0.007165, -0.040667]
+      quat_xyzw: [0.998662, 0.009149, 0.025043, 0.044308]
+  stroke_11_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.002169, -0.003757, -0.041273]
+      quat_xyzw: [0.999603, 0.009409, 0.013064, 0.023127]
+  stroke_12_001:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.010508, -0.006067, -0.039687]
+      quat_xyzw: [0.997105, 0.011193, 0.064701, 0.03833]
+  stroke_12_002:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.007165, -0.004137, -0.040667]
+      quat_xyzw: [0.998638, 0.011473, 0.043782, 0.025952]
+  stroke_12_003:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.003757, -0.002169, -0.041273]
+      quat_xyzw: [0.999578, 0.011748, 0.022845, 0.01355]
+  stroke_01_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997168, 0.0, -0.075203, 0.0]
+  stroke_01_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999647, 0.0, -0.026562, 0.0]
+  stroke_02_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997168, 0.000454, -0.06511, 0.037631]
+  stroke_02_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999647, 0.00097, -0.02299, 0.013303]
+  stroke_03_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997168, 0.000726, -0.037554, 0.065155]
+  stroke_03_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999646, 0.00124, -0.013252, 0.023019]
+  stroke_04_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997168, -0.000454, -3.4e-05, 0.075203]
+  stroke_04_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999647, -0.000454, -1.2e-05, 0.026562]
+  stroke_05_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997164, -0.002902, 0.037412, 0.065237]
+  stroke_05_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999641, -0.003419, 0.013202, 0.023048]
+  stroke_06_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.997155, -0.005189, 0.064931, 0.03794]
+  stroke_06_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999631, -0.005722, 0.022927, 0.013412]
+  stroke_07_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.99715, -0.006043, 0.075201, 0.000456]
+  stroke_07_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [-0.999629, -0.006073, 0.026561, 0.000161]
+  stroke_08_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.997153, 0.005605, -0.065338, 0.037235]
+  stroke_08_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.999634, 0.005111, -0.023071, 0.013163]
+  stroke_09_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.997154, 0.005311, -0.037948, 0.064926]
+  stroke_09_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.999636, 0.004804, -0.013391, 0.022939]
+  stroke_10_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.997147, 0.006453, -0.000487, 0.075201]
+  stroke_10_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.999626, 0.006453, -0.000171, 0.026561]
+  stroke_11_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.997129, 0.008884, 0.03702, 0.06546]
+  stroke_11_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.999603, 0.009409, 0.013064, 0.023127]
+  stroke_12_entry_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.997105, 0.011193, 0.064701, 0.03833]
+  stroke_12_exit_safe:
+    pose:
+      frame: flask
+      tcp: active
+      position: [0.0, 0.0, 0.040299]
+      quat_xyzw: [0.999578, 0.011748, 0.022845, 0.01355]
+steps:
+- {type: comment, text: Round-bottom flask scrape}
+- {type: controller, mode: admittance}
+- {type: move_pose, target: approach_neck, cartesian: false, velocity: 0.05}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_01_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_01_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_01_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_01_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_01_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_02_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_02_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_02_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_02_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_02_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_03_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_03_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_03_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_03_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_03_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_04_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_04_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_04_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_04_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_04_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_05_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_05_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_05_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_05_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_05_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_06_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_06_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_06_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_06_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_06_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_07_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_07_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_07_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_07_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_07_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_08_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_08_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_08_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_08_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_08_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_09_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_09_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_09_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_09_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_09_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_10_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_10_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_10_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_10_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_10_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_11_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_11_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_11_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_11_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_11_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_12_entry_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: stroke_12_001, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- type: force
+  wrench: [0.0, 0.0, 3.0, 0.0, 0.0, 0.0]
+  frame: tool
+- {type: move_pose, target: stroke_12_002, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: move_pose, target: stroke_12_003, cartesian: true, velocity: 0.02, speed_mm_s: 5.0}
+- {type: force_off}
+- {type: move_pose, target: stroke_12_exit_safe, cartesian: true, velocity: 0.02,
+  speed_mm_s: 15.0}
+- {type: move_pose, target: pivot_safe, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: move_pose, target: approach_neck, cartesian: true, velocity: 0.02, speed_mm_s: 15.0}
+- {type: controller, mode: position}

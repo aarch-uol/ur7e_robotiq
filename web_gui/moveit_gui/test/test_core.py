@@ -48,7 +48,7 @@ def _allow_impedance(profile):
 def test_all_profiles_load():
     for p in (ROOT / "profiles").glob("*.yaml"):
         prof = RobotProfile.load(p)
-        assert len(prof.joint_names) == 6
+        assert len(prof.joint_names) == (7 if prof.name == "fr3" else 6)
         assert prof.default_mode in prof.modes
 
 
@@ -143,6 +143,9 @@ def test_example_programs_valid(profile, bridge):
     from moveit_gui import transforms as tf
     geo.store.put_fixture(FixtureDef("vial", profile.base_link, tf.mm_deg_to_T([400, 150, 200], [0, 0, 0])),
                           replace="vial" in geo.store.fixtures)
+    # example_rbf_scrape_speed works in the flask fixture SETUP > Flask saves
+    geo.store.put_fixture(FixtureDef("flask", profile.base_link, tf.mm_deg_to_T([500, 0, 100], [0, 0, 0])),
+                          replace="flask" in geo.store.fixtures)
     for p in (ROOT / "programs").glob("*.yaml"):
         prog = Program.load(p, profile)
         assert prog.notes == [], p.name          # shipped examples are already v2

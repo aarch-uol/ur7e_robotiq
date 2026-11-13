@@ -6,6 +6,7 @@ payload calibration: claimed with core.begin_motion, refused unless idle in a Mo
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import threading
@@ -18,10 +19,12 @@ import numpy as np
 from .. import bases as B
 from .. import handeye as he
 from .. import parts as P
+from .. import robots as R
 from .. import services as SV
 from .. import transforms as tf
 from ..calibration import TcpDef, config_dir
 from ..setups import Setups, members as S_members
+from ..user_profiles import Profiles, ProfileError
 
 RESTART_STACK, RESTART_GUI = 75, 76
 PARTS_VERIFY_S = 10.0
@@ -34,7 +37,8 @@ class WorkcellCommands:
         prof = self.core.profile.name
         self.parts = P.PartStore(config_dir() / "parts" / f"{prof}.yaml")
         self.cams = he.CameraCalibrations(config_dir() / "cameras" / f"{prof}.yaml")
-        self.setups = Setups(config_dir(), prof)
+        self.setups = Setups(config_dir(), prof)            # the shared setups (made before profiles existed)
+        self.profiles = Profiles(config_dir())
         self.restart_code: Optional[int] = None
         self.model_rev = 0                                  # +1 when the 3D views must reload the robot model
         self.on_restart = None                              # set by the server's main()
@@ -176,7 +180,8 @@ class WorkcellCommands:
                 "restarting": self.restart_code, "model_rev": self.model_rev,
                 "cams_n": len(self.cams.cameras),
                 "drivers": self.drivers_state(),
-                "setup": self._setup_summary(), "base_next": self._base_next()}
+                "setup": self._setup_summary(), "base_next": self._base_next(),
+                "robot_chosen": R.chosen(config_dir()) or R.running(self.core.fake) is None}   # by hand: never asked
 
     def _base_next(self) -> str:
         """The base the next robot stack start uses when it differs from the running one, else ""."""
@@ -194,11 +199,23 @@ class WorkcellCommands:
         logs = Path(os.environ["MOVEIT_GUI_LOG_DIR"]) / "services" if os.environ.get("MOVEIT_GUI_LOG_DIR") \
             else here / "logs"
         b = c.bridge
-        self.drivers = SV.Services(here / f"{prof}.yaml", run, logs,
-                                   spawn=SV.spawn_fake if c.fake else SV.spawn_process,
-                                   have=(lambda pkg: True) if c.fake else SV.have_package,
-                                   publishers=b.topic_publishers, on_change=self._driver_changed if c.fake else None,
-                                   log=b.log)
+        # Real drivers with a real robot, and with a fake one started with --real-cameras; simulated ones otherwise.
+        # The ZED runs in its own container (ur7e_gui.sh starts it and says where its runner listens).
+        real = not c.fake or getattr(b, "real", None) is not None
+        zed = os.environ.get("MOVEIT_GUI_ZED_DIR", "").strip() or None
+
+        def have(pkg):
+            if pkg == "zed_wrapper" and zed:
+                return SV.remote_alive(zed)
+            return SV.have_package(pkg) if real else True
+
+        def route(s):
+            if s.type == "zed" and zed and real:
+                return lambda argv, log: SV.RemoteProc.start(zed, s.name, argv, log)
+            return SV.spawn_process if real else SV.spawn_fake
+        self.drivers = SV.Services(here / f"{prof}.yaml", run, logs, spawn=SV.spawn_fake, route=route,
+                                   remote_root=zed, have=have, publishers=b.topic_publishers,
+                                   on_change=None if real else self._driver_changed, log=b.log)
 
     def _driver_changed(self, s, up: bool):
         """Fake mode: a started fake driver 'publishes' its outputs, so the page and the preview work."""
@@ -211,8 +228,8 @@ class WorkcellCommands:
                 (b.fake_published.add if up else b.fake_published.discard)(o["topic"])
 
     def drivers_state(self) -> list:
-        """Small, in every state: [{name, kind, state, msg}] (the full view is drivers_get)."""
-        return [{k: r[k] for k in ("name", "kind", "state", "msg")} for r in self.drivers.view()["services"]]
+        """Small, in every state: [{name, label, kind, state, msg}] (the full view is drivers_get)."""
+        return [{k: r[k] for k in ("name", "label", "kind", "state", "msg")} for r in self.drivers.view()["services"]]
 
     def drivers_stop_all(self, wait: float = 6.0):
         """The GUI closes: stop the drivers, except on a GUI-only restart (the next GUI adopts them)."""
@@ -481,6 +498,19 @@ class WorkcellCommands:
         return self._ok("restarting the robot stack and the GUI: this page reconnects by itself (about a minute)"
                         if code == RESTART_STACK else "restarting the GUI: this page reconnects by itself")
 
+    def cmd_stack_stop(self, who=""):
+        """Stop the robot stack until someone presses Start: nothing of the robot runs, only a small start page
+        (web/idle.py). For when nobody uses the robot."""
+        why = self._restart_refusal()
+        if why:
+            raise P.PartError(why)
+        if self.on_restart is None:
+            raise P.PartError("this GUI was not started by the launcher (ur7e_gui.sh): stop it there")
+        from .idle import marker
+        marker(config_dir()).write_text(json.dumps({"by": str(who or "")[:24], "at": time.strftime("%Y-%m-%d %H:%M")}))
+        self._restart(RESTART_STACK, f"robot stack stopped{' by ' + str(who)[:24] if who else ''}")
+        return self._ok("stopping the robot stack: this page shows Start when it is down (about 30 s)")
+
     def _tcp_link(self, name: str) -> Optional[str]:
         """The robot-model link (a profile TCP's link) a TCP hangs on in the end, None when its chain ends on some
         other TF frame (a camera's, say: not the robot model's business)."""
@@ -557,15 +587,127 @@ class WorkcellCommands:
         return self._ok(f"base '{B.BASES[base][0]}': restarting the robot stack and the GUI (about a minute)",
                         restart="stack")
 
+    # ------------------------------------------------------------------ robot: arm, real / fake, gripper, F/T, cameras
+    def robot_view(self) -> dict:
+        return R.view(config_dir(), self.core.fake)
+
+    def robot_setup_view(self) -> dict:
+        """Everything the Set up pop-up shows: robots, gripper / F/T on the running base, cameras."""
+        v = self.robot_view()
+        base = self.running_base()
+        cams = [x for x in self.drivers.view()["services"] if x["kind"] == "camera"]
+        types = [t for t in SV.Services.types_view(self.drivers.have) if t["kind"] == "camera"]
+        robot = (v["running"] or v["next"])["robot"]
+        return {**v, "base": base, **R.parts_of(robot, base), "cameras": [{"name": c["label"], "type": c["type"],
+                "label": c["type_label"], "state": c["state"]} for c in cams],
+                "camera_types": [{k: t[k] for k in ("type", "label", "help", "installed", "install")} for t in types]}
+
+    def cmd_robot_view(self):
+        return self._ok(robot=self.robot_setup_view())
+    cmd_robot_view.read_only = True
+
+    def cmd_robot_setup(self, robot, mode, ip, gripper, ft, ft_ip=None, cameras=(), confirm=False, domain=None, net=None,
+                        servo=None):
+        """Set up this PC's robot in one go: arm, real / fake, IPs, gripper, F/T sensor (the base), ROS domain and
+        network, and cameras to add. Restarts the robot stack when any of those but the cameras changes."""
+        new = R.check(robot, mode, ip, ft_ip, domain, net, servo)
+        label = R.ROBOTS[new["robot"]]["label"]
+        gone = R.missing(new["robot"])
+        if gone:
+            raise R.RobotError(f"{label} is not set up on this PC: " + "; ".join(gone))
+        base = R.base_of(new["robot"], str(gripper), str(ft))
+        run = R.running(self.core.fake)
+        if run is None:
+            raise R.RobotError("setting up the robot restarts the robot stack, and this GUI was not started by the "
+                               "launcher (ur7e_gui.sh)")
+        types = {t["type"]: t for t in SV.Services.types_view(self.drivers.have) if t["kind"] == "camera"}
+        add = [str(c) for c in (cameras or [])]
+        for c in add:
+            if c not in types:
+                raise R.RobotError(f"no camera type '{c}' (one of {', '.join(types)})")
+            if not types[c]["installed"]:
+                raise R.RobotError(f"{types[c]['label']} is not installed on this PC: {types[c]['install']}")
+        restart = new != run or base != self.running_base()
+        if restart:
+            why = self._restart_refusal()
+            if why:
+                raise R.RobotError(why)
+            if not self.core.fake and self.core.mode not in ("unknown",) \
+                    and not self.core.modes.mode_supports_moveit(self.core.mode):
+                raise R.RobotError(f"change to Position first (now '{self.core.mode}')")
+            if not confirm:
+                raise R.RobotError("confirm the setup (the robot stack restarts)")
+        added = []
+        for c in add:
+            rows = self.drivers.view()["services"]
+            if any(x["type"] == c for x in rows):           # a second one would fight the first for the camera:
+                continue                                    # add it in Drivers & cameras, with its serial number
+            have = {x["name"] for x in rows}
+            name = next(n for n in [c] + [f"{c}_{i}" for i in range(2, 99)] if n not in have)
+            self.drivers.save({"name": name, "label": types[c]["label"], "type": c, "params": {}, "autostart": True})
+            added.append(types[c]["label"])
+        R.write_next(config_dir(), **new)
+        B.write_next(config_dir(), base)
+        parts = [label, new["mode"], B.BASES[base][0].lower(), f"ROS domain {new['domain']}", R.NETS[new["net"]][0].lower(),
+                 f"continuous jog {new['servo']}"] + ([f"camera {', '.join(added)} added"] if added else [])
+        if restart:
+            self._restart(RESTART_STACK, "robot set up: " + ", ".join(parts))
+            return self._ok(", ".join(parts) + ": restarting the robot stack and the GUI (about a minute)",
+                            restart="stack", robot=self.robot_setup_view())
+        return self._ok("saved: " + ", ".join(parts) + " (nothing to restart)", robot=self.robot_setup_view())
+
+    # ------------------------------------------------------------------ profiles
+    def _setups(self, owner="") -> Setups:
+        """The setups of profile `owner` ("" = the shared ones)."""
+        if not str(owner or "").strip():
+            return self.setups
+        o = self.profiles.find(owner)
+        return Setups(config_dir(), self.core.profile.name, owner=o, root=self.profiles.setups_dir(o))
+
+    def cmd_profile_list(self):
+        return self._ok(profiles=self.profiles.list(), in_use=self.setups.in_use())
+    cmd_profile_list.read_only = True
+
+    def cmd_profile_create(self, name):
+        n = self.profiles.create(str(name))
+        self.core.bridge.log(f"profile '{n}' ready")
+        return self._ok(f"profile '{n}' ready", name=n, profiles=self.profiles.list())
+    cmd_profile_create.read_only = True       # picking who you are needs no control of the robot
+
+    def cmd_profile_delete(self, name):
+        n = self.profiles.find(str(name))
+        self.profiles.delete(n)
+        return self._ok(f"profile '{n}' deleted", profiles=self.profiles.list())
+
+    def cmd_profile_prefs_get(self, name):
+        return self._ok(prefs=self.profiles.prefs(str(name)))
+    cmd_profile_prefs_get.read_only = True
+
+    def cmd_profile_prefs_save(self, name, prefs=None):
+        self.profiles.save_prefs(str(name), prefs or {})
+        return self._ok()
+    cmd_profile_prefs_save.read_only = True   # the screen layout, not the robot
+
+    def cmd_profile_prefs_copy(self, name, source):
+        d = self.profiles.copy_prefs(str(source), str(name))
+        return self._ok(f"layout copied from {self.profiles.find(str(source))}", prefs=d)
+    cmd_profile_prefs_copy.read_only = True
+
     # ------------------------------------------------------------------ setups
     def setup_current(self) -> dict:
         """The setup in use and what changed since it was saved or loaded (read from disk: call it rarely)."""
-        n = self.setups.current()
-        out = {"name": n, "changed": [], "base_changed": False, "present": self.setups.present()}
+        u = self.setups.in_use()
+        try:
+            S = self._setups(u["owner"])
+        except ProfileError:
+            S = self.setups
+        n = S.current()
+        out = {"name": n, "owner": S.owner if n else "", "changed": [], "base_changed": False,
+               "present": self.setups.present()}
         if n:
             try:
-                out["changed"] = self.setups.changes(n)
-                b = str(self.setups.info(n).get("base") or "")
+                out["changed"] = S.changes(n)
+                b = str(S.info(n).get("base") or "")
                 out["base_changed"] = bool(b) and b != self.running_base()
             except Exception as e:
                 out["error"] = str(e)
@@ -580,17 +722,27 @@ class WorkcellCommands:
             except Exception as e:
                 v = {"name": "", "changed": [], "base_changed": False, "present": [], "error": str(e)}
                 self._setup_cache = (time.monotonic(), v)
-        return {k: v[k] for k in ("name", "changed", "base_changed")}
+        return {k: v.get(k, "") for k in ("name", "owner", "changed", "base_changed")}
 
-    def cmd_setup_list(self):
-        return self._ok(setups=self.setups.list(), base=self.base_view(), current=self.setup_current())
+    def cmd_setup_list(self, owner=""):
+        S = self._setups(owner)
+        return self._ok(setups=S.list(), owner=S.owner, base=self.base_view(), current=self.setup_current(),
+                        profiles=self.profiles.list(), robot=self.robot_view(), guide=self.setup_guide())
     cmd_setup_list.read_only = True
 
-    def cmd_setup_preview(self, name):
+    def cmd_setup_copy(self, source_owner, name, owner="", new_name="", replace=False):
+        """Copy a setup from another profile (or Shared) into profile `owner`."""
+        S = self._setups(owner)
+        n = S.copy_from(self._setups(source_owner), str(name), str(new_name or ""), bool(replace))
+        return self._ok(f"setup '{name}' copied to {S.owner or 'Shared'} as '{n}'", setups=S.list(), owner=S.owner,
+                        current=self.setup_current())
+
+    def cmd_setup_preview(self, name, owner=""):
         """What loading setup `name` changes: the files, the base, and what restarts."""
-        info = self.setups.info(str(name))
-        changes = self.setups.changes(str(name))
-        d = self.setups._path(str(name)) / "files"
+        S = self._setups(owner)
+        info = S.info(str(name))
+        changes = S.changes(str(name))
+        d = S._path(str(name)) / "files"
         rel = S_members(self.core.profile.name)["parts"]
         m = self._base_model()
         stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(d / rel), m).values())
@@ -601,18 +753,33 @@ class WorkcellCommands:
                         holds=info.get("holds", []), note=info.get("note", ""), saved=info.get("saved", ""))
     cmd_setup_preview.read_only = True
 
-    def cmd_setup_save(self, name, note="", replace=False):
-        holds = self.setups.save(str(name), str(note or ""), bool(replace), base=self.running_base())
-        self.core.bridge.log(f"setup '{name}' saved: {', '.join(holds) or 'nothing to save yet'}")
-        return self._ok(f"setup '{name}' saved ({len(holds)} item(s))", setups=self.setups.list(), base=self.base_view(),
+    def _cameras_on(self) -> list:
+        """The camera drivers this robot runs now: running, or started with the GUI."""
+        return [x["name"] for x in self.drivers.view()["services"]
+                if x["kind"] == "camera" and (x["state"] not in ("stopped", "failed", "missing") or x["autostart"])]
+
+    def setup_guide(self) -> dict:
+        """What the Setups page's step list shows: the parts, the cameras and their calibrations now."""
+        cams = [{"name": x["name"], "label": x["label"], "state": x["state"]}
+                for x in self.drivers.view()["services"] if x["kind"] == "camera"]
+        return {"parts": list(self.parts.ordered()), "cameras": cams, "on": self._cameras_on(),
+                "calibrations": [c["name"] for c in self.cams.view()]}
+
+    def cmd_setup_save(self, name, note="", replace=False, owner=""):
+        S = self._setups(owner)
+        holds = S.save(str(name), str(note or ""), bool(replace), base=self.running_base(), cameras=self._cameras_on())
+        who = f" in {S.owner}" if S.owner else ""
+        self.core.bridge.log(f"setup '{name}'{who} saved: {', '.join(holds) or 'nothing to save yet'}")
+        return self._ok(f"setup '{name}' saved{who} ({len(holds)} item(s))", setups=S.list(), owner=S.owner,
+                        base=self.base_view(), current=self.setup_current())
+
+    def cmd_setup_delete(self, name, owner=""):
+        S = self._setups(owner)
+        S.delete(str(name))
+        return self._ok(f"setup '{name}' deleted", setups=S.list(), owner=S.owner, base=self.base_view(),
                         current=self.setup_current())
 
-    def cmd_setup_delete(self, name):
-        self.setups.delete(str(name))
-        return self._ok(f"setup '{name}' deleted", setups=self.setups.list(), base=self.base_view(),
-                        current=self.setup_current())
-
-    def cmd_setup_load(self, name):
+    def cmd_setup_load(self, name, owner=""):
         why = self._restart_refusal()
         if why:
             raise P.PartError(why)
@@ -621,7 +788,18 @@ class WorkcellCommands:
         if self.on_restart is None:
             raise P.PartError("loading a setup restarts the GUI, and this GUI was not started by the launcher "
                               "(ur7e_gui.sh)")
-        r = self.setups.load(str(name), base=self.running_base())
+        r = self._setups(owner).load(str(name), base=self.running_base(), cameras=self._cameras_on())
+        if r.get("cameras") is not None:                  # its cameras start with the GUI, the others stop
+            for x in self.drivers.view()["services"]:
+                if x["kind"] != "camera":
+                    continue
+                on = x["name"] in r["cameras"]
+                self.drivers.set_autostart(x["name"], on)
+                if not on and x["state"] not in ("stopped", "failed", "missing"):
+                    try:
+                        self.drivers.stop(x["name"])
+                    except Exception as e:  # noqa: BLE001 - the load is done; say why the camera kept running
+                        self.core.bridge.log(f"setup '{name}': could not stop {x['name']}: {e}")
         # the new files are in place: does the running robot model have the setup's parts, on the setup's base?
         new = P.PartStore(self.parts.path)
         m = self._base_model()

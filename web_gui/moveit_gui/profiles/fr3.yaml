@@ -1,0 +1,62 @@
+# Franka FR3 (+ Franka Hand, optional ATI F/T) with aarch-uol/fr3_scraping_ws (franka_scraping:jazzy image):
+# ur7e_gui.sh starts  ros2 launch franka_fr3_moveit_config moveit.launch.py controller_type:=position  in it.
+# Names checked against that stack with use_fake_hardware:=true [fr3_ws]: joints, MoveIt group fr3_arm
+# (chain fr3_link0 -> fr3_hand_tcp), fr3_arm_controller (JointTrajectoryController), the F/T broadcaster topic;
+# the hand's control_msgs/GripperCommand action from franka_gripper's source.
+# Position mode only for now (no freedrive: hand-guide with the buttons on the arm).
+name: fr3
+display_name: Franka FR3
+robot_ip: 169.254.104.177
+joint_names: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+joint_prefix: ""
+moveit:
+  group: fr3_arm                       # [fr3_ws] SRDF
+  base_link: fr3_link0                 # [fr3_ws] chain base
+  planning_link: fr3_hand_tcp          # [fr3_ws] chain tip
+  use_move_group_action: true
+  default_velocity_scaling: 0.1
+  default_acceleration_scaling: 0.1
+  planning_timeout_s: 60.0
+  max_cartesian_speed_mm_s: 200.0
+  cartesian_accel_mm_s2: 500.0
+  joint_accel_limit_rad_s2: 5.0
+tcps:
+  default: fr3_hand_tcp
+  model_links:
+    fr3_hand_tcp: {link: fr3_hand_tcp, moveit_target: true}
+    fr3_link8: {link: fr3_link8}
+tf_frames: [base, fr3_link0, fr3_link8, fr3_hand_tcp]
+state:
+  joint_state_timeout_s: 0.5
+  tf_timeout_s: 0.5
+topics:
+  joint_states: /joint_states
+  wrench: /ft/force_torque_sensor_broadcaster/wrench   # [fr3_ws] with load_ft_sensor:=true
+services:
+  controller_manager: /controller_manager
+control_modes:
+  default: position
+  modes:
+    position:
+      label: Position
+      activate: [fr3_arm_controller]
+      command_interface: position
+      command_source: trajectory
+      moveit_controller: fr3_arm_controller
+      supports_moveit: true
+  managed: [fr3_arm_controller]
+  stationary_joint_velocity: 0.01
+gripper:
+  enabled: true
+  model: Franka Hand
+  action_type: gripper_command                 # [fr3_ws] control_msgs/action/GripperCommand
+  # [franka_gripper] franka_gripper_node (gripper.launch.py, started by ur7e_gui.sh: fr3_scraping_ws's moveit.launch.py
+  # does not start it). MoveIt's own fr3_gripper controller points at /fr3_gripper/gripper_action, which nothing serves.
+  action: /franka_gripper/gripper_action
+  joint_name: fr3_finger_joint1                # [fr3_ws] one finger: half the opening
+  open_position: 0.04                          # [franka_gripper] width = 2 x position (0.08 m fully open)
+  closed_position: 0.0
+  max_effort: 20.0
+  effort_limit: 70.0                           # [Franka Hand] 70 N continuous
+waypoints:
+  ready: {joints: [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]}   # [fr3_ws] SRDF "ready", the start pose

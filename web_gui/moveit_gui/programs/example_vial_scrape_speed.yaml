@@ -1,0 +1,101 @@
+# Vial scrape with set TCP speeds (mm/s): example_franka_scraping_baseline with a mm/s on every straight move.
+# Speeds: to the rim 15 mm/s, scrape down the wall 5 mm/s, back up the wall + orbit 10 deg 15 mm/s, final lift
+# 30 mm/s. Everything else (vial fixture, TCP, forces, 37 angles) is as in the baseline: read its notes below.
+# BEFORE THE ROBOT: run with SPEED at 25 % first and read the MoveL lines in the log.
+#
+# The Franka sample_scraping baseline (~/franka_ros2/sample_scraping/scripts/scraping.py, what `robot_demo` runs),
+# rebuilt in PROGRAMS. Vial: fixture "vial" = vial centre at the bottom, base axes. scraping.py's values: vial at
+# target_xyz [0.525, 0.016, 0.040] m in the robot base (the profile's example vial), radius 17 mm, wall 40 mm,
+# approach 50 mm above the top, 37 angles 10 deg apart from -110 deg, scrape to 1 mm below the origin
+# (depth_offset), tool RPY [0, 180+10.3, angle+180] deg.
+# Steps as in scraping.py: approach above the centre, then to the rim at the start angle; per angle: preload
+# (Fz -2 N, Ty 0.5 Nm), press (Fx 5 N, Ty 2 Nm), 0.5 s, press + down force (Fz -1 N), scrape down the wall,
+# relax 0.25 s, 1 s, then up the wall and orbit 10 deg about the vial axis to the next angle; a failed move skips
+# that angle (on_fail: continue). End: zero wrench, lift 150 mm, ready.
+# Not carried over: the relax torque is 2 Nm (the profile limit), not 3; Franka's pose-error compensation and the
+# joint-7 turn before ready. F/T is zeroed in free air at the approach (Zero now: tool weight kept).
+# FIRST: SETUP > Vial Geometry: teach the vial (touch the rim, Save), or Vial profiles > baseline > Use for scraping.py's
+# position (only right if your vial is really there). The 3D preview shows the example vial until one is taught.
+# TCP: the poses use `tcp: active`, so whichever TCP is selected (top bar) goes there: select your spatula tip
+# TCP and the tip touches the rim. (A named TCP, e.g. robotiq_tcp, would put that one there and a longer tool
+# would end up lower, inside the vial.)
+# BEFORE THE ROBOT: check the tool orientation of "approach" / "rim_start" for your spatula in the preview, set
+# Admittance compliance for X (press) and Z, and try 2-3 angles first (loop times).
+version: 2
+name: example_vial_scrape_speed
+robot: ur7e_lab
+waypoints:
+  approach:
+    pose:
+      frame: vial
+      tcp: active
+      position: [0.0, 0.0, 0.09]
+      quat_xyzw: [0.571255, -0.815837, 0.051552, 0.073624]
+  rim_start:
+    pose:
+      frame: vial
+      tcp: active
+      position: [-0.005814, -0.015975, 0.04]
+      quat_xyzw: [0.571255, -0.815837, 0.051552, 0.073624]
+steps:
+- {type: comment, text: 'Franka sample_scraping baseline (scraping.py) rebuilt in PROGRAMS: 37 angles, 10 deg apart
+    from -110 deg; press Fx 5 N + Ty 2 Nm, scrape the wall down, relax, next angle'}
+- {type: controller, mode: position}
+- {type: movej, target: ready, velocity: 0.2}
+- {type: move_pose, target: approach, cartesian: false, velocity: 0.1}
+- {type: zero_ft}
+- {type: controller, mode: admittance}
+- {type: move_pose, target: rim_start, cartesian: true, velocity: 0.1, speed_mm_s: 15}
+- type: loop
+  times: 37
+  steps:
+  - type: force
+    wrench: [0.0, 0.0, -2.0, 0.0, 0.5, 0.0]
+    frame: tool
+    wait: false
+  - type: force
+    wrench: [5.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+    frame: tool
+    wait: false
+  - {type: wait, seconds: 0.5}
+  - type: force
+    wrench: [5.0, 0.0, -1.0, 0.0, 2.0, 0.0]
+    frame: tool
+    wait: false
+  - type: move_relative
+    offset_mm: [0.0, 0.0, -41.0]
+    rotate_deg: [0.0, 0.0, 0.0]
+    frame: vial
+    cartesian: true
+    speed_mm_s: 5
+    velocity: 0.02
+    on_fail: continue
+  - type: force
+    wrench: [-5.0, 0.0, 0.0, 0.0, -2.0, 0.0]
+    frame: tool
+    wait: false
+  - {type: wait, seconds: 0.25}
+  - type: force
+    wrench: [0.0, 0.0, -2.0, 0.0, 0.5, 0.0]
+    frame: tool
+    wait: false
+  - type: move_relative
+    offset_mm: [0.0, 0.0, 41.0]
+    rotate_deg: [0.0, 0.0, 10.0]
+    frame: vial
+    cartesian: true
+    speed_mm_s: 15
+    velocity: 0.05
+    on_fail: continue
+    pivot: frame
+  - {type: wait, seconds: 1.0}
+- {type: force_off}
+- type: move_relative
+  offset_mm: [0.0, 0.0, 150.0]
+  rotate_deg: [0.0, 0.0, 0.0]
+  frame: vial
+  cartesian: true
+  speed_mm_s: 30
+  velocity: 0.05
+- {type: controller, mode: position}
+- {type: movej, target: ready, velocity: 0.2}

@@ -1,0 +1,29 @@
+# Starts the web GUI (~/ur7e_gui.sh) when the PC starts. A systemd user service: it runs as you, with your
+# Docker access and your saved robot choice (SETUP > Setups > Hardware…). Install (docs/SETUP_WEB.md):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/ws/src/moveit_gui/scripts/ur7e_gui.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ur7e_gui
+#   sudo loginctl enable-linger $USER          # start at boot, before anyone logs in
+#
+# Log: journalctl --user -u ur7e_gui -f      Stop: systemctl --user stop ur7e_gui
+[Unit]
+Description=UR7e web GUI (ur7e_gui.sh)
+
+[Service]
+Type=simple
+# Docker and Tailscale come up with the PC: wait for them (up to 2 min), else the GUI would listen on
+# 127.0.0.1 only
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 2; done; for i in $(seq 1 60); do tailscale ip -4 >/dev/null 2>&1 && break; sleep 2; done; true'
+ExecStart=%h/ur7e_gui.sh
+# like Ctrl-C: the launcher stops the GUI, then the robot stack (up to ~45 s)
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+SuccessExitStatus=130
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

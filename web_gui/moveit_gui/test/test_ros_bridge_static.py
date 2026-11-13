@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-STUBS = ["rclpy", "rclpy.action", "rclpy.callback_groups", "rclpy.executors", "rclpy.node", "rclpy.qos",
+STUBS = ["rclpy", "rclpy.action", "rclpy.callback_groups", "rclpy.executors", "rclpy.node", "rclpy.qos", "rclpy.serialization",
          "rclpy.time", "builtin_interfaces", "builtin_interfaces.msg", "controller_manager_msgs",
          "controller_manager_msgs.srv", "geometry_msgs", "geometry_msgs.msg", "sensor_msgs", "sensor_msgs.msg",
          "std_msgs", "std_msgs.msg", "std_srvs", "std_srvs.srv", "lifecycle_msgs", "lifecycle_msgs.msg"]
@@ -268,7 +268,10 @@ def test_program_running_is_cleared_when_the_arm_stops_running_and_set_by_the_da
     def answer(state, success=True, text=""):
         fut.result.return_value = mock.MagicMock(success=success, answer=text, state=mock.MagicMock(state=state))
         b._on_dashboard_program(fut)
-    answer("PLAYING")                                                    # Play pressed
+    answer("PLAYING")                     # a program plays, but the driver never saw External Control connect
+    assert b._snap.program_running is False and b._snap.program_state == "PLAYING"
+    b._on_prog(mock.MagicMock(data=True))                                # External Control connected
+    answer("PLAYING")
     assert b._snap.program_running is True and b._snap.program_state == "PLAYING"
     answer("", success=False, text="timeout")                            # no answer: keep what we know
     assert b._snap.program_running is True
@@ -322,3 +325,21 @@ def test_pause_in_admittance_holds_at_the_reference_instead_of_cancelling(ros_br
     b2.cancel_motion()
     b2._fjt_cancel["admittance_trajectory_controller"].call_async.assert_called()
     b2._execute_handle.cancel_goal_async.assert_called()
+
+
+def test_joint_states_are_read_at_about_100_hz(ros_bridge_module):
+    """500 Hz arm + the gripper on /joint_states: messages that come too soon are dropped without decoding."""
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b._t_grip_msg = 0.0
+    seen = []
+    rb.deserialize_message = lambda data, cls: seen.append(data) or mock.MagicMock()
+    b._on_joints = lambda msg: setattr(b, "_t_joints", rb.time.monotonic())
+    b._t_grip_msg = rb.time.monotonic()                  # gripper fresh too
+    b._t_joints = rb.time.monotonic()
+    for _ in range(5):
+        b._on_joints_raw(b"x")                           # 5 messages within 10 ms: none decoded
+    assert seen == []
+    b._t_joints -= 0.02                                  # the arm is due
+    b._on_joints_raw(b"y")
+    assert seen == [b"y"]

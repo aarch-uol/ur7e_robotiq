@@ -118,13 +118,74 @@ const modeLabel = (n) => INFO.modes.find((m) => m.name === n)?.label || n;
 function gate(el, cond = true) { el.disabled = !(holds && cond); }
 
 // ------------------------------------------------------------------- lease
-// operator name, asked once per browser, so the header says who has control (not just an IP)
+// The profile: who you are (Cenk, Ayesha, ...), asked once per browser. The others see the name, and who has control.
+// Your setups (SETUP › Setups) and your screen layout are kept under it on the robot PC (moveit_gui/user_profiles.py).
+const PREF_KEYS = ["op-joints", "op-layouts1", "pg-jog-open", "pg-path", "v3-frames", "v3-pose", "v3-show", "v3-zones"];   // sorted
+const scmd = (name, args = {}) => post("/api/cmd", { cmd: name, args }, true);
+const localPrefs = () => Object.fromEntries(PREF_KEYS.map((k) => [k, localStorage.getItem(k)]).filter(([, v]) => v != null));
+let prefsSynced = null;                     // JSON of the layout as last read from / saved to the profile
+async function profilePrefs(name, reload) {
+  // the profile's layout replaces this browser's; a profile with none yet gets this browser's
+  const r = await scmd("profile_prefs_get", { name });
+  if (!r.ok) { prefsSynced = null; return; }
+  const local = localPrefs();
+  if (!Object.keys(r.prefs).length) {
+    prefsSynced = JSON.stringify(local);
+    if (Object.keys(local).length) scmd("profile_prefs_save", { name, prefs: local });
+    return;
+  }
+  const sorted = (o) => JSON.stringify(Object.fromEntries(Object.entries(o).sort()));
+  prefsSynced = sorted(r.prefs);
+  if (sorted(local) === prefsSynced) return;
+  for (const k of PREF_KEYS) if (!(k in r.prefs)) localStorage.removeItem(k);
+  for (const [k, v] of Object.entries(r.prefs)) localStorage.setItem(k, v);
+  if (reload) location.reload();
+}
+setInterval(() => {                         // a changed layout goes to the profile (5 s)
+  const n = localStorage.getItem("operator");
+  if (!n || prefsSynced == null) return;
+  const now = JSON.stringify(localPrefs());
+  if (now !== prefsSynced) { prefsSynced = now; scmd("profile_prefs_save", { name: n, prefs: localPrefs() }); }
+}, 5000);
 async function operatorName(force) {
   let n = localStorage.getItem("operator") || "";
   if (!n || force) {
-    const v = await askText("Your name\n\nShown to the others who have this GUI open, and as the person in control.", n,
-      { maxLength: 24, placeholder: "e.g. Cenk" });
-    if (v != null) { n = v.trim().slice(0, 24); localStorage.setItem("operator", n); post("/api/hello", { bid: BID, name: n }, true); }
+    const r = await scmd("profile_list");
+    const names = r.ok ? r.profiles.map((p) => p.name) : [];
+    const sel = h("select", { style: "min-width:160px" }, ...names.map((x) => h("option", { value: x }, x)),
+      h("option", { value: "+" }, "New profile…"));
+    sel.value = names.find((x) => x.toLowerCase() === n.toLowerCase()) || names[0] || "+";
+    const nw = h("input", { type: "text", maxLength: 24, placeholder: "your name, e.g. Cenk", style: "width:180px" });
+    const nwRow = h("div", { class: "row" }, "Name", nw);
+    const others = h("select", {}, h("option", { value: "" }, "keep the layout it has"),
+      ...names.map((x) => h("option", { value: x }, `copy ${x}'s layout`)));
+    const paint = () => { nwRow.hidden = sel.value !== "+"; others.hidden = !names.length; };
+    sel.onchange = paint;
+    paint();
+    const form = h("div", { style: "display:flex;flex-direction:column;gap:8px" }, h("div", { class: "row" }, "Profile", sel), nwRow,
+      h("div", { class: "row" }, "Layout", others));
+    const v = await ask("Who are you?\nYour profile keeps your setups (SETUP › Setups) and your screen layout. The others see the name, " +
+      "and who has control.", { content: form, result: () => ({ name: sel.value === "+" ? nw.value.trim() : sel.value, copy: others.value }) });
+    if (v && v.name) {
+      let name = v.name;
+      if (sel.value === "+") {
+        const c = await cmd("profile_create", { name });
+        if (!c.ok) return n;
+        name = c.name;
+      }
+      if (v.copy && v.copy.toLowerCase() !== name.toLowerCase()) {
+        const c = await cmd("profile_prefs_copy", { name, source: v.copy });
+        if (!c.ok) return n;
+      }
+      const changed = name !== n || v.copy;
+      n = name;
+      localStorage.setItem("operator", n);
+      post("/api/hello", { bid: BID, name: n }, true);
+      if (changed) {
+        pages.SETUP?.wc?.W?.setups?.showOwner?.(n);
+        await profilePrefs(n, true);            // the profile's layout: the page reloads if it differs
+      }
+    }
   }
   return n;
 }
@@ -182,6 +243,7 @@ function usersToggle(e) {
   };
   document.addEventListener("pointerdown", off, true); document.addEventListener("keydown", off, true);
 }
+let robotAsked = false;
 async function askControl() {
   const r = await post("/api/ask", { bid: BID }, true);
   toast(r.msg || (r.ok ? "asked" : "failed"), !!r.ok);
@@ -524,7 +586,7 @@ pages.OPERATE = {
     // more windows for your own layouts: Motion planner, Joint chart, Program run, Log (panels.js)
     this.xv = extraViews({ h, btn, cmd, pcmd, INFO, getS: () => S, op: this, navTo, logs });
     this.vg = workspace({ h, cmd, toast, view3d: v3box, ftEl: this.ftc.el, ftBtn: $("#op-ft-show", ft), extra: this.xv,
-      cards: { manual, fts: ft, robot, arm: stack, grip, joints: jmCard }, header: $("#h-layouts"),
+      cards: { manual, fts: ft, robot, arm: stack, grip, joints: jmCard }, header: $("#h-layouts"), navSlot: $("#nav-lay"),
       onEdit: () => navTo("OPERATE") });
     el.append(this.vg.el);
     this.mode = "j";
@@ -737,7 +799,7 @@ pages.OPERATE = {
   // other frames are asked for at most once a second)
   async followCart(s) {
     const frame = $("#op-frame").value;
-    let p = frame === INFO.base_link ? s.tcp : null;
+    let p = frame === INFO.base_link && s.tcp && !s.tcp.stale ? s.tcp : null;
     if (!p && frame && Date.now() - (this.cartAt || 0) > 1000) {
       this.cartAt = Date.now();
       const r = await post("/api/cmd", { cmd: "current_pose", args: { frame } }, true);
@@ -828,7 +890,7 @@ pages.OPERATE = {
       "Pause the robot program: the arm halts, power and brakes stay on. A GUI program run pauses with it.");
     this.pStopProg = btn("■ Stop program", "quiet", async () => (await ask("Stop the robot program?\n\nThe arm halts; power and brakes stay on. " +
       "▶ Play starts it again from the beginning. A GUI program run pauses and can resume after Play.")) && cmd("robot_stop_program"),
-      "Stop the robot program (power and brakes stay on)");
+      "Stop the program on the pendant (External Control): power and brakes stay on");
     const step = (n, b, label) => {
       const el = h("div", { class: "pstep", id: `op-ps${n}` }, h("span", { class: "pnum" }, String(n)),
         INFO.local || INFO.remote_power || n === 3 ? b : h("span", { class: "muted" }, label + " (robot PC / pendant)"));
@@ -838,7 +900,7 @@ pages.OPERATE = {
     // icons + short words; the full explanation is in each button's hover text
     const ib = (b, ic, t) => { b.innerHTML = icon(ic) + (t ? `<span>${t}</span>` : ""); b.classList.add("ibtn"); return b; };
     ib(this.pOff, "power", ""); this.pOff.title = "Power off… (UR Dashboard)";
-    ib(this.pPause, "pause", "Pause"); ib(this.pStopProg, "stop", "Stop"); ib(this.pResume, "play", "Resume");
+    ib(this.pPause, "pause", "Pause pendant"); ib(this.pStopProg, "stop", "Stop pendant"); ib(this.pResume, "play", "Resume");
     ib(this.pPlay, "play", "Play program");
     return h("div", { class: "card", id: "op-robot" },
       h("div", { class: "row chead" }, h("span", { class: "ctitle grow" }, "Robot"),
@@ -858,7 +920,8 @@ pages.OPERATE = {
       BACKDRIVE: "Backdrive", "?": "Robot mode unknown" }[rm] || rm;
     const safety = s.safety_mode && s.safety_mode !== "NORMAL" ? nice(s.safety_mode) : "";
     st.textContent = safety || label;
-    $("#op-rsub").textContent = safety ? label : running ? (prog === true ? "Pendant program running" : paused
+    $("#op-rsub").textContent = safety ? label : running ? (prog === true ? "Pendant program running" : s.program_state === "PLAYING"
+      ? "A pendant program plays, but not External Control for this PC (set its Host IP to this PC)" : paused
       ? "Pendant program paused" : "Pendant program stopped") : "";
     const cls = safety ? "bad" : running && prog === true ? "ok" : "warn";
     st.className = "rstate " + cls;
@@ -908,6 +971,7 @@ pages.OPERATE = {
     if (this.jm) this.jm.update(s);
     if (this.ftc) this.ftc.push(s);
     if (this.xv) for (const x of Object.values(this.xv)) x.update(s);
+    if (this.vg) this.vg.update(s);
     // Untouched fields follow the arm, so a MoveJ never sends a joint back to a stale value.
     if (s.joints_deg) s.joints_deg.forEach((v, i) => setField(`#op-j${i}`, v, false));
     if (this.mode === "c") this.followCart(s);
@@ -945,6 +1009,8 @@ pages.OPERATE = {
       `<span><span class="k">${jshort(n)}</span><span class="v">${jd[i] == null ? "—" : jd[i].toFixed(1)}°</span></span>`).join("");
     const p = s.tcp;
     // X Roll / Y Pitch / Z Yaw side by side: one short block instead of six lines
+    $("#op-pose").classList.toggle("muted", !!(p && p.stale));
+    $("#op-pose").title = p && p.stale ? "TF is late: the last pose, held for up to 2 s" : "";
     $("#op-pose").innerHTML = p ? [0, 1, 2].map((i) =>
       `<span class="k">${"XYZ"[i]}</span><span class="v">${fmt(p.xyz_mm[i])} mm</span>` +
       `<span class="k">${["Roll", "Pitch", "Yaw"][i]}</span><span class="v">${fmt(p.rpy_deg[i])} °</span>`).join("") : "<span class='muted'>no pose</span>";
@@ -1364,8 +1430,10 @@ pages.PROGRAMS = {
       btn("Close", "", () => cmd("gripper", { percent: 100, effort: gripForce() })),
       h("span", { class: "mono muted", id: "pg-grip-pct" })) : null;
     if (grip) grip.querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1", b.dataset.grip = "1", b.dataset.tip = ""));
-    const drawer = h("details", { class: "pg-drawer", id: "pg-drawer", open: true,
-      ontoggle: (e) => { if (current === "PROGRAMS") dockJog(e.target.open ? $("#pg-jog") : null); } },
+    // closed by default so the commands start at the top; it stays as the user left it
+    const drawer = h("details", { class: "pg-drawer", id: "pg-drawer", open: localStorage.getItem("pg-jog-open") === "1",
+      ontoggle: (e) => { localStorage.setItem("pg-jog-open", e.target.open ? "1" : "0");
+        if (current === "PROGRAMS") dockJog(e.target.open ? $("#pg-jog") : null); } },
       h("summary", { class: "section" }, "Jog & gripper (move the arm, then add a MoveJ / MoveL here)"),
       h("div", { id: "pg-jog" }), grip);
     const insertTab = h("div", { class: "col", id: "pg-t-insert" },
@@ -1462,7 +1530,7 @@ pages.PROGRAMS = {
       h("span", { class: "state", id: "pg-state" }, "READY"),
       btn("▶ RUN", "primary", () => this.run(false)), btn("Step", "", () => this.run(true)),
       btn("Pause", "", () => (S.runner.state === "PAUSED" ? pcmd("program_resume") : pcmd("program_pause"))),
-      btn("■ STOP", "danger", () => pcmd("program_stop")),
+      btn("■ Stop program", "stopo", () => pcmd("program_stop"), "Stop this program run (the red STOP in the top bar stops everything)"),
       h("span", { class: "badge hidden", id: "pg-loops" }),
       h("span", { class: "muted small", id: "pg-pause-why" }),
       h("div", { class: "grow" }),
@@ -2219,7 +2287,7 @@ pages.AUTOMATION = {
         h("div", { class: "row" },
           btn("Prepare", "", () => cmd("policy_prepare", { name: this.sel, recording: this.rec() })),
           btn("▶ Run", "primary", () => this.run()),
-          btn("■ STOP POLICY", "danger", () => cmd("policy_stop"))))));
+          btn("■ Stop policy", "stopo", () => cmd("policy_stop"), "Stop the policy (the red STOP in the top bar stops everything)")))));
     [this.prep, this.runB, this.stopB] = el.querySelectorAll(".card:last-child .row:last-child .btn");
     if (INFO.policies.length) this.select(INFO.policies[0].name);
   },
@@ -2273,11 +2341,11 @@ pages.AUTOMATION = {
   update(s) {
     this.requirements();
     const pol = s.policy, fb = pol.feedback, busy = pol.busy, running = busy && !!pol.current, preparing = busy && !pol.current;
-    const prepared = pol.prepared === this.sel;
-    const state = running ? "RUNNING" : preparing ? "PREPARING…" : prepared ? "READY TO RUN"
+    const prepared = !!this.sel && pol.prepared === this.sel;      // (no policy picked: nothing is ready to run)
+    const state = running ? "RUNNING" : preparing ? "PREPARING…" : !this.sel ? "NO POLICY PICKED" : prepared ? "READY TO RUN"
       : this.reqOk ? "NOT PREPARED" : "NOT READY";
     $("#au-state").textContent = state;
-    $("#au-dot").className = "dot " + (running || prepared ? "ok" : preparing || this.reqOk ? "warn" : "bad");
+    $("#au-dot").className = "dot " + (running || prepared ? "ok" : !this.sel ? "off" : preparing || this.reqOk ? "warn" : "bad");
     this.prep.title = this.reqOk ? "Moves to the start, measures the force baseline, checks the policy files" :
       "Fix the red checks first";
     this.prep.textContent = pol.result && !prepared ? "Prepare again" : "Prepare";
@@ -2286,7 +2354,7 @@ pages.AUTOMATION = {
     gate(this.prep, !!this.sel && this.reqOk && s.idle);
     gate(this.runB, prepared && this.reqOk && s.idle);
     this.stopB.classList.toggle("hidden", !busy);
-    this.stopB.textContent = preparing ? "■ Cancel prepare" : "■ STOP POLICY";
+    this.stopB.textContent = preparing ? "■ Cancel prepare" : "■ Stop policy";
     this.stopB.disabled = false;
     $("#au-live").classList.toggle("hidden", !(fb && (busy || fb.state === "baseline")));
     if (fb) {
@@ -2507,7 +2575,7 @@ pages.SETUP = {
       h("div", { class: "view3d su-v3", id: "su-v3" }, h("div", { class: "muted v3msg", id: "su-v3-msg" }, "Loading the robot model…")));
     // Parts, Camera calibration, Setups: workcell.js
     const lease = (b) => { b.dataset.lease = "1"; return b; };
-    this.wc = workcell({ h, btn, note, cmd, post, $, toast, ask, askText, lease, freedriveButton, fake: () => INFO.fake });
+    this.wc = workcell({ h, btn, note, cmd, post, $, toast, ask, askText, lease, freedriveButton, navTo, fake: () => INFO.fake });
     const pt = this.wc.buildParts(() => this.svPaint(true)), hc = this.wc.buildCalib(), st = this.wc.buildSetups();
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
     this.views["Camera calibration"] = h("div", { class: "cols" }, hc.left, hc.right);
@@ -3543,8 +3611,9 @@ pages.DIAGNOSTICS = {
 };
 
 // ===================================================================== shell
-function navTo(name) {
+function navTo(name, sub) {                  // sub: a SETUP item, e.g. "Drivers & cameras"
   if (pages[current] && pages[current].hide) pages[current].hide();
+  if (typeof sub === "string" && pages[name]) pages[name].sub = sub;
   current = name;
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.textContent === name));
   document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.dataset.page === name));
@@ -3594,6 +3663,8 @@ function robotSummary(s, progOff, healthy) {
     return [nice(s.safety_mode), "See the Robot card", "bad"];
   if (s.robot_mode !== "RUNNING")
     return [nice(s.robot_mode), s.robot_mode === "POWER_OFF" ? "Power on from the Robot card" : "Release the brakes on the Robot card", "bad"];
+  if (progOff && s.program_state === "PLAYING") return ["Not connected to the pendant program",
+    "A program plays, but its External Control host is another PC: set it to this PC, then Play", "bad"];
   if (progOff) return [s.program_state === "PAUSED" ? "Pendant program paused" : "Pendant program stopped",
     `Press ${s.program_state === "PAUSED" ? "Resume" : "Play"} program on the Robot card`, "bad"];
   return ["Ready", `Running · ${nice(s.safety_mode)}`, healthy ? "ok" : ""];
@@ -3628,7 +3699,7 @@ function renderHeader(s) {
   const rec = s.record && s.record.recording, rp = $("#h-rec");
   rp.hidden = !rec;
   const rb = $("#h-recbtn");
-  rb.textContent = rec ? "■ Stop" : "● Record";
+  rb.innerHTML = rec ? '■<span class="lbl"> Stop rec</span>' : '●<span class="lbl"> Record</span>';
   rb.classList.toggle("danger", !!rec);
   rb.disabled = rec ? !!rec.stopping : !holds;
   if (rec) {
@@ -3636,7 +3707,7 @@ function renderHeader(s) {
     rp.title = `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`;
   }
   const bad = Object.entries(s.connected || {}).filter(([, v]) => !v).map(([k]) => k);
-  $("#h-conn").innerHTML = bad.length ? icon("warn") + " " + bad.join(", ") + " off" : "";
+  $("#h-conn").innerHTML = bad.length ? icon("warn") + `<span class="ell">${bad.join(", ")} off</span>` : "";
   $("#h-conn").title = bad.length ? "Not connected: " + bad.join(", ") : "";
   $("#h-conn").hidden = !bad.length;
   document.body.classList.toggle("disconnected-parts", bad.length > 0);
@@ -3669,6 +3740,11 @@ function renderHeader(s) {
   $("#lease-who").onclick = async () => { await operatorName(true); if (holds) takeLease(); };
   usersRender(s);
   batchAsk(s);
+  // first time on this PC: nobody picked a robot yet, so ask the one in control (once per page load)
+  if (holds && s.workcell?.robot_chosen === false && !robotAsked && pages.SETUP?.wc?.W.pickRobot) {
+    robotAsked = true;
+    pages.SETUP.wc.W.pickRobot(true);
+  }
   document.body.classList.toggle("viewing", !holds);
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
   const viewer = INFO && INFO.role === "viewer";
@@ -3721,12 +3797,16 @@ function render() {
 
 async function boot() {
   INFO = await (await fetch("/api/info")).json();
-  $("#h-robot").textContent = INFO.robot + (INFO.fake ? "  [FAKE]" : "");
+  const me = localStorage.getItem("operator");
+  if (me) await profilePrefs(me, true);       // this profile's layout (changed in another browser: reload once)
+  $("#h-robot").replaceChildren(INFO.robot, ...(INFO.fake ? [" ", h("span", { class: "hchip fake", title: "Fake robot: no driver, nothing is sent to a robot" }, "FAKE")] : []));
+  document.body.classList.toggle("fake", !!INFO.fake);
   $("#h-robot").title = `${INFO.ur_type} · ${INFO.robot_ip} · profile ${INFO.profile}`;
   document.title = `MoveIt GUI — ${INFO.robot}`;
   const nav = $("#nav"), main = $("#main");
   for (const name of Object.keys(pages)) {
     nav.append(h("a", { onclick: () => navTo(name) }, name));
+    if (name === "OPERATE") nav.append(h("div", { class: "navlay", id: "nav-lay", hidden: true }));
     const el = h("div", { class: "page", "data-page": name });
     main.append(el);
     pages[name].build(el);
@@ -3791,7 +3871,15 @@ async function boot() {
     }
     else say(`${r.cmd}: ${r.msg}`, r.ok);
   });
-  es.onerror = () => { connected = false; render(); };   // the heartbeat, not the stream, decides the lease
+  let probing = false;
+  es.onerror = async () => {                               // the heartbeat, not the stream, decides the lease
+    connected = false; render();
+    if (probing) return;                                   // the robot stack was stopped: show its Start page
+    probing = true;
+    try { const r = await fetch("/api/info", { cache: "no-store" }); if (r.status === 503 && (await r.json()).stack === "stopped") location.reload(); }
+    catch (e) { /* down for a restart: EventSource retries */ }
+    setTimeout(() => { probing = false; }, 3000);
+  };
   navTo(Object.keys(pages).includes(location.hash.slice(1)) ? location.hash.slice(1) : "OPERATE");
 }
 boot();

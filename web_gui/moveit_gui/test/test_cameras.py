@@ -75,7 +75,7 @@ def test_cameras_page_status_preview_and_no_traffic_when_hidden(win):
     page = s.cameras
     rows = {r.topic: r for r in page.rows}
     assert rows["/camera/camera/color/image_rect_raw"].state.text() == "publishing"
-    assert rows["/zed/zed_node/rgb/image_rect_color"].state.text() == "no publisher"      # not set up yet
+    assert rows["/zed/zed_node/rgb/color/rect/image"].state.text() == "no publisher"      # not set up yet
     assert win.bridge.watched_image().topic == "/camera/camera/color/image_rect_raw"
     assert page.view.pixmap() is not None and not page.view.pixmap().isNull()
     assert "1280×720 · rgb8" in page.info.text()

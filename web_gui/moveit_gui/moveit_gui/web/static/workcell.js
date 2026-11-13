@@ -19,7 +19,7 @@ export function meshPartDefaults(file, parent, existing = [], scale = 0.001) {
 }
 
 export function workcell(ctx) {
-  const { h, btn, note, cmd, toast, lease, ask, askText } = ctx;
+  const { h, btn, note, cmd, toast, lease, ask, askText, navTo } = ctx;
   // the views are built once and only one is in the page at a time: look in the page, then in the hidden views
   const roots = [];
   const $ = (sel) => document.querySelector(sel) || roots.map((r) => r.querySelector(sel)).find(Boolean) || null;
@@ -417,6 +417,13 @@ export function workcell(ctx) {
     const r = await cmd("restart", { what });
     if (r.ok) toast(r.msg, true, true);
   }
+  async function stackStop() {
+    if (!(await ask("Stop the robot stack?\n\nFor when nobody uses the robot. The driver, controllers, MoveIt, the cameras and this GUI " +
+      "stop, so the PC is idle. The arm stays where it is. The address shows a page with Start robot stack; " +
+      "anyone (not a Viewer) can start it again there (about a minute).", { ok: "Stop stack" }))) return;
+    const r = await cmd("stack_stop", { who: localStorage.getItem("operator") || "" });
+    if (r.ok) toast(r.msg, true, true);
+  }
 
   // ================================================================ Camera calibration
   function buildCalib() {
@@ -572,21 +579,39 @@ export function workcell(ctx) {
     const words = (keys) => [...new Set((keys || []).map((k) => LABEL[k] ?? k).filter(Boolean))];
     const list = h("div", { class: "list", id: "st-list" }), autos = h("div", { class: "list", id: "st-auto" });
     const cur = h("div", { class: "st-cur", id: "st-current" }, "—");
+    // whose setups the list shows: a person's profile, or "" (the shared ones, saved before profiles existed)
+    let OWNER = null, PROFILES = [];
+    const ownerSel = h("select", { id: "st-owner", title: "Whose setups to show. Save puts the setup here." });
+    ownerSel.onchange = () => { OWNER = ownerSel.value; W.setups.load(); };
+    const ownerName = (o) => o || "Shared";
+    const isCur = (s) => CUR?.name === s.name && (CUR.owner || "") === (OWNER || "");
+    const steps = h("div", { class: "list", id: "st-steps" });
+    const guide = h("details", { class: "st-guide" }, h("summary", { class: "section", style: "cursor:pointer" }, "Make a new setup, step by step"), steps,
+      h("div", { class: "muted small", style: "margin-top:6px" }, "To switch later: Load… on a setup. Its camera holder, calibration and cameras come back."));
     const card = h("div", { class: "card su-main" },
       h("div", { class: "section" }, "Setups"),
-      note("A setup is everything for one tool on the robot, saved by name: parts, TCPs, calibrations, F/T bias, payload, gains, keep-out zones, vials.",
-        "Programs and policies are shared by every setup. Loading one restarts the GUI (and the robot stack when its parts " +
-        "or base differ from the running robot model); the files in use before are kept as an automatic backup."),
+      note("One setup per tool or camera holder, saved by name. Load one to switch.",
+        "A setup keeps the parts (your holder in the robot model), TCPs, camera calibrations and which cameras run, F/T bias, " +
+        "payload, gains, keep-out zones and vials. Programs and policies are shared by every setup. Loading one restarts the GUI " +
+        "(and the robot stack when its parts or base differ from the running robot model); the files in use before are kept as an automatic backup."),
       cur,
+      h("div", { class: "row" }, h("span", { class: "muted" }, "Profile"), ownerSel, h("span", { class: "grow" }),
+        lease(btn("Copy from another profile…", "quiet", () => copyFrom(), "Copy someone's setup into this profile"))),
       list,
+      guide,
       h("div", { class: "section" }, "Save what is on the robot now"),
       h("div", { class: "row" }, h("input", { type: "text", id: "st-name", placeholder: "name, e.g. scraping spatula", style: "width:200px" }),
         h("input", { type: "text", id: "st-note", placeholder: "note (what is mounted)", style: "flex:1" }),
         lease(btn("Save", "primary", () => save(false)))),
       h("div", { class: "muted small", id: "st-present" }),
       h("details", {}, h("summary", { class: "muted small" }, "Automatic backups (before each load, newest 5)"), autos));
-    const baseBox = h("div", { class: "list", id: "st-base" });
+    const baseBox = h("div", { class: "list", id: "st-base" }), robotBox = h("div", { id: "st-robot" });
     const side = h("div", { class: "card", style: "width:320px" },
+      h("div", { class: "section" }, "Robot"),
+      note("What this PC runs: the arm (real or fake), gripper, F/T sensor and cameras.",
+        "Hardware… lists what the GUI knows: what is ready on this PC can be picked, the rest says what is missing. " +
+        "Switching restarts the robot stack (about a minute). Kept for the next starts; ur7e_gui.sh --fake or --robot-ip win for one start."),
+      robotBox,
       h("div", { class: "section" }, "On the flange (base)"),
       note("The fixed hardware in the robot model. Your parts go on top of it.",
         "Each base has its own URDF, SRDF (MoveIt's collision rules and groups) and controllers. Switching restarts the robot " +
@@ -595,21 +620,149 @@ export function workcell(ctx) {
       h("div", { class: "section" }, "Restart"),
       h("div", { class: "row" }, lease(btn("Restart GUI…", "", () => restart("gui"), "The GUI only: the robot stack keeps running")),
         lease(btn("Restart robot stack…", "", () => restart("stack"), "Driver, controllers, MoveIt and the GUI: puts the parts into the robot model"))),
+      h("div", { class: "row" }, lease(btn("Stop robot stack…", "", () => stackStop(), "Nobody uses the robot: stop everything, leave a Start page"))),
       note("Refused while the robot moves, a program or policy runs, or a force is applied.",
         "The launcher (ur7e_gui.sh) does the restart; a GUI started by hand cannot restart itself."));
     let B = null, CUR = null;
+    let RB = null;
+    const robotLabel = (n) => (RB?.robots.find((r) => r.name === n) || { label: n }).label;
+    const optLabel = (list, n) => (list?.find((x) => x.name === n) || { label: n }).label;
+    function fillRobot(v) {
+      if (!v) return;
+      RB = v;
+      if (B) fillBase(B);
+      const run = v.running;
+      robotBox.replaceChildren(run
+        ? h("div", {},
+            h("div", { class: "row" }, h("span", { class: "grow" }, h("b", {}, robotLabel(run.robot)), ` · ${run.mode}${run.mode === "real" ? " · " + run.ip : ""}`),
+              lease(btn("Hardware…", "primary", () => setupRobot(false)))),
+            h("div", { class: "muted small" }, `Gripper: ${optLabel(v.grippers, v.gripper)} · F/T: ${optLabel(v.ft_sensors, v.ft)} · ` +
+              `Cameras: ${v.cameras.length ? v.cameras.map((c) => c.name).join(", ") : "none"}`),
+            h("div", { class: "muted small", title: "Your own ROS 2 programs need  export ROS_DOMAIN_ID=" + run.domain }, `ROS domain ${run.domain} · ` +
+              optLabel(v.nets, run.net) + ` · continuous jog ${run.servo || "off"}`))
+        : h("div", { class: "muted small" }, "Started by hand, not by ur7e_gui.sh: set the robot up there."));
+    }
+    // Set up this robot: arm (real / fake, IP), gripper, F/T sensor, cameras; one Apply, one restart
+    async function setupRobot(first) {
+      const r0 = await cmd("robot_view");
+      if (!r0.ok) return;
+      const v = r0.robot;
+      fillRobot(v);
+      if (B) fillBase(B);
+      const cur = v.running || v.next;
+      const ready = (r) => !r.missing.length;
+      let arm = v.robots.find((r) => r.name === cur.robot && ready(r)) ? cur.robot : (v.robots.find(ready) || {}).name;
+      let mode = cur.mode, gripper = v.gripper, ft = v.ft, net = cur.net || "lab";
+      const domain = h("input", { type: "number", min: 0, max: v.domain_max, step: 1, value: cur.domain ?? "42", style: "width:70px" });
+      const ip = h("input", { type: "text", value: cur.ip || v.next.ip, style: "width:140px" });
+      const servo = h("input", { type: "checkbox", checked: (cur.servo || v.next.servo || "on") === "on" });
+      const ftIp = h("input", { type: "text", value: cur.ft_ip || v.next.ft_ip, style: "width:140px" });
+      const camChecks = {};
+      const sec = (n, t) => h("div", { class: "section", style: "margin:10px 0 4px" }, `${n}. ${t}`);
+      const radio = (group, name, on, label, sub, enabled, set, extra) => h("label", { class: "item" + (on ? " on" : "") + (enabled ? "" : " muted"),
+          style: enabled ? "cursor:pointer" : "" },
+        h("input", { type: "radio", name: group, value: name, checked: on, disabled: !enabled, onchange: () => { set(name); paint(); } }),
+        h("div", { class: "grow" }, h("div", {}, label, extra || ""), sub ? h("div", { class: "small" }, sub) : ""));
+      const body = h("div", { style: "display:flex;flex-direction:column;gap:2px" });
+      const foot = h("div", { class: "muted small", style: "margin-top:8px" });
+      function paint() {
+        const A = v.robots.find((r) => r.name === arm) || { grippers: ["none"], ft_sensors: ["none"] };
+        if (!A.grippers.includes(gripper)) gripper = A.grippers[0];                     // another arm: its own gripper
+        if (!A.ft_sensors.includes(ft)) ft = A.ft_sensors.includes("none") ? "none" : A.ft_sensors[0];
+        const real = mode === "real";
+        body.replaceChildren(
+          sec(1, "Robot arm"),
+          h("div", { class: "list" }, ...v.robots.map((r) => radio("su-arm", r.name, r.name === arm, r.label, ready(r) ? r.text : "",
+            ready(r), (n) => (arm = n),
+            [" ", ready(r) ? h("span", { class: "chip ok" }, "ready") : h("span", { class: "chip warn" }, "not set up"),
+              ready(r) ? "" : h("ul", { class: "small", style: "margin:4px 0 0 16px;padding:0" }, ...r.missing.map((m) => h("li", {}, m)))]))),
+          h("div", { class: "row", style: "margin-top:4px" }, ...v.modes.map((m) => h("label", { title: m.text },
+            h("input", { type: "radio", name: "su-mode", value: m.name, checked: m.name === mode, onchange: () => { mode = m.name; paint(); } }), ` ${m.label} `)),
+            real ? h("span", {}, " Robot IP ", ip) : h("span", { class: "muted small" }, " no robot: a simulated arm")),
+          arm === "ur7e" ? h("label", { class: "row", style: "cursor:pointer;margin-top:4px" }, servo, " Continuous jog (MoveIt Servo)",
+            h("span", { class: "muted small" }, " hold-to-jog buttons; off: step jog only")) : "",
+          sec(2, "Gripper"),
+          h("div", { class: "list" }, ...A.grippers.map((g) => radio("su-grip", g, g === gripper, optLabel(v.grippers, g),
+            v.grippers.find((x) => x.name === g)?.text, true, (n) => (gripper = n)))),
+          sec(3, "Force/torque sensor"),
+          h("div", { class: "list" }, ...A.ft_sensors.map((f) => radio("su-ft", f, f === ft, optLabel(v.ft_sensors, f),
+            v.ft_sensors.find((x) => x.name === f)?.text, true, (n) => (ft = n)))),
+          ft !== "none" && real ? h("div", { class: "row" }, "F/T sensor IP ", ftIp) : "",
+          sec(4, "ROS 2"),
+          h("div", { class: "row" }, "Domain ID ", domain, h("span", { class: "muted small" }, " your own ROS 2 programs use the same number")),
+          h("div", { class: "list" }, ...v.nets.map((n) => radio("su-net", n.name, n.name === net, n.label, n.text, true, (x) => (net = x)))),
+          sec(5, "Cameras"),
+          v.cameras.length ? h("div", { class: "small" }, "On this robot: " + v.cameras.map((c) => `${c.name} (${c.label})`).join(", ") +
+            ". Edit or remove them in SETUP › Drivers & cameras.") : h("div", { class: "muted small" }, "None yet. Tick the ones to add:"),
+          h("div", { class: "list" }, ...v.camera_types.filter((t) => !v.cameras.some((c) => c.type === t.type)).map((t) => {
+            const box = camChecks[t.type] || (camChecks[t.type] = h("input", { type: "checkbox", disabled: !t.installed }));
+            return h("label", { class: "item" + (t.installed ? "" : " muted"), style: t.installed ? "cursor:pointer" : "" }, box,
+              h("div", { class: "grow" }, h("div", {}, "Add ", t.label, " ", t.installed ? "" : h("span", { class: "chip warn" }, "not installed")),
+                h("div", { class: "small" }, t.installed ? t.help : t.install)));
+          })));
+        updateFoot();
+      }
+      function updateFoot() {
+        const real = mode === "real";
+        const same = cur && arm === cur.robot && mode === cur.mode && (!real || ip.value.trim() === cur.ip) &&
+          gripper === v.gripper && ft === v.ft && (!real || ft === "none" || ftIp.value.trim() === cur.ft_ip) &&
+          String(domain.value).trim() === String(cur.domain) && net === cur.net &&
+          (servo.checked ? "on" : "off") === (cur.servo || "off");
+        foot.textContent = same ? "Cameras are added without a restart." : "Apply restarts the robot stack and the GUI (about a minute).";
+      }
+      body.addEventListener("input", updateFoot);
+      paint();
+      const form = h("div", {}, body, foot);
+      const title = first ? "Set up this robot" : "Robot hardware";
+      const text = (first ? "Nothing is set up on this PC yet. Pick what you have; you can change it later in SETUP › Setups.\n" : "") +
+        "Fake: no robot, nothing is sent anywhere. Real: nothing moves until you command it.";
+      const c = await ask(`${title}\n${text}`, { content: form, wide: true, ok: "Apply", cancel: first ? "Later" : "Cancel",
+        result: () => ({ robot: arm, mode, ip: ip.value.trim(), gripper, ft, ft_ip: ftIp.value.trim(), domain: String(domain.value).trim(), net,
+          servo: servo.checked ? "on" : "off",
+          cameras: Object.entries(camChecks).filter(([, b]) => b.checked).map(([k]) => k) }) });
+      if (!c) return;
+      if (!c.robot) return toast("no robot is ready on this PC yet", false);
+      const r = await cmd("robot_setup", { ...c, confirm: true });
+      if (r.ok) { toast(r.msg, true, !!r.restart); if (r.robot) fillRobot(r.robot); }
+    }
     async function save(replace, name, nt) {
       name = name ?? $("#st-name").value.trim();
       nt = nt ?? $("#st-note").value;
       if (!name) return toast("name the setup first", false);
-      const r = await cmd("setup_save", { name, note: nt, replace });
+      const r = await cmd("setup_save", { name, note: nt, replace, owner: OWNER || "" });
       if (!r.ok && /exists/.test(r.msg || "") && (await ask(`Replace setup "${name}" with what is on the robot now?`))) return save(true, name, nt);
       if (r.ok) { fillBase(r.base); fill(r.setups, r.current); }
+    }
+    // copy a setup from another profile (or Shared) into the one shown; the robot's files don't change
+    async function copyFrom() {
+      const others = ["", ...PROFILES.map((p) => p.name)].filter((o) => o !== (OWNER || ""));
+      const from = h("select", {}, ...others.map((o) => h("option", { value: o }, ownerName(o))));
+      const pick = h("select", { style: "min-width:200px" });
+      const as = h("input", { type: "text", placeholder: "same name", maxlength: 40, style: "width:200px" });
+      const fillPick = async () => {
+        const r = await cmd("setup_list", { owner: from.value });
+        const l = (r.ok ? r.setups : []).filter((x) => !x.auto);
+        pick.replaceChildren(...(l.length ? l.map((x) => h("option", { value: x.name }, x.name + (x.note ? " · " + x.note : "")))
+          : [h("option", { value: "" }, "no setups")]));
+      };
+      from.onchange = fillPick;
+      await fillPick();
+      const form = h("div", { style: "display:flex;flex-direction:column;gap:8px" }, h("div", { class: "row" }, "From", from), h("div", { class: "row" }, "Setup", pick),
+        h("div", { class: "row" }, "Save as", as));
+      const c = await ask(`Copy a setup into ${ownerName(OWNER)}\nA copy: later changes in either one don't touch the other. ` +
+        "The robot keeps running what it runs now; Load… the copy to use it.", { content: form, ok: "Copy", result: () => ({ from: from.value, name: pick.value, as: as.value.trim() }) });
+      if (!c || !c.name) return;
+      const go = (replace) => cmd("setup_copy", { source_owner: c.from, name: c.name, owner: OWNER || "", new_name: c.as, replace });
+      let r = await go(false);
+      if (!r.ok && /already has/.test(r.msg || "") && (await ask(`Replace "${c.as || c.name}" in ${ownerName(OWNER)} with the copy?`))) r = await go(true);
+      if (r.ok) { toast(r.msg, true); fill(r.setups, r.current); }
     }
     const baseLabel = (n) => (B?.choices.find((c) => c.name === n) || { label: n || "?" }).label;
     function fillBase(b) {
       if (!b) return;
       B = b;
+      if (RB?.running && RB.running.robot !== "ur7e")       // these bases are the UR7e's parts
+        return baseBox.replaceChildren(h("div", { class: "muted small" }, "Gripper and F/T sensor: Robot › Hardware… above."));
       baseBox.replaceChildren(...b.choices.map((c) => h("div", { class: "item" + (c.name === b.running ? " on" : "") },
         h("div", { class: "grow" }, h("div", {}, c.label, c.name === b.running ? h("span", { class: "chip ok" }, " running") : "",
           c.name === b.next && c.name !== b.running ? h("span", { class: "chip warn" }, " next start") : ""),
@@ -624,29 +777,30 @@ export function workcell(ctx) {
       if (r.ok) toast(r.msg, true, true);
     }
     async function load(s) {
-      const pv = await cmd("setup_preview", { name: s.name });
+      const pv = await cmd("setup_preview", { name: s.name, owner: OWNER || "" });
       if (!pv.ok) return;
       const ch = words(pv.changes);
       const lines = [ch.length ? `Changes: ${ch.join(", ")}` : "Nothing differs from what is in use now.",
         pv.base ? `Base: ${pv.base.from_label} → ${pv.base.to_label}. Check that this hardware is really on the robot.` : "",
         pv.restart === "stack" ? "Restarts the robot stack and the GUI (about a minute). Then press Play on the pendant (unless headless)."
           : "Restarts the GUI (a few seconds)."].filter(Boolean);
-      const unsaved = CUR?.name && (CUR.changed?.length || CUR.base_changed) && CUR.name !== s.name
+      const unsaved = CUR?.name && (CUR.changed?.length || CUR.base_changed) && !isCur(s)
         ? `\n\nNot saved in "${CUR.name}": ${words(CUR.changed).concat(CUR.base_changed ? ["base"] : []).join(", ")} (kept in an automatic backup).` : "";
       if (!(await ask(`Load setup "${s.name}"?\n\n${lines.join("\n")}${unsaved}`))) return;
-      const r = await cmd("setup_load", { name: s.name });
+      const r = await cmd("setup_load", { name: s.name, owner: OWNER || "" });
       if (r.ok) toast(r.msg, true, true);
     }
-    const row = (s) => h("div", { class: "item" + (CUR?.name === s.name ? " on" : "") },
-      h("div", { class: "grow" }, h("div", {}, s.name, CUR?.name === s.name ? h("span", { class: "chip ok" }, "in use") : "",
+    const row = (s) => h("div", { class: "item" + (isCur(s) ? " on" : "") },
+      h("div", { class: "grow" }, h("div", {}, s.name, isCur(s) ? h("span", { class: "chip ok" }, "in use") : "",
           s.base ? h("span", { class: "chip" + (B && s.base !== B.running ? " warn" : ""),
           title: B && s.base !== B.running ? "a different base from the running one: loading switches it" : "base" }, baseLabel(s.base)) : "",
           s.note ? h("span", { class: "muted" }, " · " + s.note) : ""),
-        h("div", { class: "muted small" }, `${s.saved} · ${words(s.holds).join(", ") || "empty"}`), s.error ? h("div", { class: "error small" }, s.error) : ""),
+        s.cameras?.length ? h("div", { class: "muted small" }, "Cameras: " + s.cameras.map(camLabel).join(", ")) : "",
+        h("div", { class: "muted small" }, `${s.saved} · ${words(s.holds).join(", ") || "empty"}` + (s.copied_from ? ` · copied from ${s.copied_from}` : "")), s.error ? h("div", { class: "error small" }, s.error) : ""),
       lease(btn("Load…", "", () => load(s), "Shows what changes first")),
-      lease(btn("✕", "quiet", async () => (await ask(`Delete setup "${s.name}"?`)) && cmd("setup_delete", { name: s.name }).then((r) => r.ok && fill(r.setups, r.current)))));
+      lease(btn("✕", "quiet", async () => (await ask(`Delete setup "${s.name}"?`)) && cmd("setup_delete", { name: s.name, owner: OWNER || "" }).then((r) => r.ok && fill(r.setups, r.current)))));
     function fillCurrent(c) {
-      CUR = c ? { ...c, note: (W.setups.all || []).find((s) => s.name === c.name)?.note || "" } : null;
+      CUR = c ? { ...c, note: (c.owner || "") === (OWNER || "") ? (W.setups.all || []).find((s) => s.name === c.name)?.note || "" : "" } : null;
       if (!c) return;
       $("#st-present").textContent = c.present?.length ? "Saves: " + [B ? "base " + baseLabel(B.running) : "", ...words(c.present)].filter(Boolean).join(" · ")
         : "Nothing to save yet.";
@@ -655,21 +809,62 @@ export function workcell(ctx) {
         return;
       }
       const ch = words(c.changed).concat(c.base_changed ? ["base"] : []);
-      cur.replaceChildren(h("div", { class: "row" }, h("span", { class: "grow" }, "In use: ", h("b", {}, c.name), " ",
+      const mine = (c.owner || "") === (OWNER || "");
+      cur.replaceChildren(h("div", { class: "row" }, h("span", { class: "grow" }, "In use: ", h("b", {}, c.owner ? `${c.owner} / ${c.name}` : c.name), " ",
           ch.length ? chip("changed", "warn") : chip("saved", "ok")),
-        ch.length ? lease(btn(`Save into "${c.name}"`, "primary", async () => (await ask(`Save the changes (${ch.join(", ")}) into "${c.name}"?`)) &&
+        ch.length && mine ? lease(btn(`Save into "${c.name}"`, "primary", async () => (await ask(`Save the changes (${ch.join(", ")}) into "${c.name}"?`)) &&
           save(true, c.name, CUR.note))) : ""),
         h("div", { class: "muted small" }, ch.length ? `Changed since saved: ${ch.join(", ")}` : "Nothing changed since it was saved or loaded."));
+    }
+    // the step list: where each step stands now, and a button to its page
+    function fillSteps(g) {
+      if (!g) return;
+      const step = (n, title, done, now, page, sub) => h("div", { class: "item" + (done ? " on" : "") },
+        h("div", { class: "grow" }, h("div", {}, `${n}. ${title} `, done ? chip("done", "ok") : chip("to do", "warn")),
+          h("div", { class: "muted small" }, now)),
+        page ? btn(sub || page, "quiet", () => navTo(page, sub)) : "");
+      const run = g.cameras.filter((c) => g.on.includes(c.name));
+      steps.replaceChildren(
+        step(1, "Put your camera holder in the robot model", g.parts.length > 0,
+          g.parts.length ? "Parts now: " + g.parts.join(", ") : "Import its mesh (.stl, .obj, .dae) on the tool. Then Restart robot stack.", "SETUP", "Parts"),
+        step(2, "Add your camera and start it", run.length > 0,
+          run.length ? "Running: " + run.map((c) => c.label).join(", ") : g.cameras.length ? "Start yours (others: Stop)." : "Add it with + Add…", "SETUP", "Drivers & cameras"),
+        step(3, "Calibrate the camera", g.calibrations.length > 0,
+          g.calibrations.length ? "Calibrated: " + g.calibrations.join(", ") : "Eye-in-hand: Start, Plan poses, Collect all…, Solve, Save + add to robot.", "SETUP", "Camera calibration"),
+        step(4, "Save it under your name", !!CUR?.name && !(CUR.changed?.length || CUR.base_changed),
+          CUR?.name ? `In use: ${CUR.name}` : "Type a name below (e.g. alice_d405) and press Save.", "", ""));
+    }
+    function fillOwners(profiles, owner) {
+      PROFILES = profiles || PROFILES;
+      if (owner != null) OWNER = owner;
+      ownerSel.replaceChildren(...["", ...PROFILES.map((p) => p.name)].map((o) => h("option", { value: o }, ownerName(o))));
+      ownerSel.value = OWNER || "";
     }
     function fill(all, current) {
       W.setups.all = all;
       if (current) fillCurrent(current);
       const mine = all.filter((s) => !s.auto), auto = all.filter((s) => s.auto);
-      list.replaceChildren(...(mine.length ? mine.map(row) : [h("div", { class: "muted small" }, "No setups saved yet.")]));
+      list.replaceChildren(...(mine.length ? mine.map(row) : [h("div", { class: "muted small" }, "No setups saved yet: follow the steps below.")]));
+      if (!mine.length) guide.open = true;
       autos.replaceChildren(...(auto.length ? auto.map(row) : [h("div", { class: "muted small" }, "None.")]));
     }
     roots.push(card, side);
-    W.setups = { card, side, all: [], load: () => cmd("setup_list").then((r) => { if (r.ok) { fillBase(r.base); fill(r.setups, r.current); } }),
+    W.pickRobot = setupRobot;
+    let G = null;
+    const camLabel = (n) => (G?.cameras.find((c) => c.name === n) || { label: n }).label;
+    W.setups = { card, side, all: [],
+      load: async () => {
+        if (OWNER == null) {                // first time: this browser's profile (top right), else the shared setups
+          const p = await cmd("profile_list");
+          const me = (localStorage.getItem("operator") || "").toLowerCase();
+          OWNER = (p.ok && p.profiles.find((x) => x.name.toLowerCase() === me)?.name) || "";
+        }
+        const r = await cmd("setup_list", { owner: OWNER });
+        if (!r.ok && OWNER) { OWNER = ""; return W.setups.load(); }      // the profile was deleted
+        if (r.ok) { G = r.guide; fillOwners(r.profiles, r.owner); fillBase(r.base); fill(r.setups, r.current); fillSteps(r.guide); }
+        cmd("robot_view").then((x) => x.ok && fillRobot(x.robot));
+      },
+      showOwner: (o) => { OWNER = o || ""; W.setups.load(); },
       update: (s) => {                      // the state's short summary changed (a save, load or edit elsewhere): read it again
         const k = JSON.stringify(s.workcell?.setup || null);
         if (k !== W.setups.key) { const first = W.setups.key == null; W.setups.key = k; if (!first) W.setups.load(); }

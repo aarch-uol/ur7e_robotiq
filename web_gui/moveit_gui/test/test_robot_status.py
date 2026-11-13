@@ -125,3 +125,12 @@ def test_web_gripper_reactivate_clears_a_fault(core):
         assert s.state()["gripper_status"]["fault"] == "none"
     finally:
         s.shutdown()
+
+
+def test_a_program_playing_without_external_control_for_this_pc_is_refused(core, monkeypatch):
+    """The pendant plays a program, but its External Control host is another PC: the arm would not move."""
+    import dataclasses
+    snap = core.bridge.snapshot
+    monkeypatch.setattr(core.bridge, "snapshot", lambda: dataclasses.replace(
+        snap(), program_running=False, program_state="PLAYING"))
+    assert "Host IP" in core.motion_refusal()

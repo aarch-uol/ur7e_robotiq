@@ -175,7 +175,7 @@ def main():
     s.cameras.watch("/camera/camera/depth/image_rect_raw")
     pump(1.0)
     shot(sizes, "1366_setup_cameras_depth")
-    s.cameras.watch("/zed/zed_node/rgb/image_rect_color")
+    s.cameras.watch("/zed/zed_node/rgb/color/rect/image")
     pump(0.5)
     shot(sizes, "1366_setup_cameras_missing")
     s.sub.setCurrentRow(0)

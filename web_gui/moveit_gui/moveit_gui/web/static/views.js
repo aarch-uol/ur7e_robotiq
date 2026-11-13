@@ -15,11 +15,12 @@ import { ask } from "/static/dialog.js";
 
 const KEY = "op-layouts1";
 const MAIN_H = 560;
-const MINW = { "3d": 420, ft: 260, cam: 240, empty: 220, plan: 300, jchart: 300, prog: 260, log: 300 }, MINH = 160, MAIN_MINH = 260;
+const MINW = { "3d": 420, ft: 260, cam: 240, empty: 220, plan: 300, jchart: 300, prog: 260, log: 300, drv: 240 }, MINH = 160, MAIN_MINH = 260;
 const SIDE_MIN = 280, SIDE_MAX = 600, FOLD_W = 36, GAP = 8, MAX_VIEWS = 6, MAX_LAYOUTS = 9;
 const TYPES = [["cam", "Camera"], ["ft", "F/T chart"], ["plan", "Motion planner"], ["jchart", "Joint chart"],
-  ["prog", "Program run"], ["log", "Log"], ["empty", "Empty"]];
-const ONE = ["ft", "plan", "jchart", "prog", "log"];                   // one window of each in a layout
+  ["prog", "Program run"], ["log", "Log"], ["drv", "Camera drivers"], ["empty", "Empty"]];
+const ONE = ["ft", "plan", "jchart", "prog", "log", "drv"];                   // one window of each in a layout
+const QUALITY = [["low", "Low", "640 px, 10 fps"], ["med", "Med", "960 px, 15 fps"], ["high", "High", "1280 px, 30 fps"]];   // server.PREVIEW
 const typeName = (k) => (TYPES.find((x) => x[0] === k) || [k, k])[1];
 const CARDS = ["manual", "fts", "robot", "arm", "grip", "joints"];
 const clone = (o) => JSON.parse(JSON.stringify(o));
@@ -33,8 +34,8 @@ const MAIN = base({ name: "Main", fixed: true, l: ["manual", "fts", "chart"], ti
 const PRESETS = [
   base({ name: "Force", l: ["manual", "fts", "chart"], r: ["robot", "arm", "joints", "grip"], right: ["c1"], rw: [1], f: 0.66,
     tiles: { chart: { type: "ft", att: true }, c1: { type: "cam", pick: 0 } }, h: { chart: 320 }, min: ["grip"] }),
-  base({ name: "Cameras", l: ["manual", "grip"], r: ["robot", "arm", "fts", "joints"], bottom: ["c1", "c2"], bw: [1, 1], bh: 340,
-    tiles: { c1: { type: "cam", pick: 0 }, c2: { type: "cam", pick: 1 } } }),
+  base({ name: "Cameras", l: ["manual", "grip", "drv"], r: ["robot", "arm", "fts", "joints"], bottom: ["c1", "c2"], bw: [1, 1], bh: 340,
+    tiles: { c1: { type: "cam", pick: 0 }, c2: { type: "cam", pick: 1 }, drv: { type: "drv" } } }),
 ];
 
 // every card exactly once in a side column; tiles referenced exist; numbers sane (a stored layout may be old)
@@ -79,7 +80,7 @@ function attach(L) {
 }
 function clampSide(v, d) { return Math.max(SIDE_MIN, Math.min(SIDE_MAX, Math.round(+v || d))); }
 
-export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, onEdit, extra = {} }) {
+export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, navSlot, onEdit, extra = {} }) {
   // ---- state
   let stored = null;
   try { stored = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) { stored = null; }
@@ -128,7 +129,10 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
     const r = await cmd("camera_status").catch(() => null);
     if (!r || !r.ok) return;
     const known = new Set(r.cameras.map((c) => c.topic));
-    const next = [...r.cameras, ...(r.topics || []).filter((t) => !known.has(t)).map((t) => ({ name: t, topic: t, publishers: 1 }))];
+    // first what publishes, then the cameras of SETUP › Drivers & cameras, then the profile's list: "Camera 1" is a live one
+    const rank = (c) => (c.publishers > 0 ? 0 : c.driver ? 1 : 2);
+    const next = [...r.cameras, ...(r.topics || []).filter((t) => !known.has(t) && !/\/(compressed|compressedDepth|zstd|theora)$/.test(t))
+      .map((t) => ({ name: t, topic: t, publishers: 1 }))].map((c, i) => [rank(c), i, c]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map((x) => x[2]);
     if (JSON.stringify(next) === JSON.stringify(W.cams)) return;
     W.cams = next;
     if (W.shown) render();
@@ -157,6 +161,10 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
       TYPES.map(([k, n]) => h("option", { value: k }, n)));
     T.topic = h("select", { class: "ltopic", title: "Camera topic", onchange: () => { L().tiles[id].topic = T.topic.value; save(); render(); } });
     T.topic.addEventListener("mousedown", () => refreshCams());
+    T.q = h("select", { class: "lq", title: "Picture in this window: Low 640 px, 10 fps · Med 960 px, 15 fps · High 1280 px, 30 fps " +
+      "(more data over the network). The camera itself is set in SETUP › Drivers & cameras.",
+      onchange: () => { L().tiles[id].q = T.q.value; save(); render(); } },
+      QUALITY.map(([k, n, d]) => h("option", { value: k, title: d }, n)));
     T.title = h("span", { class: "ltitle" });
     T.mn = h("button", { class: "lmin", type: "button", onclick: (e) => { e.stopPropagation(); toggleMin(id); } });
     T.x = h("button", { class: "lx ledit", type: "button", title: "Close this window", html: icon("close"),
@@ -205,7 +213,8 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
       T.topic.replaceChildren(...opts);
       T.topic.value = topic;
     }
-    const key = [t.type, topic, on, live].join("|");
+    const q = QUALITY.some(([k]) => k === t.q) ? t.q : "low";
+    const key = [t.type, topic, on, live, q].join("|");
     if (T.key === key) return;
     stopCam(T);
     T.key = key;
@@ -218,7 +227,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
       ftEl.dispatchEvent(new Event("toggle"));
     } else if (t.type === "cam" && topic) {
       T.img = h("img", { class: "vcam", alt: "", draggable: "false",
-        src: on ? "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&t=" + Date.now() : "" });
+        src: on ? "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&q=" + q + "&t=" + Date.now() : "" });
       T.msg = h("div", { class: "vmsg" }, "");
       T.img.onerror = () => { if (T.img && W.shown) { T.msg.textContent = "No picture"; T.msg.title = "Is the camera running? SETUP › Drivers & cameras"; } };
       T.img.onload = () => { T.msg.textContent = ""; aspect(T, topic); };
@@ -226,8 +235,9 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
       T.body.replaceChildren(T.img, T.msg);
       T.recBtn = tool("record", "Record a clip of this camera (a WebM video downloads when you stop)",
         () => (T.rec ? stopRec(T) : startRec(T, topic)));
-      T.tools.append(T.recLbl, T.fit, tool("camera", "Photo (downloads a JPEG)", () => photo(T, topic)), T.recBtn,
-        tool("popout", "Open in its own browser window", () => window.open("/api/camera.mjpeg?topic=" + encodeURIComponent(topic),
+      T.q.value = q;
+      T.tools.append(T.q, T.recLbl, T.fit, tool("camera", "Photo (downloads a JPEG)", () => photo(T, topic)), T.recBtn,
+        tool("popout", "Open in its own browser window", () => window.open("/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&q=" + q,
           "cam" + topic, "popup,width=680,height=520")));
     } else if (extra[t.type]) {
       T.body.replaceChildren(extra[t.type].el);
@@ -581,14 +591,22 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
   };
   addEventListener("resize", later);
 
-  // ---- the top bar: layout numbers (two or more layouts); while editing, the edit toolbar
+  // ---- layout numbers (two or more layouts) under OPERATE in the left nav; while editing, the edit toolbar in the
+  // top bar (it needs the width)
   function renderHeader() {
     if (!header) return;
     const S = L();
     header.replaceChildren();
-    header.className = "grp hlay" + (W.edit ? " editing" : "");
-    header.hidden = !W.shown || (!W.edit && W.list.length < 2);
-    if (header.hidden) return;
+    header.className = "grp hlay editing";
+    header.hidden = !W.shown || !W.edit;
+    if (navSlot) {
+      navSlot.replaceChildren();
+      navSlot.hidden = !W.shown || W.edit || W.list.length < 2;
+    }
+    if (!W.edit) {
+      if (navSlot && !navSlot.hidden) renderNums(navSlot);
+      return;
+    }
     if (W.edit) {
       const name = h("input", { type: "text", value: S.name, maxlength: "24", title: "Layout name",
         oninput: () => { S.name = name.value.trim() || "Layout"; save(); } });
@@ -600,16 +618,19 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
         h("button", { type: "button", class: "hl-done", html: icon("check") + "<span>Done</span>", onclick: () => { W.edit = false; save(); render(); } }));
       return;
     }
+  }
+  function renderNums(box) {
+    const S = L();
     const tog = (k) => h("button", { type: "button", class: "hl-ico" + (fd(k) ? "" : " on"), disabled: S.fixed || W.auto[k],
       html: icon(k === "l" ? "panelL" : "panelR"),
       title: S.fixed ? "Main is fixed: both columns stay" : W.auto[k] ? "Hidden: the browser window is too small"
         : (fd(k) ? "Show" : "Hide") + ` the ${k === "l" ? "left" : "right"} column`,
       onclick: () => { S.fold[k] = !S.fold[k]; save(); render(); } });
-    header.append(tog("l"), h("span", { class: "hl-sep" }),
-      ...W.list.map((x, i) => h("button", { type: "button", class: "hl-num" + (i === W.cur ? " on" : ""),
+    box.append(h("div", { class: "navlay-cap" }, "Layout"),
+      h("div", { class: "navlay-row" }, ...W.list.map((x, i) => h("button", { type: "button", class: "hl-num" + (i === W.cur ? " on" : ""),
         title: `${i + 1}: ${x.name}` + (x.fixed ? " (fixed)" : ""), "aria-label": `Layout ${i + 1}: ${x.name}`,
-        onclick: () => use(i) }, String(i + 1))),
-      h("span", { class: "hl-sep" }), tog("r"));
+        onclick: () => use(i) }, String(i + 1)))),
+      h("div", { class: "navlay-row" }, tog("l"), tog("r")));
   }
   function use(i) {
     if (i === W.cur) return;
@@ -733,6 +754,10 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
     toggleChart,
     setupView,
     enter() { W.shown = true; render(); refreshCams(); },
+    update(s) {                          // a camera driver started or stopped: list the cameras again
+      const sig = (s.workcell?.drivers || []).map((d) => d.name + ":" + d.state).join(" ");
+      if (sig !== W.drvSig) { W.drvSig = sig; if (W.shown) refreshCams(); }
+    },
     leave() { W.shown = false; W.edit = false; document.body.classList.remove("ledit"); tiles.forEach((T) => { stopCam(T); T.key = null; }); renderHeader(); },
   };
 }

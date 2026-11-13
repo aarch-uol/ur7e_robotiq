@@ -136,3 +136,34 @@ def test_a_new_gui_adopts_running_drivers(mgr):
     assert not (m2.run_dir / "cam.json").exists()
     m3 = make()
     assert not m3.runs
+
+
+def test_resolution_frame_rate_and_display_name(tmp_path):
+    rs = SV.make_service({"name": "d405", "label": " D405  wrist ", "type": "realsense",
+                          "params": {"resolution": "848x480", "fps": "60"}})
+    assert rs.title == "D405 wrist" and "depth_module.depth_profile:=848,480,60" in rs.argv()
+    old = SV.make_service({"name": "web", "type": "usb_cam", "params": {"size": "1280,720,15"}})   # saved before
+    assert old.params["resolution"] == "1280x720" and "framerate:=15.0" in old.argv() and old.title == "web"
+    with pytest.raises(SV.ServiceError, match="30 fps"):
+        SV.make_service({"name": "x", "type": "realsense", "params": {"resolution": "1280x720", "fps": "60"}})
+    z = SV.make_service({"name": "zed_x_nano", "type": "zed",
+                         "params": {"model": "zedxnano", "resolution": "SVGA", "fps": "120", "publish": "2"}})
+    ov = next(a for a in z.argv() if a.startswith("param_overrides:="))
+    assert "general.grab_resolution:=SVGA" in ov and "general.grab_frame_rate:=120" in ov
+    assert "general.pub_resolution:=CUSTOM;general.pub_downscale_factor:=2.0" in ov
+    assert "grab_resolution" not in " ".join(SV.make_service({"name": "z", "type": "zed", "params": {}}).argv())
+    with pytest.raises(SV.ServiceError, match="15, 30, 60 fps"):
+        SV.make_service({"name": "z", "type": "zed", "params": {"model": "zedx", "resolution": "HD1200", "fps": "120"}})
+    with pytest.raises(SV.ServiceError, match="resolution one of"):
+        SV.make_service({"name": "z", "type": "zed", "params": {"model": "zed2i", "resolution": "HD1200"}})
+
+
+def test_rename_while_running(mgr):
+    m = mgr[0]()
+    m.save({"name": "cam", "type": "usb_cam", "params": {}})
+    m.start("cam")
+    assert m.view()["services"][0]["label"] == "cam"
+    m.save({"name": "cam", "label": "Wrist webcam", "type": "usb_cam", "params": {}}, replace="cam")
+    assert m.view()["services"][0]["label"] == "Wrist webcam"
+    with pytest.raises(SV.ServiceError, match="stop 'cam' first"):
+        m.save({"name": "cam", "label": "Wrist webcam", "type": "usb_cam", "params": {"fps": "15"}}, replace="cam")

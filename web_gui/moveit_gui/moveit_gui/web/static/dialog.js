@@ -4,6 +4,7 @@
 //   await ask(text, { ok: "Give", cancel: "Keep", danger: true, timeout: 30 })
 //   await askText("Your name:", "default")            the text, or null on Cancel
 //   tell(text)                                        just OK
+//   await ask(text, { content: node, result: () => value, wide: true })   a form in the pop-up: OK answers result()
 // The first line is the title, the rest the message. One pop-up at a time: others wait.
 // valid: a function; a queued pop-up whose question no longer applies is skipped (answers Cancel).
 // A pop-up with `timeout` (seconds) closes by itself when the time runs out (shown on the Cancel button) and answers
@@ -30,12 +31,13 @@ function show(text, o) {
     if (verb && !o.ok) { o = { ...o, ok: verb[1], danger: true }; }
     if (!o.ok && /\n\nExecute\?$/.test(all)) o = { ...o, ok: "Execute" };
     const back = el("div", "dlg-back");
-    const box = el("div", "dlg" + (o.danger ? " danger" : ""));
+    const box = el("div", "dlg" + (o.danger ? " danger" : "") + (o.wide ? " wide" : ""));
     box.setAttribute("role", "dialog");
     box.setAttribute("aria-modal", "true");
     box.append(el("div", "dlg-title", title));
     const shown = o.ok === "Execute" ? body.replace(/\n\nExecute\?$/, "") : body;
     if (shown.trim()) box.append(el("div", "dlg-text", shown));
+    if (o.content) box.append(o.content);
     let input = null;
     if (o.input) {
       input = el("input", "dlg-input");
@@ -64,13 +66,13 @@ function show(text, o) {
       if (before && before.focus && before.isConnected) before.focus({ preventScroll: true });
       resolve(v);
     };
-    const answer = (ok) => done(o.input ? (ok ? input.value : null) : ok);
+    const answer = (ok) => done(o.input ? (ok ? input.value : null) : o.result ? (ok ? o.result() : null) : ok);
     const key = (e) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); answer(false); }
       else if (e.key === "Enter" && (e.target === input || !e.target.closest || !e.target.closest(".dlg button"))) {
         e.preventDefault(); e.stopPropagation(); answer(true);
       } else if (e.key === "Tab") {           // keep the focus inside the pop-up
-        const f = [...box.querySelectorAll("button, input")];
+        const f = [...box.querySelectorAll("button, input:not([disabled]), select")];
         const i = f.indexOf(document.activeElement);
         e.preventDefault();
         f[(i + (e.shiftKey ? -1 : 1) + f.length) % f.length].focus();

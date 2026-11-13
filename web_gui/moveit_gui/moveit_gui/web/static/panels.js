@@ -3,9 +3,11 @@
 //   jchart Joint chart: joint angles (or speeds) over the last 20 s
 //   prog  Program run: what runs, where it is, Pause / Resume / Stop
 //   log   Log: the last lines of the GUI log, with a filter
+//   drv   Camera drivers: each driver from SETUP › Drivers & cameras with its state and Start / Stop
 // The server owns every rule: these only show the state and send the same commands as the other pages.
 import { icon } from "/static/icons.js";
 import { axisRange } from "/static/monitors.js";
+import { STATE, ON } from "/static/drivers.js";
 
 const COLORS = ["#d1495b", "#2e8b57", "#2f5fb3", "#c77d12", "#7b4fb3", "#14879c", "#6b7280"];
 
@@ -165,5 +167,30 @@ export function extraViews({ h, btn, cmd, pcmd, INFO, getS, op, navTo, logs }) {
     update: logUpdate,
   };
 
-  return { plan, jchart, prog, log };
+  // ---------------------------------------------------------------- Camera drivers
+  const dList = h("div", { class: "xd-list" });
+  let dSig = null;
+  const drv = {
+    label: "Camera drivers", min: 240,
+    el: box("xdrv", dList, h("div", { class: "row" }, h("span", { class: "grow" }),
+      btn("Set up…", "quiet", () => navTo("SETUP", "Drivers & cameras")))),
+    update(s) {
+      const ds = s.workcell?.drivers || [];
+      const sig = JSON.stringify(ds);
+      if (sig === dSig) return;
+      dSig = sig;
+      dList.replaceChildren(...(ds.length ? ds.map((d) => {
+        const [txt, cls] = STATE[d.state] || STATE.stopped, on = ON.has(d.state);
+        const b = d.state === "missing" ? "" : lease(btn(on || d.state === "stopping" ? "Stop" : "Start", on ? "" : "primary",
+          () => cmd(on ? "drivers_stop" : "drivers_start", { name: d.name })));
+        if (b && d.state === "stopping") b.disabled = true;
+        return h("div", { class: "xd-row", title: d.msg || "" },
+          h("span", { class: "dot " + (STATE[d.state] || STATE.stopped)[2] }),
+          h("span", { class: "grow" }, h("div", {}, d.label || d.name), h("div", { class: "muted small" }, txt.toLowerCase() + (d.msg ? " · " + d.msg : ""))),
+          b);
+      }) : [h("div", { class: "muted small" }, "No camera drivers yet. Add one in SETUP › Drivers & cameras.")]));
+    },
+  };
+
+  return { plan, jchart, prog, log, drv };
 }

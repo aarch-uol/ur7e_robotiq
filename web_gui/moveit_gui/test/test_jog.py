@@ -100,7 +100,7 @@ def test_step_jog_moves_one_step_through_moveit(core):
 
 def test_hold_to_jog_needs_servo_in_both_position_and_admittance(core):
     ok, msg = core.jog_start(JogCommand.parse("cartesian", "x", 1), 0.5)
-    assert not ok and "Servo is not ready" in msg
+    assert not ok and "Continuous jog is off" in msg
     core.bridge.servo_available = True
     ok, msg = core.jog_start(JogCommand.parse("cartesian", "x", 1), 0.5)
     assert ok, msg
@@ -109,7 +109,7 @@ def test_hold_to_jog_needs_servo_in_both_position_and_admittance(core):
     core.switch_mode("admittance")
     core.update()
     ok, msg = core.jog_start(JogCommand.parse("cartesian", "x", 1), 0.5)
-    assert not ok and "Servo is not ready" in msg
+    assert not ok and "Continuous jog is off" in msg
     assert not core.busy
 
 
@@ -332,7 +332,7 @@ def test_desktop_jog_tab_steps_and_holds(win):
 
     op.jog_step.setCurrentIndex(0)                                   # hold
     pump(0.3)
-    assert not plus_j1.isEnabled() and "Servo is not ready" in op.jog_note.text()
+    assert not plus_j1.isEnabled() and "Continuous jog is off" in op.jog_note.text()
     win.bridge.servo_available = True
     pump(0.5)
     assert plus_j1.isEnabled()                                      # Position uses direct forward-position Servo

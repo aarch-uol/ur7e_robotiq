@@ -330,6 +330,9 @@ class RobotCore:
             return f"robot mode is {s.robot_mode}: power on and release the brakes (OPERATE or the pendant)"
         if s.program_running is not True and getattr(s, "program_state", None) == "PAUSED":
             return "the robot program is paused: ▶ Resume program (OPERATE, Robot) or Play on the pendant"
+        if s.program_running is not True and getattr(s, "program_state", None) == "PLAYING":
+            return ("a program plays on the pendant, but it is not External Control connected to this PC: in the "
+                    "program's External Control node set Host IP to this PC, then press Play again")
         if s.program_running is False or (s.program_running is None and s.robot_mode == "RUNNING"
                                           and self.profile.topics.get("program_running")):
             return ("the External Control program is not running: start it with ▶ Play program (OPERATE, Arm "
@@ -449,8 +452,8 @@ class RobotCore:
         if not route:
             return f"MoveIt Servo has no configured route for {self.mode}. Change to Position or Admittance."
         if not self.bridge.servo_ready(route):
-            return ("MoveIt Servo is not ready: start the stack with servo:=true. If it is running, it waits for "
-                    "the joints to change once (MoveIt 2.12): one step jog wakes it up")
+            return ("Continuous jog is off (MoveIt Servo is not running): use the step jog, or turn on Continuous "
+                    "jog in SETUP › Setups › Hardware…. If Servo is running, one step jog wakes it up.")
         return None
 
     def jog_start(self, cmd: JogCommand, speed: float) -> Result:

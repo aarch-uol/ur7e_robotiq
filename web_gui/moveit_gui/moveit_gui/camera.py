@@ -143,6 +143,9 @@ class ImageWatch:
         self._lock = threading.Lock()
         self._frame: Optional[CameraFrame] = None
 
+    def set_limits(self, max_decode_hz: float, max_width: int):
+        self._period, self.max_width = 1.0 / max_decode_hz, int(max_width)
+
     def on_image(self, encoding, width, height, step, data, is_bigendian=False, frame_id=""):
         now = time.monotonic()
         self.stats.tick(now)

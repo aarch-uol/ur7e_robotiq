@@ -156,13 +156,13 @@ class FlaskCommands:
         return FlaskGeometry.from_dict(fx.meta["flask_geometry"])
 
     def _flask_plan(self, tool=None, tcp=None, theta_min_deg=0.0, theta_max_deg=15.0, rings=3, step_deg=15.0,
-                    press_mm=0.5, margin_mm=1.0):
+                    press_mm=0.5, margin_mm=1.0, pattern="down"):
         g = self._flask_saved()
         tcp = str(tcp or self.core.store.active_tcp)
         if tcp not in self.core.store.tcps:
             raise FS.FlaskSetupError(f"unknown TCP '{tcp}'")
         t = FS.make_tool(tool, tcp)
-        a = FS.scrape_args(theta_min_deg, theta_max_deg, rings, step_deg, press_mm, margin_mm)
+        a = FS.scrape_args(theta_min_deg, theta_max_deg, rings, step_deg, press_mm, margin_mm, pattern)
         T = self.core.geo.T_base_frame(FS.FLASK_FIXTURE)
         try:              # keep the tool's roll as it is held now (only the roll: the axis is set by the pivot)
             ref = self.core.geo.current_pose(FS.FLASK_FIXTURE, tcp).T()[:3, :3]
@@ -170,7 +170,7 @@ class FlaskCommands:
             ref = None
         plan = fs.generate_scrape_poses(g, t, a["theta_min_deg"], a["theta_max_deg"], a["rings"], a["step_deg"],
                                         press_depth_mm=a["press_depth_mm"], margin_m=a["margin_m"],
-                                        reference_orientation=ref)
+                                        reference_orientation=ref, pattern=a["pattern"])
         # the bent tool's check is ~100x slower: a coarser band (1°, every 30° around) keeps it to a few seconds
         coarse = isinstance(t, fs.BentTool)
         band = fs.reachable_band(g, t, margin_m=a["margin_m"], resolution_deg=1.0 if coarse else 0.25,

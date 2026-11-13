@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import mimetypes
+import os
 import signal
 import sys
 import threading
@@ -39,7 +41,8 @@ from .service import CommandError, WebService
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 1 << 20
 MAX_UPLOAD = 28 << 20          # /api/upload: an STL for SETUP > Parts (20 MB, base64 in JSON)
-CAMERA_FPS = 10.0
+# a camera window's picture in the browser: ?q= -> (at most this wide in pixels, frames/s); low is the default
+PREVIEW = {"low": (640, 10.0), "med": (960, 15.0), "high": (1280, 30.0)}
 ERR_EVERY_S = 30.0
 
 
@@ -111,8 +114,6 @@ class Hub:
         self.state_json = "{}"
         self.running = True
         self._last_err = -1e9
-        self.camera_lock = threading.Lock()
-        self.camera_viewers = 0
         self._thread = threading.Thread(target=self._loop, daemon=True, name="web-tick")
         self._thread.start()
 
@@ -122,13 +123,13 @@ class Hub:
             try:
                 self.service.tick()
                 st = self.service.state()
-                w = self.service.core.bridge.watched_image()
-                if w is not None:
+                st["cameras"] = {}                                     # what the browser's camera pictures get
+                for t, w in self.service.core.bridge.open_images().items():
                     f = w.latest()
-                    st["camera"] = {"topic": w.topic, "rate": round(w.stats.rate(), 1), "age": w.stats.age(),
-                                    "width": f.width if f else 0, "height": f.height if f else 0,
-                                    "encoding": f.encoding if f else "", "frame_id": f.frame_id if f else "",
-                                    "error": f.error if f else ""}
+                    st["cameras"][t] = {"rate": round(w.stats.rate(), 1), "age": w.stats.age(),
+                                        "width": f.width if f else 0, "height": f.height if f else 0,
+                                        "encoding": f.encoding if f else "", "frame_id": f.frame_id if f else "",
+                                        "error": f.error if f else ""}
                 js = json.dumps(st, default=_json_default)
             except Exception as e:                           # keep ticking: the lease watchdog lives here
                 js = json.dumps({"error": f"{type(e).__name__}: {e}"})
@@ -288,7 +289,8 @@ def make_handler(hub: Hub, allow_hosts=()):
                     q = parse_qs(url.query)
                     return self._events(q.get("bid", [""])[0], q.get("name", [""])[0])
                 if path == "/api/camera.mjpeg":
-                    return self._camera(parse_qs(url.query).get("topic", [""])[0])
+                    q = parse_qs(url.query)
+                    return self._camera(q.get("topic", [""])[0], q.get("q", ["low"])[0])
                 if path == "/api/robot_model":
                     return self._json(200, service.robot_model())
                 if path.startswith("/mesh/"):
@@ -369,25 +371,23 @@ def make_handler(hub: Hub, allow_hosts=()):
                 self.wfile.write("".join(out).encode())
                 self.wfile.flush()
 
-        def _camera(self, topic: str):
+        def _camera(self, topic: str, quality: str = "low"):
+            """One camera window: an MJPEG stream of one topic. Each topic has one subscription, shared by all
+            windows that show it; it goes when the last one closes."""
             bridge = service.core.bridge
-            with hub.camera_lock:
-                ok, msg = bridge.watch_image(topic or None)
-                if ok:
-                    hub.camera_viewers += 1
-            if not ok:
+            width, fps = PREVIEW.get(quality, PREVIEW["low"])
+            w, msg = bridge.open_image(topic) if topic else (None, "no topic")
+            if w is None:
                 return self._json(404, {"ok": False, "msg": msg})
-            self.send_response(200)
-            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.close_connection = True
-            last = None
             try:
+                w.set_limits(fps, width)                         # the last window to open on this topic sets it
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.close_connection = True
+                last = None
                 while hub.running:
-                    w = bridge.watched_image()
-                    if w is None or w.topic != topic:
-                        break                                    # another viewer switched the topic
                     f = w.latest()
                     if f is not None and f.stamp != last and not f.error:
                         last = f.stamp
@@ -396,13 +396,9 @@ def make_handler(hub: Hub, allow_hosts=()):
                             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " +
                                              str(len(jpg)).encode() + b"\r\n\r\n" + jpg + b"\r\n")
                             self.wfile.flush()
-                    time.sleep(1.0 / CAMERA_FPS)
+                    time.sleep(1.0 / fps)
             finally:
-                with hub.camera_lock:
-                    hub.camera_viewers -= 1
-                    w = bridge.watched_image()
-                    if hub.camera_viewers <= 0 and w is not None and w.topic == topic:
-                        bridge.watch_image(None)               # no image traffic while nobody looks
+                bridge.close_image(topic)
 
         # -------------------------------------------------------------- POST
         def do_POST(self):
@@ -467,27 +463,45 @@ def check_bind_host(host: str):
 
 
 class Server:
-    def __init__(self, service: WebService, host: str = "127.0.0.1", port: int = 8180, allow_hosts=()):
-        check_bind_host(host)
+    """The GUI on host:port, and on the same port of each address in also_hosts (e.g. Tailscale and the lab
+    network): one hub, so every browser sees the same robot and the same control."""
+
+    def __init__(self, service: WebService, host: str = "127.0.0.1", port: int = 8180, allow_hosts=(),
+                 also_hosts=()):
+        hosts = [host] + [h for h in also_hosts if h and h != host]
+        for h in hosts:
+            check_bind_host(h)
         self.hub = Hub(service)
-        self.httpd = ThreadingHTTPServer((host, port), make_handler(self.hub, tuple(allow_hosts)))
-        self.httpd.daemon_threads = True
+        handler = make_handler(self.hub, tuple(allow_hosts))
+        self.httpds = []
+        for h in hosts:
+            d = ThreadingHTTPServer((h, port if not self.httpds else self.httpds[0].server_address[1]), handler)
+            d.daemon_threads = True
+            self.httpds.append(d)
+        self.httpd = self.httpds[0]
 
     @property
     def port(self) -> int:
         return self.httpd.server_address[1]
 
+    @property
+    def addresses(self):
+        return [f"{d.server_address[0]}:{d.server_address[1]}" for d in self.httpds]
+
     def serve_forever(self):
         self.httpd.serve_forever(poll_interval=0.2)
 
     def start(self) -> "Server":
-        threading.Thread(target=self.serve_forever, daemon=True, name="web-http").start()
+        for i, d in enumerate(self.httpds):
+            threading.Thread(target=d.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True,
+                             name=f"web-http-{i}").start()
         return self
 
     def stop(self):
         self.hub.stop()
-        self.httpd.shutdown()
-        self.httpd.server_close()
+        for d in self.httpds:
+            d.shutdown()
+            d.server_close()
         self.hub.service.shutdown()
 
 
@@ -503,14 +517,20 @@ def main(argv=None):
     ap.add_argument("--policies-dir", default=str(Path.home() / "moveit_gui_policies"))
     ap.add_argument("--fake", action="store_true", help="no ROS: simulated robot")
     ap.add_argument("--urdf", help="--fake only: a URDF file for the 3D view")
+    ap.add_argument("--real-cameras", action="store_true",
+                    help="--fake only: also read real camera topics from ROS and run the camera drivers for real "
+                         "(a fake robot with the cameras that are plugged in)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="127.0.0.1 + `tailscale serve` (recommended), or this PC's Tailscale IP")
     ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
                     help="also accept this DNS name in the Host header (repeatable), e.g. robot.lab.example.org")
+    ap.add_argument("--also-host", action="append", default=[], metavar="IP",
+                    help="also listen on this address, same port (repeatable), e.g. this PC's lab network IP")
     ap.add_argument("--port", type=int, default=8180)   # 8080 code-server, 8090 a tunnel client on the lab PC
     args = ap.parse_args(argv)
     try:
-        check_bind_host(args.host)
+        for h in [args.host] + args.also_host:
+            check_bind_host(h)
     except ValueError as e:
         ap.error(str(e))
     profiles_dir, programs_dir, policies_dir = prepare_dirs(args, root)
@@ -520,13 +540,17 @@ def main(argv=None):
         bridge = FakeBridge(profile)
         if args.urdf:
             bridge.fake_robot_description = Path(args.urdf).read_text()
+        if args.real_cameras:
+            from ..ros_bridge import RealCameras
+            bridge.real = RealCameras()
+            bridge.fake_cameras.clear()     # only the real cameras, so none is mistaken for a real one
     else:
         from ..ros_bridge import RosBridge
         bridge = RosBridge(profile)
     core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake)
     service = WebService(core)
-    server = Server(service, args.host, args.port, args.allow_host)
-    print(f"MoveIt GUI web: http://{args.host}:{server.port}/  ({profile.display_name}"
+    server = Server(service, args.host, args.port, args.allow_host, args.also_host)
+    print(f"MoveIt GUI web: {'  '.join('http://' + a + '/' for a in server.addresses)}  ({profile.display_name}"
           f"{', FAKE robot' if args.fake else ''})", flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -542,5 +566,17 @@ def main(argv=None):
     return service.restart_code or 0
 
 
+def run():
+    """The console entry point: main(), then leave at once with its code. Everything is already stopped by then;
+    a camera thread still inside ROS during the interpreter's teardown could abort the process ("terminate
+    called without an active exception", seen on the Jetson with the ZED running), and the launcher would get
+    134 instead of the restart code 75 / 76 and stop."""
+    code = main()
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(code or 0))
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    run()

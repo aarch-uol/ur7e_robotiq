@@ -24,6 +24,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.serialization import deserialize_message
 from rclpy.time import Time
 
 from action_msgs.srv import CancelGoal
@@ -108,7 +109,211 @@ def _pose_to_T(pose) -> np.ndarray:
     return tf.make([p.x, p.y, p.z], tf.normalize_quat(quat))
 
 
-class RosBridge:
+class CameraTopics:
+    """Topics and camera images, read only (the camera preview, calibration, a program's photo, driver checks).
+    Needs self.node, self.cb, self._tf (a tf2 Buffer or None), self._image_sub and self._image_watch."""
+
+    def _next_image(self, topic: str, timeout_s: float):
+        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why)."""
+        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
+        t = next((x for x in types if x in IMAGE_TYPES), None)
+        if t is None:
+            return None, f"{topic}: no image publisher"
+        got, ev = {}, threading.Event()
+
+        def on_msg(m):
+            if not ev.is_set():
+                got["m"] = m
+                ev.set()
+        if t == IMAGE_TYPE:
+            from sensor_msgs.msg import Image as Msg
+        else:
+            from sensor_msgs.msg import CompressedImage as Msg
+        sub = self.node.create_subscription(Msg, topic, on_msg, qos_profile_sensor_data, callback_group=self.cb)
+        try:
+            if not ev.wait(timeout_s):
+                return None, f"{topic}: no image within {timeout_s:.0f} s"
+        finally:
+            self.node.destroy_subscription(sub)
+        return t, got["m"]
+
+    def grab_image(self, topic: str, timeout_s: float = 3.0):
+        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
+        or (None, why)."""
+        import cv2
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
+        try:
+            if t == IMAGE_TYPE:
+                from .camera import to_gray
+                img = to_gray(m.encoding, m.width, m.height, m.step, m.data, bool(m.is_bigendian))
+            else:
+                img = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    return None, f"{topic}: could not decode {m.format}"
+        except Exception as e:
+            return None, f"{topic}: {e}"
+        return img, m.header.frame_id
+
+    def grab_photo(self, topic: str, timeout_s: float = 3.0):
+        """(JPEG bytes at full resolution, "") of the next frame of an image topic, or (None, why). A JPEG
+        CompressedImage is passed through unchanged."""
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
+        try:
+            if t == IMAGE_TYPE:
+                from .camera import decode_image, encode_jpeg
+                return encode_jpeg(decode_image(m.encoding, m.width, m.height, m.step, m.data,
+                                                bool(m.is_bigendian), max_width=max(1, int(m.width)))), ""
+            if "jpeg" in str(m.format).lower() or "jpg" in str(m.format).lower():
+                return bytes(m.data), ""
+            import cv2
+            from .camera import encode_jpeg
+            bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None, f"{topic}: could not decode {m.format}"
+            return encode_jpeg(bgr[..., ::-1]), ""
+        except Exception as e:
+            return None, f"{topic}: {e}"
+
+    def camera_info(self, topic: str, timeout_s: float = 3.0) -> Tuple[Optional[dict], str]:
+        from sensor_msgs.msg import CameraInfo
+        got, ev = {}, threading.Event()
+
+        def on_msg(m):
+            if not ev.is_set():
+                got["m"] = m
+                ev.set()
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        sub = self.node.create_subscription(CameraInfo, topic, on_msg, qos, callback_group=self.cb)
+        try:
+            if not ev.wait(timeout_s):
+                return None, f"{topic}: no CameraInfo within {timeout_s:.0f} s"
+        finally:
+            self.node.destroy_subscription(sub)
+        m = got["m"]
+        return {"K": [float(v) for v in m.k], "D": [float(v) for v in m.d], "model": m.distortion_model,
+                "width": int(m.width), "height": int(m.height), "frame_id": m.header.frame_id}, "ok"
+
+    def tf_parent(self, frame: str) -> Optional[str]:
+        """The TF parent of a frame (e.g. the camera driver's camera_link above its optical frame), or None."""
+        if self._tf is None:
+            return None
+        try:
+            d = yaml.safe_load(self._tf.all_frames_as_yaml()) or {}
+        except Exception:
+            return None
+        p = (d.get(frame) or {}).get("parent")
+        return p if p and p != "NO_PARENT" else None
+
+    def topic_types(self) -> List[Tuple[str, str]]:
+        """(topic, type) for every topic in the graph now (one row per type), for the recorder."""
+        try:
+            return sorted((name, t) for name, types in self.node.get_topic_names_and_types() for t in types)
+        except Exception:  # noqa: BLE001 - a graph query during shutdown
+            return []
+
+    def image_topics(self) -> List[Tuple[str, str]]:
+        return sorted((name, t) for name, types in self.node.get_topic_names_and_types() for t in types
+                      if t in IMAGE_TYPES)
+
+    def topic_publishers(self, topic: str) -> int:
+        return self.node.count_publishers(topic)
+
+    def _subscribe_image(self, topic: str, w: ImageWatch):
+        """(subscription feeding w, '') or (None, why)."""
+        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
+        t = next((x for x in types if x in IMAGE_TYPES), None)
+        if t is None:
+            return None, f"{topic}: no image publisher" if not types else f"{topic} is {', '.join(types)}"
+        if t == IMAGE_TYPE:
+            from sensor_msgs.msg import Image as Msg
+            cb = lambda m: w.on_image(m.encoding, m.width, m.height, m.step, m.data, bool(m.is_bigendian),  # noqa
+                                      m.header.frame_id)
+        else:
+            from sensor_msgs.msg import CompressedImage as Msg
+            cb = lambda m: w.on_compressed(m.format, m.data, m.header.frame_id)  # noqa
+        return self.node.create_subscription(Msg, topic, cb, qos_profile_sensor_data, callback_group=self.cb), ""
+
+    def watch_image(self, topic: Optional[str]) -> Tuple[bool, str]:
+        """Preview one image topic (or none). Only one subscription exists at a time (the desktop GUI)."""
+        if self._image_sub is not None:
+            self.node.destroy_subscription(self._image_sub)
+            self._image_sub, self._image_watch = None, None
+        if not topic:
+            return True, "preview off"
+        w = ImageWatch(topic)
+        sub, why = self._subscribe_image(topic, w)
+        if sub is None:
+            return False, why
+        self._image_sub, self._image_watch = sub, w
+        return True, f"watching {topic}"
+
+    _streams_lock = threading.Lock()
+
+    def open_image(self, topic: str):
+        """(ImageWatch, msg) for one camera window in the browser: one subscription per topic, shared by everyone
+        watching it, so several cameras show at once. close_image(topic) when the window goes. (None, why)."""
+        with self._streams_lock:
+            st = self.__dict__.setdefault("_streams", {})          # topic -> [subscription, watch, viewers]
+            if topic in st:
+                st[topic][2] += 1
+                return st[topic][1], f"watching {topic}"
+            w = ImageWatch(topic)
+            sub, why = self._subscribe_image(topic, w)
+            if sub is None:
+                return None, why
+            st[topic] = [sub, w, 1]
+            return w, f"watching {topic}"
+
+    def close_image(self, topic: str):
+        with self._streams_lock:
+            e = self.__dict__.get("_streams", {}).get(topic)
+            if e is None:
+                return
+            e[2] -= 1
+            if e[2] <= 0:                                           # nobody looks: no image traffic
+                self.node.destroy_subscription(e[0])
+                del self._streams[topic]
+
+    def open_images(self) -> dict:
+        """{topic: ImageWatch} of what the browser watches now."""
+        with self._streams_lock:
+            return {t: e[1] for t, e in self.__dict__.get("_streams", {}).items()}
+
+    def watched_image(self) -> Optional[ImageWatch]:
+        return self._image_watch
+
+
+class RealCameras(CameraTopics):
+    """Real cameras next to a fake robot (moveit_gui_web --fake --real-cameras): its own node that only reads
+    topics and TF, so camera drivers can be tried on a PC without a robot. It publishes nothing."""
+
+    def __init__(self, node_name: str = "moveit_gui_cameras"):
+        if not rclpy.ok():
+            rclpy.init()
+        self.node = Node(node_name)
+        self.cb = ReentrantCallbackGroup()
+        self._image_sub = None
+        self._image_watch: Optional[ImageWatch] = None
+        self._tf = None
+        if Buffer is not None:
+            self._tf = Buffer()
+            self._tf_listener = TransformListener(self._tf, self.node, spin_thread=False)
+        self._executor = MultiThreadedExecutor(num_threads=2)
+        self._executor.add_node(self.node)
+        threading.Thread(target=self._executor.spin, daemon=True, name="ros-cameras").start()
+
+    def shutdown(self):
+        self._executor.shutdown(timeout_sec=1.0)
+        self.node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+class RosBridge(CameraTopics):
     STALE_S = 1.0
     SPIN_STALE_S = 2.0              # executor heartbeat older than this: the ROS thread is stuck
     CONTROLLERS_STALE_S = 3.0       # polled every 0.5 s by _health_tick
@@ -124,7 +329,7 @@ class RosBridge:
         self._logs: deque = deque(maxlen=1000)
         self._snap = Snapshot(connected={k: False for k in ("ROS", "UR", "MoveIt", "Gripper", "F/T")})
         self._snap.connected["ROS"] = True
-        self._t_joints = self._t_wrench = 0.0
+        self._t_joints = self._t_wrench = self._t_grip_msg = 0.0
         self._t_controllers = 0.0                       # last controller list (poll or call); 0 = never
         self._t_spin = time.monotonic()                 # executor heartbeat
         self._shutting_down = False
@@ -140,8 +345,9 @@ class RosBridge:
 
         t, s = profile.topics, profile.services
         n = self.node
-        n.create_subscription(JointState, t.get("joint_states", "/joint_states"), self._on_joints,
-                              qos_profile_sensor_data, callback_group=self.cb)
+        # raw: most messages are dropped unread (_on_joints_raw), which saves decoding them in Python
+        n.create_subscription(JointState, t.get("joint_states", "/joint_states"), self._on_joints_raw,
+                              qos_profile_sensor_data, callback_group=self.cb, raw=True)
         if t.get("wrench"):
             n.create_subscription(WrenchStamped, t["wrench"], self._on_wrench,
                                   qos_profile_sensor_data, callback_group=self.cb)
@@ -224,11 +430,14 @@ class RosBridge:
         if self._fd_pub:
             n.create_timer(1.0 / float(fd.get("keepalive_hz", 10.0)), self._freedrive_tick, callback_group=self.cb)
 
-        # --- TF (TCPs, fixtures' parents, vision frames)
-        self._tf = None
+        # --- TF (TCPs, fixtures' parents, vision frames). Its own node and thread: /tf comes at ~500 Hz, and on the
+        # shared executor it queued behind every other callback. On a loaded Jetson the buffer then fell more than
+        # tf_timeout_s behind and the TCP pose went missing.
+        self._tf = self._tf_node = None
         if Buffer is not None:
             self._tf = Buffer()
-            self._tf_listener = TransformListener(self._tf, n, spin_thread=False)
+            self._tf_node = Node(node_name + "_tf")
+            self._tf_listener = TransformListener(self._tf, self._tf_node, spin_thread=True)
 
         n.create_timer(0.5, self._health_tick, callback_group=self.cb)
 
@@ -327,7 +536,8 @@ class RosBridge:
         except Exception as e:  # pragma: no cover
             self.log(f"MoveIt interface unavailable: {e}")
 
-        self._executor = MultiThreadedExecutor(num_threads=6)
+        # 4, not 6: TF has its own thread now, and more Python threads mostly wait on each other for the GIL
+        self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(n)
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True, name="ros-executor")
         self._spin_thread.start()
@@ -403,6 +613,17 @@ class RosBridge:
         return self._wait_future(client.call_async(request), timeout_s)
 
     # ========================================================= subscriptions
+    # The arm's joint states come at 500 Hz and the gripper's at its controller rate, both on /joint_states. The GUI
+    # needs about 100 Hz (view, status, standstill); every message in Python cost CPU the Jetson did not have.
+    JOINTS_MIN_DT = 0.01
+    GRIPPER_MIN_DT = 0.02
+
+    def _on_joints_raw(self, data: bytes):
+        now = time.monotonic()
+        if now - self._t_joints < self.JOINTS_MIN_DT and now - self._t_grip_msg < self.GRIPPER_MIN_DT:
+            return
+        self._on_joints(deserialize_message(data, JointState))
+
     def _on_joints(self, msg: JointState):
         # The gripper has its own controller manager: its joint usually arrives in a separate message on the
         # same topic, so read it before deciding whether this message carries the arm.
@@ -415,6 +636,7 @@ class RosBridge:
             with self._lock:
                 self._snap.gripper_position = gpos
                 self._snap.gripper_joint = gjoint
+                self._t_grip_msg = time.monotonic()
         q = reorder_joints(msg.name, msg.position, self.profile.joint_names)
         if q is None:
             return            # e.g. the gripper-only JointState message
@@ -471,6 +693,7 @@ class RosBridge:
 
     def _on_prog(self, msg: Bool):
         with self._lock:
+            self._ext_control = bool(msg.data)           # the driver's own word: External Control is connected
             self._snap.program_running = bool(msg.data)
             if msg.data:
                 self._snap.program_state = "PLAYING"
@@ -558,7 +781,11 @@ class RosBridge:
             st = (res.state.state or "").strip().upper()
             with self._lock:
                 self._snap.program_state = st or None
-                self._snap.program_running = st == "PLAYING"
+                # PLAYING says only that some program plays. The arm takes motion only when it is External
+                # Control connected to this driver (it may point at another PC): the driver's topic says that.
+                # Without a topic in the profile, trust the Dashboard.
+                ext = getattr(self, "_ext_control", None) if self.profile.topics.get("program_running") else True
+                self._snap.program_running = st == "PLAYING" and ext is True
         elif res is not None and dashboard_lost(res.answer):
             with self._lock:
                 self._snap.program_state = None
@@ -1167,101 +1394,10 @@ class RosBridge:
                 out[a.object.id] = a.link_name
         return out
 
-    # Camera calibration (handeye.py): one full-resolution frame and the camera's intrinsics, on demand.
-    def _next_image(self, topic: str, timeout_s: float):
-        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why)."""
-        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
-        t = next((x for x in types if x in IMAGE_TYPES), None)
-        if t is None:
-            return None, f"{topic}: no image publisher"
-        got, ev = {}, threading.Event()
 
-        def on_msg(m):
-            if not ev.is_set():
-                got["m"] = m
-                ev.set()
-        if t == IMAGE_TYPE:
-            from sensor_msgs.msg import Image as Msg
-        else:
-            from sensor_msgs.msg import CompressedImage as Msg
-        sub = self.node.create_subscription(Msg, topic, on_msg, qos_profile_sensor_data, callback_group=self.cb)
-        try:
-            if not ev.wait(timeout_s):
-                return None, f"{topic}: no image within {timeout_s:.0f} s"
-        finally:
-            self.node.destroy_subscription(sub)
-        return t, got["m"]
 
-    def grab_image(self, topic: str, timeout_s: float = 3.0):
-        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
-        or (None, why)."""
-        import cv2
-        t, m = self._next_image(topic, timeout_s)
-        if t is None:
-            return None, m
-        try:
-            if t == IMAGE_TYPE:
-                from .camera import to_gray
-                img = to_gray(m.encoding, m.width, m.height, m.step, m.data, bool(m.is_bigendian))
-            else:
-                img = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_GRAYSCALE)
-                if img is None:
-                    return None, f"{topic}: could not decode {m.format}"
-        except Exception as e:
-            return None, f"{topic}: {e}"
-        return img, m.header.frame_id
 
-    def grab_photo(self, topic: str, timeout_s: float = 3.0):
-        """(JPEG bytes at full resolution, "") of the next frame of an image topic, or (None, why). A JPEG
-        CompressedImage is passed through unchanged."""
-        t, m = self._next_image(topic, timeout_s)
-        if t is None:
-            return None, m
-        try:
-            if t == IMAGE_TYPE:
-                from .camera import decode_image, encode_jpeg
-                return encode_jpeg(decode_image(m.encoding, m.width, m.height, m.step, m.data,
-                                                bool(m.is_bigendian), max_width=max(1, int(m.width)))), ""
-            if "jpeg" in str(m.format).lower() or "jpg" in str(m.format).lower():
-                return bytes(m.data), ""
-            import cv2
-            from .camera import encode_jpeg
-            bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
-            if bgr is None:
-                return None, f"{topic}: could not decode {m.format}"
-            return encode_jpeg(bgr[..., ::-1]), ""
-        except Exception as e:
-            return None, f"{topic}: {e}"
 
-    def camera_info(self, topic: str, timeout_s: float = 3.0) -> Tuple[Optional[dict], str]:
-        from sensor_msgs.msg import CameraInfo
-        got, ev = {}, threading.Event()
-
-        def on_msg(m):
-            if not ev.is_set():
-                got["m"] = m
-                ev.set()
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-        sub = self.node.create_subscription(CameraInfo, topic, on_msg, qos, callback_group=self.cb)
-        try:
-            if not ev.wait(timeout_s):
-                return None, f"{topic}: no CameraInfo within {timeout_s:.0f} s"
-        finally:
-            self.node.destroy_subscription(sub)
-        m = got["m"]
-        return {"K": [float(v) for v in m.k], "D": [float(v) for v in m.d], "model": m.distortion_model,
-                "width": int(m.width), "height": int(m.height), "frame_id": m.header.frame_id}, "ok"
-
-    def tf_parent(self, frame: str) -> Optional[str]:
-        """The TF parent of a frame (e.g. the camera driver's camera_link above its optical frame), or None."""
-        if self._tf is None:
-            return None
-        try:
-            d = yaml.safe_load(self._tf.all_frames_as_yaml()) or {}
-        except Exception:
-            return None
-        p = (d.get(frame) or {}).get("parent")
-        return p if p and p != "NO_PARENT" else None
 
     # ======================================================== transition checks
     def trajectory_action_ready(self, controller: str) -> bool:
@@ -1468,51 +1604,6 @@ class RosBridge:
         self.log(msg)
         return (res is not None and res.success), msg
 
-    # ================================================================ topics
-    def topic_types(self) -> List[Tuple[str, str]]:
-        """(topic, type) for every topic in the graph now (one row per type), for the recorder."""
-        try:
-            return sorted((name, t) for name, types in self.node.get_topic_names_and_types() for t in types)
-        except Exception:  # noqa: BLE001 - a graph query during shutdown
-            return []
-
-    # ================================================================ cameras
-    def image_topics(self) -> List[Tuple[str, str]]:
-        return sorted((name, t) for name, types in self.node.get_topic_names_and_types() for t in types
-                      if t in IMAGE_TYPES)
-
-    def topic_publishers(self, topic: str) -> int:
-        return self.node.count_publishers(topic)
-
-    def watch_image(self, topic: Optional[str]) -> Tuple[bool, str]:
-        """Preview one image topic (or none). Only one subscription exists at a time."""
-        if self._image_sub is not None:
-            self.node.destroy_subscription(self._image_sub)
-            self._image_sub, self._image_watch = None, None
-        if not topic:
-            return True, "preview off"
-        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
-        t = next((x for x in types if x in IMAGE_TYPES), None)
-        if t is None:
-            return False, f"{topic}: no image publisher" if not types else f"{topic} is {', '.join(types)}"
-        w = ImageWatch(topic)
-        if t == IMAGE_TYPE:
-            from sensor_msgs.msg import Image
-            cb = lambda m: w.on_image(m.encoding, m.width, m.height, m.step, m.data, bool(m.is_bigendian),  # noqa
-                                      m.header.frame_id)
-            self._image_sub = self.node.create_subscription(Image, topic, cb, qos_profile_sensor_data,
-                                                            callback_group=self.cb)
-        else:
-            from sensor_msgs.msg import CompressedImage
-            cb = lambda m: w.on_compressed(m.format, m.data, m.header.frame_id)  # noqa
-            self._image_sub = self.node.create_subscription(CompressedImage, topic, cb, qos_profile_sensor_data,
-                                                            callback_group=self.cb)
-        self._image_watch = w
-        return True, f"watching {topic}"
-
-    def watched_image(self) -> Optional[ImageWatch]:
-        return self._image_watch
-
     def _param_call(self, srv_type, service: str, request):
         """A parameter service call on a client kept per service. A new client per call had to discover the service
         again each time (0.5 s): on a busy ROS graph that missed, and the F/T bias / gains read as "not running"."""
@@ -1636,6 +1727,12 @@ class RosBridge:
                 time.sleep(0.02)
         time.sleep(0.1)                                  # let DDS send the last zeros before the node goes
         self._executor.shutdown(timeout_sec=1.0)
+        if getattr(self, "_tf_node", None) is not None:
+            try:
+                self._tf_listener.executor.shutdown(timeout_sec=1.0)
+                self._tf_node.destroy_node()
+            except Exception as e:
+                self.log(f"shutdown: TF node: {e}")
         self.node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

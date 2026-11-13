@@ -27,5 +27,6 @@ setup(
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={"console_scripts": ["moveit_gui = moveit_gui.app:main",
-                                      "moveit_gui_web = moveit_gui.web.server:main"]},
+                                      "moveit_gui_web = moveit_gui.web.server:run",
+                                      "moveit_gui_idle = moveit_gui.web.idle:run"]},
 )
