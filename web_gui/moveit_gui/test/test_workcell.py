@@ -352,6 +352,8 @@ def test_restart_rules(env):
         run(s, "restart", what="stack")
     s.core.busy = False
     run(s, "restart", what="gui")
+    again = run(s, "restart", what="gui")
+    assert "already pending" in again["msg"]
     assert s.restart_code == RESTART_GUI and wait(lambda: got == [1], 3)
 
 

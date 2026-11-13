@@ -28,8 +28,40 @@ function h(tag, props = {}, ...kids) {
   for (const c of kids.flat()) if (c != null && c !== false) el.append(c.nodeType ? c : document.createTextNode(c));
   return el;
 }
-const btn = (text, role = "", onclick = null, title = "") =>
-  h("button", { class: `btn ${role}`, onclick, title: title || null }, text);
+function actionState(b, state) {
+  if (!b) return;
+  if (state) b.dataset.actionState = state; else delete b.dataset.actionState;
+  b.setAttribute("aria-busy", state === "pending" || state === "running" ? "true" : "false");
+}
+async function runAction(b, onclick, e) {
+  if (!onclick || b.dataset.actionState === "pending" || b.dataset.actionState === "running") return;
+  actionState(b, "pending");
+  let r;
+  try {
+    r = onclick(e);
+    if (r && typeof r.then === "function") r = await r;
+    if (r && r.job) {
+      actionState(b, "running");
+      r = await waitJob(r.job);
+    }
+    if (r && typeof r === "object" && "ok" in r) {
+      actionState(b, r.ok ? "done" : "error");
+      const state = b.dataset.actionState;
+      setTimeout(() => { if (b.dataset.actionState === state) actionState(b, ""); }, 900);
+    } else actionState(b, "");
+  } catch (x) {
+    actionState(b, "error");
+    toast(x && x.message ? x.message : String(x), false);
+    setTimeout(() => { if (b.dataset.actionState === "error") actionState(b, ""); }, 1200);
+  }
+  return r;
+}
+const action = (onclick) => function (e) { return runAction(e.currentTarget, onclick, e); };
+const btn = (text, role = "", onclick = null, title = "") => {
+  const b = h("button", { class: `btn ${role}`, title: title || null }, text);
+  if (onclick) b.addEventListener("click", action(onclick));
+  return b;
+};
 // one short line of help; the details sit behind ⓘ (hover / long-press) instead of a paragraph on the page
 const note = (short, details = "") => h("div", { class: "muted small" }, short,
   details ? h("span", { class: "hint", title: details }, " ⓘ") : null);
@@ -75,7 +107,10 @@ async function post(path, body = {}, silent = false) {
     data = { ok: false, msg: `no answer from the robot PC (${e.message})` };
   }
   if (silent) return data;
-  if (data.job) myJobs.add(data.job);
+  if (data.job) {
+    const early = ownJob(data.job);
+    if (early) setTimeout(() => showJobResult(early), 0);
+  }
   if (!data.ok) toast(data.msg || "failed", false);
   else if (data.msg && data.msg !== "ok" && data.msg !== "started") say(data.msg, true);   // the page shows the result
   return data;
@@ -100,6 +135,43 @@ function say(msg, ok) {
 }
 // toasts: answers to what THIS browser did. Errors stay until dismissed, the rest fade after 3 s.
 const myJobs = new Set();
+const earlyResults = new Map();
+const jobResults = new Map();
+const jobWaiters = new Map();
+function rememberJobResult(r) {
+  jobResults.set(r.id, r);
+  while (jobResults.size > 50) jobResults.delete(jobResults.keys().next().value);
+  const done = jobWaiters.get(r.id);
+  if (done) { jobWaiters.delete(r.id); jobResults.delete(r.id); done(r); }
+}
+function ownJob(id) {
+  myJobs.add(id);
+  const r = earlyResults.get(id);
+  if (!r) return null;
+  earlyResults.delete(id);
+  myJobs.delete(id);
+  rememberJobResult(r);
+  return r;
+}
+function takeJobResult(r) {
+  if (myJobs.delete(r.id)) { rememberJobResult(r); return true; }
+  earlyResults.set(r.id, r);
+  while (earlyResults.size > 50) earlyResults.delete(earlyResults.keys().next().value);
+  return false;
+}
+function waitJob(id) {
+  const r = jobResults.get(id);
+  if (r) { jobResults.delete(id); return Promise.resolve(r); }
+  return new Promise((resolve) => jobWaiters.set(id, resolve));
+}
+function clearJobResults() {
+  const stopped = { ok: false, msg: "the GUI restarted before the result arrived" };
+  for (const done of jobWaiters.values()) done(stopped);
+  myJobs.clear();
+  earlyResults.clear();
+  jobResults.clear();
+  jobWaiters.clear();
+}
 function toast(msg, ok, sticky) {
   say(msg, ok);
   const box = $("#toasts");
@@ -115,7 +187,9 @@ function toast(msg, ok, sticky) {
 
 const modeLabel = (n) => INFO.modes.find((m) => m.name === n)?.label || n;
 // gate(el, cond): enabled only with the control lease AND cond
-function gate(el, cond = true) { el.disabled = !(holds && cond); }
+function gate(el, cond = true) {
+  el.disabled = el.dataset.actionState === "pending" || el.dataset.actionState === "running" || !(holds && cond);
+}
 
 // ------------------------------------------------------------------- lease
 // The profile: who you are, asked once per browser. The others see the name, and who has control.
@@ -129,12 +203,13 @@ async function profilePrefs(name, reload) {
   const r = await scmd("profile_prefs_get", { name });
   if (!r.ok) { prefsSynced = null; return; }
   const local = localPrefs();
+  const sorted = (o) => JSON.stringify(Object.fromEntries(Object.entries(o).sort()));
   if (!Object.keys(r.prefs).length) {
-    prefsSynced = JSON.stringify(local);
-    if (Object.keys(local).length) scmd("profile_prefs_save", { name, prefs: local });
+    if (!Object.keys(local).length) { prefsSynced = sorted(local); return; }
+    const saved = await scmd("profile_prefs_save", { name, prefs: local });
+    prefsSynced = saved.ok ? sorted(local) : null;       // a failed save must be retried, not remembered as synced
     return;
   }
-  const sorted = (o) => JSON.stringify(Object.fromEntries(Object.entries(o).sort()));
   prefsSynced = sorted(r.prefs);
   if (sorted(local) === prefsSynced) return;
   for (const k of PREF_KEYS) if (!(k in r.prefs)) localStorage.removeItem(k);
@@ -143,11 +218,17 @@ async function profilePrefs(name, reload) {
   location.reload();                        // the navigation is not at once: the caller must stop here
   return true;
 }
-setInterval(() => {                         // a changed layout goes to the profile (5 s)
+let prefsSaving = false;
+setInterval(async () => {                    // a changed layout goes to the profile (5 s)
   const n = localStorage.getItem("operator");
-  if (!n || prefsSynced == null) return;
-  const now = JSON.stringify(localPrefs());
-  if (now !== prefsSynced) { prefsSynced = now; scmd("profile_prefs_save", { name: n, prefs: localPrefs() }); }
+  if (!n || prefsSynced == null || prefsSaving) return;
+  const prefs = localPrefs(), now = JSON.stringify(prefs);
+  if (now === prefsSynced) return;
+  prefsSaving = true;
+  try {
+    const r = await scmd("profile_prefs_save", { name: n, prefs });
+    if (r.ok && localStorage.getItem("operator") === n && JSON.stringify(localPrefs()) === now) prefsSynced = now;
+  } finally { prefsSaving = false; }
 }, 5000);
 async function operatorName(force) {
   let n = localStorage.getItem("operator") || "";
@@ -413,6 +494,13 @@ function holdEnd(b, stopIfRunning) {
 window.addEventListener("pointerup", () => HOLD.btn && holdEnd(HOLD.btn, true));
 window.addEventListener("blur", () => HOLD.btn && holdEnd(HOLD.btn, true));
 function holdJobDone(id) { if (HOLD.job === id) HOLD.job = null; }
+function showJobResult(r) {
+  holdJobDone(r.id);
+  if (holdCancelled.has(r.id)) { holdCancelled.delete(r.id); toast(`${r.cmd}: stopped (button released)`, true); return; }
+  toast(`${r.cmd}: ${r.msg}`, r.ok);
+  if (r.ok && r.cmd === "MoveJ") pages.OPERATE.resetJoints();      // the target is reached: fields follow again
+  if (r.ok && r.cmd === "MovePose") pages.OPERATE.resetCart();
+}
 // set a numeric field; follow=false only writes untouched fields that do not have the focus
 function setField(sel, v, mark, clear) {
   const el = $(sel);
@@ -791,16 +879,16 @@ pages.OPERATE = {
   plan() {
     const { vel, acc } = scaling();
     if (this.mode === "j")
-      cmd("plan_joints", { q_deg: INFO.joint_names.map((_, i) => +$(`#op-j${i}`).value), vel, acc });
+      return cmd("plan_joints", { q_deg: INFO.joint_names.map((_, i) => +$(`#op-j${i}`).value), vel, acc });
     else {
       const v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-c${i}`).value);
       const linear = $("#op-linear").checked;
-      cmd("plan_pose", { frame: $("#op-frame").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3),
+      return cmd("plan_pose", { frame: $("#op-frame").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3),
                          linear, vel, acc, speed_mm_s: linear ? mmS() : null });
     }
   },
   async execute() {
-    if (await confirmMove("Execute the previewed plan (" + (S.plan.what || "") + ")")) cmd("plan_execute");
+    if (await confirmMove("Execute the previewed plan (" + (S.plan.what || "") + ")")) return cmd("plan_execute");
   },
   async refreshPlan(s) {
     if (!s.plan.what && this.planId !== -2) { this.planId = -2; this.view && this.view.clearPreview(); }   // used / gone
@@ -886,13 +974,13 @@ pages.OPERATE = {
         + (d.big ? `\n\nWARNING: ${d.big} moves more than 30°.` : "") + `\n\nVelocity ${Math.round(vel * 100)} %`;
       // a large move always asks, even with "Confirm moves" off
       if (d.big ? (await ask(text + "\n\nExecute?")) : await confirmMove(text))
-        cmd("move_joints", { q_deg: q, vel, acc });
+        return cmd("move_joints", { q_deg: q, vel, acc });
     } else {
       const v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-c${i}`).value);
       const frame = $("#op-frame").value, linear = $("#op-linear").checked, mms = linear ? mmS() : null;
       if (await confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`
                             + (mms ? ` at ≤ ${mms} mm/s` : "")))
-        cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc, speed_mm_s: mms });
+        return cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc, speed_mm_s: mms });
     }
   },
   modePick() {
@@ -910,7 +998,7 @@ pages.OPERATE = {
     const name = $("#op-mode").value, m = INFO.modes.find((x) => x.name === name);
     if (!m) return;
     if (m.direct_torque && !(await ask(`Enter ${m.label}?\n\nThis commands DIRECT TORQUE on the robot.`, { ok: "Enter", danger: true }))) return;
-    cmd("switch_mode", { mode: name });
+    return cmd("switch_mode", { mode: name });
   },
   // Robot power through the UR Dashboard (pendant in Remote Control), as three steps: Power on → Release brakes →
   // ▶ Play program. Power on and brake release from any browser with control and "I can see the robot", unless
@@ -930,7 +1018,7 @@ pages.OPERATE = {
       const gui = S.runner && S.runner.state === "PAUSED" && S.runner.pause_reason ? "\nThe paused GUI program carries on with its step." : "";
       if (r && r.ok && (await ask(paused ? `Resume ${r.program} on the robot?${gui}` :
         `Start ${r.program} on the robot?\n\nIt must be your External Control program. ` +
-        "Pending GUI motions are cancelled first; the GUI can command the arm once it runs." + gui))) cmd("robot_play", { program: r.program });
+        "Pending GUI motions are cancelled first; the GUI can command the arm once it runs." + gui))) return cmd("robot_play", { program: r.program });
     };
     this.pPlay = btn("▶ Play program", "", play,
       "Start the program loaded on the pendant (External Control). In Remote Control the pendant's Play button is disabled.");
@@ -1377,10 +1465,10 @@ async function forceApply() {
     if (!x.ok || !x.active) { clearInterval(FORCE.timer); FORCE.timer = null; }
   }, 200);
 }
-function forceRelease() { post("/api/cmd", { cmd: "force_release", args: {} }); }
+function forceRelease() { return post("/api/cmd", { cmd: "force_release", args: {} }); }
 function forceStop() {
   if (FORCE.timer) { clearInterval(FORCE.timer); FORCE.timer = null; }
-  post("/api/cmd", { cmd: "force_stop", args: {} });
+  return post("/api/cmd", { cmd: "force_stop", args: {} });
 }
 
 function forceUpdate(s) {
@@ -1578,12 +1666,12 @@ pages.PROGRAMS = {
         const v = [...scrape.querySelector(".grid").querySelectorAll("input[type=number]")].map((i) => +i.value);
         const common = { frame: $("#pg-sc-frame").value, step_deg: v[1], count: v[2], approach_mm: v[3],
           back_and_forth: $("#pg-sc-back").checked };
-        const fold = (r) => r.ok && this.foldAll(true);      // one folder per angle: start folded
+        const fold = (r) => { if (r.ok) this.foldAll(true); return r; };      // one folder per angle: start folded
         if (scrape.querySelector("input[name=pg-sc-kind]:checked").value === "baseline")
-          this.apply(pcmd("program_scrape_baseline", { ...common, press_axis: $("#pg-sc-axis").value, force_n: +$("#pg-sc-f").value,
+          return this.apply(pcmd("program_scrape_baseline", { ...common, press_axis: $("#pg-sc-axis").value, force_n: +$("#pg-sc-f").value,
             contact_n: +$("#pg-sc-c").value, stroke_mm: +$("#pg-sc-s").value, strokes: +$("#pg-sc-n").value,
             standoff_mm: +$("#pg-sc-so").value, search_mm: +$("#pg-sc-se").value })).then(fold);
-        else this.apply(pcmd("program_scrape", { ...common, policy: policySel.value, duration: v[0] }));
+        else return this.apply(pcmd("program_scrape", { ...common, policy: policySel.value, duration: v[0] }));
       }));
     scrape.lastChild.dataset.lease = "1";
     const yamlBox = h("details", { class: "card" }, h("summary", { class: "section" }, "Edit as YAML"),
@@ -1658,7 +1746,7 @@ pages.PROGRAMS = {
       (await ask(`"${this.prog.name}" has unsaved changes. Discard them and ${what}?`));
   },
   undo(redo) {
-    if (holds && S && S.runner.state === "IDLE") this.apply(cmd(redo ? "program_redo" : "program_undo"));
+    if (holds && S && S.runner.state === "IDLE") return this.apply(cmd(redo ? "program_redo" : "program_undo"));
   },
   async apply(promise) { const r = await promise; if (r.ok && r.program) this.display(r.program, r.selected); return r; },
   show() { if (this.tab === "insert" && $("#pg-drawer").open) dockJog($("#pg-jog")); },
@@ -2058,7 +2146,7 @@ pages.PROGRAMS = {
     if (wp) {
       const set = btn("Set waypoint here", "", async () => {
         if (!(await ask(`Re-teach waypoint ${wp.name} from the current robot position? Other steps using it follow.`))) return;
-        this.apply(pcmd("program_set_waypoint", { path: row.path }));
+        return this.apply(pcmd("program_set_waypoint", { path: row.path }));
       }, "Re-teach this waypoint from the robot's current position");
       const here = holdButton("Hold: Move here", () => {
         const { vel, acc } = scaling();
@@ -2070,21 +2158,21 @@ pages.PROGRAMS = {
     }
     box.replaceChildren(...kids);
   },
-  move(d) { if (this.path) this.apply(pcmd("program_move_step", { path: this.path, delta: d })).then((r) => r.ok && r.selected === undefined && this.moved(d)); },
+  move(d) { if (this.path) return this.apply(pcmd("program_move_step", { path: this.path, delta: d })).then((r) => { if (r.ok && r.selected === undefined) this.moved(d); return r; }); },
   moved(d) { const p = [...this.path]; p[p.length - 1] += d; this.path = p; this.display(this.prog); },
-  dup() { if (this.path) this.apply(pcmd("program_duplicate", { path: this.path })); },
+  dup() { if (this.path) return this.apply(pcmd("program_duplicate", { path: this.path })); },
   async del() {
     const r = this.row();
     if (!r) return;
     const kids = this.prog.rows.filter((x) => x.path.length > r.path.length && pathEq(x.path.slice(0, r.path.length), r.path)).length;
     if (kids && !(await ask(`Delete ${r.label} ${r.title} and the ${kids} command(s) inside it? (Undo brings it back.)`))) return;
-    this.apply(pcmd("program_delete_step", { path: this.path }));
+    return this.apply(pcmd("program_delete_step", { path: this.path }));
   },
   async run(step) {
     const start = $("#pg-from").checked && this.path ? this.path : null;
     if (S.runner.state === "PAUSED") return pcmd("program_resume", { step_mode: step });
     if (!INFO.fake && !step && !(await ask(`Run ${this.prog?.name || "program"} on the robot${start ? " from step " + this.row()?.label : ""}?`))) return;
-    pcmd("program_run", { start, step_mode: step, loop: $("#pg-loop").checked });
+    return pcmd("program_run", { start, step_mode: step, loop: $("#pg-loop").checked });
   },
   update(s) {
     if (!this.v3init && $("#pg-v3").offsetParent) { this.v3init = true; this.init3d(); }   // first time PROGRAMS shows
@@ -2192,10 +2280,10 @@ pages.PROGRAMS = {
   teachTol() { return { pos_tol_mm: +$("#pg-tc-mm").value, rot_tol_deg: +$("#pg-tc-deg").value }; },
   teachStart() {
     const path = $("#pg-tc-mode").value === "path";
-    cmd("teach_start", { mode: path ? "path" : "waypoints", move: $("#pg-tc-move").value, frame: $("#pg-frame").value,
+    return cmd("teach_start", { mode: path ? "path" : "waypoints", move: $("#pg-tc-move").value, frame: $("#pg-frame").value,
       auto: !path && $("#pg-tc-auto").checked, path: this.path, where: this.where, ...this.teachTol() });
   },
-  teachSimplify() { if (S && S.teach && S.teach.phase === "review") cmd("teach_simplify", this.teachTol()); },
+  teachSimplify() { if (S && S.teach && S.teach.phase === "review") return cmd("teach_simplify", this.teachTol()); },
   teachInsert() {
     if ($("#pg-tc-kind").value === "replay") {
       const sp = $("#pg-tc-rspeed").value.trim();
@@ -2203,7 +2291,7 @@ pages.PROGRAMS = {
     }
     const v = $("#pg-tc-speed").value.trim();
     const f = $("#pg-tc-press").value.trim();
-    this.apply(cmd("teach_insert", { kind: "movel", ...this.teachTol(), speed_mm_s: v === "" ? null : +v, path: this.path, where: this.where,
+    return this.apply(cmd("teach_insert", { kind: "movel", ...this.teachTol(), speed_mm_s: v === "" ? null : +v, path: this.path, where: this.where,
       press_n: f === "" || +f === 0 ? null : +f, press_dir: $("#pg-tc-pdir").value }));
   },
   teachUpdate(s) {
@@ -2365,7 +2453,7 @@ pages.PROGRAMS = {
     if (c.problems.length) { toast("Batch check found problems:\n• " + c.problems.join("\n• "), false, true); return; }
     if (!INFO.fake && !(await ask(`Run ${this.prog?.name || "the program"} ${c.runs} times on the robot?\n\n` +
       "Each run is a normal program run. STOP ends the whole batch.", { ok: "Run" }))) return;
-    cmd("batch_run", { batch });
+    return cmd("batch_run", { batch });
   },
   batchUpdate(s) {
     const b = s.batch;
@@ -2442,7 +2530,7 @@ pages.AUTOMATION = {
   async run() {
     const p = INFO.policies.find((x) => x.name === this.sel), m = INFO.modes.find((x) => x.name === p.mode);
     if (!INFO.fake && !(await ask(`Run ${p.name} on the robot?` + (m && m.direct_torque ? "\n\nThis commands DIRECT TORQUE." : "")))) return;
-    cmd("policy_run", { name: this.sel, recording: this.rec() });
+    return cmd("policy_run", { name: this.sel, recording: this.rec() });
   },
   async requirements() {
     if (!this.sel || Date.now() - this.reqT < 1500) return;
@@ -2668,7 +2756,7 @@ pages.SETUP = {
             if (INFO.fake || (await ask(`Move through all ${n} calibration poses in order and evaluate?\n\n` +
                 "This starts over (collected poses are cleared). Check the poses with ◀ ▶ first and that the " +
                 "workspace is clear. Keep a hand near STOP.")))
-              cmd("payload_collect");
+              return cmd("payload_collect");
           }, "Start over and collect every pose in order, then evaluate"); b.id = "su-pall"; return b; })(),
           (() => { const b = btn("Evaluate", "", () => cmd("payload_evaluate"),
             "Fit mass and CoG from the poses collected so far (3 or more; more and more different is better)"); b.id = "su-peval"; return b; })(),
@@ -2792,7 +2880,7 @@ pages.SETUP = {
     const name = p.poses[this.pPick];
     if (INFO.fake || (await ask(`Move to "${name}" (the blue ghost) and collect it?\n\nCheck that the path ` +
         "from where the arm is now is clear. Keep a hand near STOP.")))
-      cmd("payload_collect", { index: this.pPick });
+      return cmd("payload_collect", { index: this.pPick });
   },
   // F/T limit card (ft_guard.py): soft warns, hard stops the GUI's motion
   ftLimitCard() {
@@ -3134,7 +3222,7 @@ pages.SETUP = {
                    rpy_deg: this.koVals("su-ko-r"), enabled: $("#su-ko-en").checked };
     if (this.koEditing) args.replace = this.koEditing;
     else if (S.keepout.boxes.some((b) => b.name === name)) { toast(`a box named ${name} exists: Edit it instead`, false); return; }
-    cmd("keepout_save", args).then((r) => { if (r.ok) this.koForm({ ...args }); });
+    return cmd("keepout_save", args).then((r) => { if (r.ok) this.koForm({ ...args }); return r; });
   },
   koUpdate(s) {
     const k = s.keepout, st = k.status;
@@ -3198,13 +3286,14 @@ pages.SETUP = {
     const name = $("#su-tn").value.trim(), v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#su-to${i}`).value);
     const exists = S.calibration.tcps.some((t) => t.name === name && !t.builtin);
     if (exists && !(await ask(`Change TCP ${name}? Poses taught with it will now mean a different tool point.`))) return;
-    cmd("tcp_save", { name, parent: $("#su-tp").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), replace: exists });
+    return cmd("tcp_save", { name, parent: $("#su-tp").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), replace: exists });
   },
   async pivotCmd(command, args = {}) {
     const r = await cmd(command, args);
     if (r.ok && r.pivot) this.pivotUpdate(r.pivot);
+    return r;
   },
-  pivotReset() { this.pivotCmd("pivot_reset", { parent: $("#su-tp").value }); },
+  pivotReset() { return this.pivotCmd("pivot_reset", { parent: $("#su-tp").value }); },
   pivotUpdate(p) {
     this.pivot = p;
     $("#su-pivot-samples").replaceChildren(...p.samples.map((x, i) => h("span", { class: "chip", title: `${x.xyz_mm.join(", ")} mm · ${x.rpy_deg.join(", ")}°` },
@@ -3221,7 +3310,7 @@ pages.SETUP = {
     const name = $("#su-tn").value.trim();
     const existing = S.calibration.tcps.some(t => t.name === name);
     if (existing && !(await ask(`Replace TCP ${name}? Previously taught poses will use the new offset.`))) return;
-    cmd("pivot_save", { name, replace: existing, rpy_deg: [3, 4, 5].map(i => +$(`#su-to${i}`).value) });
+    return cmd("pivot_save", { name, replace: existing, rpy_deg: [3, 4, 5].map(i => +$(`#su-to${i}`).value) });
   },
   // F/T bias: software offsets on the F/T broadcaster (the ATI box itself is never biased)
   buildBias() {
@@ -3595,7 +3684,7 @@ pages.DIAGNOSTICS = {
       h("div", { class: "muted small", style: "margin-top:6px" }, "Saved in ", h("span", { class: "mono", id: "dg-rec-dir" }),
         ". Open the .mcap file in PlotJuggler 4 or Lichtblick/Foxglove; ros2 bag play replays it."),
       h("div", { class: "scroll", style: "max-height:180px;margin-top:4px" }, h("table", { class: "hist" },
-        h("thead", {}, h("tr", {}, ["When", "Name", "Started by", "Length", "Size", "Topics", "Result"].map((x) => h("th", {}, x)))),
+        h("thead", {}, h("tr", {}, ["When", "Name", "Operator", "Program", "Length", "Size", "Topics", "Result", "File"].map((x) => h("th", {}, x)))),
         h("tbody", { id: "dg-rec-recent" }))));
   },
   async recCatalog() {
@@ -3609,11 +3698,21 @@ pages.DIAGNOSTICS = {
     const mb = (v) => (v >= 1000 ? (v / 1000).toFixed(2) + " GB" : (v || 0).toFixed(1) + " MB");
     $("#dg-rec-recent").replaceChildren(...(r.recent.length ? r.recent.map((m) => h("tr", { title: m.dir },
       h("td", { class: "mono" }, new Date(m.started * 1000).toLocaleString()), h("td", { class: "mono small" }, m.name),
-      h("td", {}, m.run && m.run.name ? `${m.source}: ${m.run.kind} ${m.run.name}` : m.source),
+      h("td", {}, m.operator || m.source || "—"),
+      h("td", {}, m.program || (m.run && m.run.kind === "program" ? m.run.name : "") || "—"),
       h("td", { class: "num" }, (m.duration_s || 0).toFixed(0) + " s"), h("td", { class: "num" }, mb(m.size_mb)),
       h("td", { class: "num" }, m.topics.length),
       h("td", { style: `color:var(--${m.ok ? "ok" : m.ok === false ? "danger" : "muted"})` },
-        m.ok == null ? "recording…" : (m.ok ? "✓ " : "✗ ") + m.reason))) :
+        m.active ? "recording…" : m.ok == null ? "result unknown" : (m.ok ? "✓ " : "✗ ") + m.reason),
+      h("td", { class: "row" },
+        m.mcap ? h("a", { class: "btn quiet", href: "/api/record.mcap?name=" + encodeURIComponent(m.name), download: true }, "MCAP") : null,
+        holds && (INFO.role === "admin" || (m.operator && m.operator.toLowerCase() === (localStorage.getItem("operator") || "").toLowerCase()))
+          ? btn("Delete", "quiet", async () => {
+              if (!(await ask(`Delete recording ${m.name}?\n\nThis permanently removes its MCAP, metadata and photos.`, { ok: "Delete", danger: true }))) return;
+              const out = await cmd("record_delete", { name: m.name });
+              if (out.ok) this.recCatalog();
+              return out;
+            }) : null))) :
       [h("tr", {}, h("td", { class: "muted" }, "No recordings yet."))]));
   },
   recTopics() {
@@ -3866,6 +3965,12 @@ function robotSummary(s, progOff, healthy) {
     `Press ${s.program_state === "PAUSED" ? "Resume" : "Play"} program on the Robot card`, "bad"];
   return ["Ready", `Running · ${nice(s.safety_mode)}`, healthy ? "ok" : ""];
 }
+async function stopRobotStack() {
+  if (!(await ask("Stop the robot?\n\nThe driver, MoveIt and cameras stop. This page stays available with one Start button. " +
+                  "The arm is not powered off or emergency-stopped.", { ok: "Stop robot", danger: true }))) return;
+  return cmd("stack_stop", { who: localStorage.getItem("operator") || "" });
+}
+
 function renderHeader(s) {
   // robot_program_running is only published once it changes: no value while RUNNING = External Control never ran
   const progOff = s.program_running === false || (s.program_running == null && s.robot_mode === "RUNNING");
@@ -3894,15 +3999,28 @@ function renderHeader(s) {
   pill.className = "pill " + actCls;
   pill.onclick = actPage ? () => navTo(actPage) : null;
   const rec = s.record && s.record.recording, rp = $("#h-rec");
-  rp.hidden = !rec;
   const rb = $("#h-recbtn");
   rb.innerHTML = rec ? '■<span class="lbl"> Stop rec</span>' : '●<span class="lbl"> Record</span>';
   rb.classList.toggle("danger", !!rec);
   rb.disabled = rec ? !!rec.stopping : !holds;
-  if (rec) {
-    rp.textContent = `● REC ${mmss(rec.elapsed_s)} · ${rec.size_mb.toFixed(1)} MB`;
-    rp.title = `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`;
-  }
+  rp.textContent = rec ? `● ${mmss(rec.elapsed_s)}` : "Off";
+  rp.className = "val hstat" + (rec ? " rec" : "");
+  rp.title = rec ? `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`
+    : "No recording. Click for recording details.";
+  const storage = s.record && s.record.storage;
+  const hs = $("#h-storage");
+  hs.textContent = !storage || storage.free_gb == null ? "—" : `${storage.free_gb.toFixed(1)} GB`;
+  hs.className = "val " + (storage && storage.state === "critical" ? "storage-critical" : storage && storage.state === "low" ? "storage-low" : "");
+  hs.title = !storage ? "Storage status unavailable" : storage.error ? `Storage check failed: ${storage.error}` :
+    `${nice(storage.state)} · recording start needs ${Math.round(storage.start_min_mb / 1000)} GB free; active recording stops below ${(storage.stop_min_mb / 1000).toFixed(1)} GB`;
+  const cameraRows = (s.workcell && s.workcell.drivers || []).filter((d) => d.kind === "camera");
+  const runningCams = cameraRows.filter((d) => d.state === "running").length;
+  const hc = $("#h-camera");
+  hc.textContent = !cameraRows.length ? "None" : runningCams === cameraRows.length ? `${runningCams} ready`
+    : runningCams ? `${runningCams}/${cameraRows.length} ready` : "Off";
+  hc.className = "val " + (cameraRows.length && runningCams === cameraRows.length ? "st-ok" : cameraRows.length ? "st-bad" : "");
+  hc.title = cameraRows.length ? cameraRows.map((d) => `${d.label}: ${d.state}${d.msg ? " — " + d.msg : ""}`).join("\n") : "No camera services configured";
+  $("#h-profile").textContent = localStorage.getItem("operator") || "Pick";
   const bad = Object.entries(s.connected || {}).filter(([, v]) => !v).map(([k]) => k);
   $("#h-conn").innerHTML = bad.length ? icon("warn") + `<span class="ell">${bad.join(", ")} off</span>` : "";
   $("#h-conn").title = bad.length ? "Not connected: " + bad.join(", ") : "";
@@ -3949,6 +4067,19 @@ function renderHeader(s) {
   $("#lease-btn").title = viewer ? "You are a Viewer: an Admin can make you an Operator (SETTINGS › Roles)" : "";
   $("#lease-btn").className = "btn " + (holds ? "quiet" : "primary");
   $("#lease-btn").style.color = holds ? "var(--on-chrome2)" : "";
+  const stackStop = $("#h-stackstop");
+  let stackWhy = "";
+  if (viewer) stackWhy = "Viewer access cannot stop the robot stack";
+  else if (!holds) stackWhy = L.client ? `${L.name.split(" @ ")[0]} has control` : "take control first";
+  else if (s.workcell && s.workcell.restarting) stackWhy = "a restart or stop is already pending";
+  else if (s.runner && s.runner.state !== "IDLE") stackWhy = `the program is ${nice(s.runner.state)}`;
+  else if (s.batch && s.batch.active) stackWhy = "a batch is running";
+  else if (s.policy && s.policy.busy) stackWhy = "a policy is running";
+  else if (s.force && s.force.active) stackWhy = "force control is active";
+  else if (!s.idle) stackWhy = act !== "Nothing" ? `${act} is active` : "the robot is busy";
+  stackStop.disabled = !!stackWhy;
+  stackStop.title = stackWhy ? "Cannot stop robot: " + stackWhy
+    : "Stop the driver, MoveIt and cameras and leave a Start page. The marker persists across reboot.";
   document.querySelectorAll("[data-freedrive]").forEach((b) => {
     b.textContent = s.freedrive ? "End freedrive" : "Freedrive";
     b.classList.toggle("on", s.freedrive);
@@ -4024,7 +4155,11 @@ async function boot() {
     const note = await askText("Record everything\n\nNote for this run (optional):", "", { ok: "Record", maxLength: 200, placeholder: "note" });
     if (note != null) cmd("record_start", { preset: "all", note: note.trim() });
   };
+  $("#h-stackstop").onclick = action(stopRobotStack);
   $("#h-rec").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
+  $("#h-storage-grp").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
+  $("#h-camera-grp").onclick = () => { navTo("SETUP"); pages.SETUP.show("Cameras"); };
+  $("#h-profile-grp").onclick = () => operatorName(true);
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") post("/api/stop"); });
 
   const es = new EventSource("/api/events?bid=" + encodeURIComponent(BID) + "&name=" +
@@ -4036,14 +4171,16 @@ async function boot() {
     const next = JSON.parse(e.data);
     if (next.error) { srvError = String(next.error); if (S) render(); return; }   // keep the last good state
     srvError = ""; S = next;
-    if (S.boot && boot && S.boot !== boot && sessionStorage.getItem("retake")) { location.reload(); return; }
-    if (S.boot && boot && S.boot !== boot && !$("#reload-bar")) {     // the GUI restarted: this page is old code
+    const rebooted = !!(S.boot && boot && S.boot !== boot);
+    if (rebooted) clearJobResults();
+    if (rebooted && sessionStorage.getItem("retake")) { location.reload(); return; }
+    if (rebooted && !$("#reload-bar")) {     // the GUI restarted: this page is old code
       document.body.prepend(h("div", { id: "reload-bar", class: "reload-bar" },
         "The GUI was restarted (maybe updated). This page still runs the old version. ",
         h("button", { class: "btn primary", onclick: () => location.reload() }, "Reload page")));
     }
-    if (S.boot && boot && S.boot !== boot) logSeq = 0;               // sequence numbers restart with the server
-    boot = boot || S.boot;
+    if (rebooted) logSeq = 0;               // sequence numbers restart with the server
+    if (S.boot) boot = S.boot;
     modelWatch(S);
     render();
   });
@@ -4062,15 +4199,7 @@ async function boot() {
   });
   es.addEventListener("result", (e) => {
     const r = JSON.parse(e.data);
-    holdJobDone(r.id);
-    if (holdCancelled.has(r.id)) { holdCancelled.delete(r.id); myJobs.delete(r.id); toast(`${r.cmd}: stopped (button released)`, true); return; }
-    if (myJobs.has(r.id)) {
-      myJobs.delete(r.id);
-      toast(`${r.cmd}: ${r.msg}`, r.ok);
-      if (r.ok && r.cmd === "MoveJ") pages.OPERATE.resetJoints();      // the target is reached: fields follow again
-      if (r.ok && r.cmd === "MovePose") pages.OPERATE.resetCart();
-    }
-    else say(`${r.cmd}: ${r.msg}`, r.ok);
+    if (takeJobResult(r)) showJobResult(r);
   });
   let probing = false;
   es.onerror = async () => {                               // the heartbeat, not the stream, decides the lease
@@ -4085,6 +4214,11 @@ async function boot() {
   if (sessionStorage.getItem("retake")) {                 // back after switching to your settings: control again
     sessionStorage.removeItem("retake");
     takeLease();
+  }
+  if (sessionStorage.getItem("stackStarted")) {
+    sessionStorage.removeItem("stackStarted");
+    const ur = String(INFO.robot || "").toLowerCase().includes("ur");
+    setTimeout(() => toast(ur ? "Robot stack ready. Play External Control on the pendant." : "Robot stack ready.", true, true), 150);
   }
 }
 boot();

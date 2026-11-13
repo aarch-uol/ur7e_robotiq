@@ -219,6 +219,9 @@ ROBOT_FILE="$DATA/config/moveit_gui/robot"
 # SETUP > Setups > Robot > Stop robot stack: while this file exists only a small start page runs (no driver, no
 # MoveIt, no ROS), until someone presses Start there
 STACK_OFF_FILE="$DATA/config/moveit_gui/stack_off"
+# what the start page shows while the stack starts (web/idle.py --progress): stage=driver|moveit|slow, log=<file>
+STACK_PROGRESS_FILE="$DATA/config/moveit_gui/stack_progress"
+PROGRESS_JOB=""
 IDLE=0
 OVERRIDE=1                                          # --fake / --robot-ip count until the GUI switches the robot
 read_robot() {                                      # sets ROBOT, FAKE, ROBOT_IP, FT_IP, DOMAIN, NET, SERVO for this start
@@ -415,6 +418,8 @@ start_stack() {
 
   if [ "$FAKE" = 0 ] && [ "$IDLE" = 0 ]; then
     say "Robot stack starting ($ROBOT at $ROBOT_IP, base $BASE, ROS domain $DOMAIN, net $NET). Log: ~/ur7e_data/logs/launch_$stamp.log"
+    progress driver
+    start_progress_page
     ok=0
     for _ in $(seq 1 45); do
       docker ps --format '{{.Names}}' | grep -qx "$NAME" || { echo "The robot stack exited:"; tail -30 "$DATA/logs/launch_$stamp.log"; return 1; }
@@ -423,13 +428,36 @@ start_stack() {
     done
     if [ "$ok" = 1 ]; then
       say "Controllers are up"
+      progress moveit
     else
+      progress slow
       echo "Controllers not up after 90 s: starting the GUI anyway (it shows what is missing)."
       echo "Last launch log lines:"; tail -15 "$DATA/logs/launch_$stamp.log"
     fi
     [ "$ROBOT" = fr3 ] && echo "    Franka Desk: joints unlocked, FCI activated, the arm in execution mode (blue light)." \
       || echo "    On the pendant: load and PLAY the External Control program, unless you passed headless_mode:=true."
   fi
+}
+
+# The start page with the stack's progress, while the driver comes up (the GUI is not there yet to answer on the
+# port). It runs in the new container (the one with ROS and the GUI's code) and is stopped before the GUI starts.
+progress() {
+  [ "$MODE" = web ] || return 0
+  mkdir -p "$(dirname "$STACK_PROGRESS_FILE")"
+  printf 'stage=%s\nlog=launch_%s.log\n' "$1" "$stamp" > "$STACK_PROGRESS_FILE.tmp" && mv -f "$STACK_PROGRESS_FILE.tmp" "$STACK_PROGRESS_FILE"
+}
+start_progress_page() {
+  [ "$MODE" = web ] && [ -n "${IDLE_CMD:-}" ] || return 0
+  docker exec "$NAME" bash -c "$ENV && echo \$\$ > /tmp/stack_progress.pid && exec $IDLE_CMD --progress" >/dev/null 2>&1 &
+  PROGRESS_JOB=$!
+}
+stop_progress_page() {
+  [ -n "$PROGRESS_JOB" ] || return 0
+  docker exec "$NAME" bash -c 'kill -TERM "$(cat /tmp/stack_progress.pid)"' >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do kill -0 "$PROGRESS_JOB" 2>/dev/null || break; sleep 0.25; done
+  kill "$PROGRESS_JOB" 2>/dev/null || true
+  wait "$PROGRESS_JOB" 2>/dev/null || true
+  PROGRESS_JOB=""
 }
 
 # In the background + wait, so Ctrl-C reaches the cleanup at once. The GUI records its pid and is exec'd, so
@@ -440,6 +468,7 @@ run_gui() {
   say "GUI log: ~/ur7e_data/logs/gui_$gstamp.log"
   local pre="$GUI_PRE" cmd="$GUI_CMD"
   [ "$IDLE" = 1 ] && { pre=""; cmd="$IDLE_CMD"; }
+  stop_progress_page
   docker exec "$NAME" bash -c "$ENV && $pre echo \$\$ > $GUI_PIDFILE && exec > >(tee -a /data/logs/gui_$gstamp.log) 2>&1 && exec $cmd" &
   local rc=0
   wait $! || rc=$?

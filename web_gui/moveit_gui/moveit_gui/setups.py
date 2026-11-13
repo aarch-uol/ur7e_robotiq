@@ -22,6 +22,7 @@ import filecmp
 import json
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -121,10 +122,8 @@ def copy_files(cfg: Path, profile: str, dest: Path) -> List[str]:
     return holds
 
 
-def put_in_place(cfg: Path, profile: str, files: Path):
-    """Make the files in use those of `files` (as copy_files made them). A member `files` lacks is removed, except
-    an OPTIONAL one in a set saved before it existed (no `.strict`), which stays as it is."""
-    cfg, files = Path(cfg), Path(files)
+def _put_in_place(cfg: Path, profile: str, files: Path):
+    """Apply one prepared file set. Caller owns rollback."""
     strict = (files / ".strict").exists()
     for key, rel in members(profile).items():
         dst, src = cfg / rel.rstrip("/"), files / rel.rstrip("/")
@@ -145,6 +144,22 @@ def put_in_place(cfg: Path, profile: str, files: Path):
         (cfg / "ft_payload").mkdir(parents=True, exist_ok=True)
         # a new name, so it is the newest file (the one SETUP shows as the last calibration)
         shutil.copy2(kept[-1], cfg / "ft_payload" / f"{profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+
+
+def put_in_place(cfg: Path, profile: str, files: Path):
+    """Make the files in use those of files; restore the previous set if a copy fails midway."""
+    cfg, files = Path(cfg), Path(files)
+    cfg.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=".settings-rollback-", dir=cfg))
+    try:
+        copy_files(cfg, profile, backup)
+        try:
+            _put_in_place(cfg, profile, files)
+        except Exception:
+            _put_in_place(cfg, profile, backup)
+            raise
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 class Setups:

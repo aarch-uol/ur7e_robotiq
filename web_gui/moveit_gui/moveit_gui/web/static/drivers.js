@@ -78,7 +78,7 @@ export function drivers(ctx) {
           h("div", { class: "muted small" }, s.type_label, " · ", (STATE[s.state] || STATE.stopped)[0].toLowerCase(),
             s.state === "running" && s.up_s != null ? ` ${upTime(s.up_s)}` : "")),
         s.state === "missing" ? "" : lease(btn(on || s.state === "stopping" ? "Stop" : "Start", on ? "" : "quiet",
-          (e) => { e.stopPropagation(); (on ? stop : start)(s.name); })));
+          (e) => { e.stopPropagation(); return (on ? stop : start)(s.name); })));
     };
     list.replaceChildren(...(ss.length ? (groups.length > 1
       ? groups.flatMap((k) => [h("div", { class: "muted small dr-grp" }, kinds[k] || k), ...ss.filter((s) => s.kind === k).map(row)])
@@ -87,8 +87,8 @@ export function drivers(ctx) {
   }
   function pick(name) { D.sel = name; D.topic = null; D.edit = null; fillList(); fillRight(); scan(); }
   function pickTopic(t) { if (!t) return; D.topic = t; D.edit = null; fillList(); fillRight(); scan(); }
-  async function start(n) { const r = await cmd("drivers_start", { name: n }); took(r); }
-  async function stop(n) { const r = await cmd("drivers_stop", { name: n }); took(r); }
+  async function start(n) { const r = await cmd("drivers_start", { name: n }); took(r); return r; }
+  async function stop(n) { const r = await cmd("drivers_stop", { name: n }); took(r); return r; }
 
   // ------------------------------------------------------------------ the right side: one service or one topic
   const preview = h("div", { class: "cam", id: "dr-cam" });

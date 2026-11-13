@@ -31,6 +31,7 @@ class ProfileError(ValueError):
 class Profiles:
     def __init__(self, cfg: Path):
         self.dir = Path(cfg) / "profiles"
+        self._names_cache = (None, ())
 
     def path(self, name: str) -> Path:
         name = str(name or "").strip()
@@ -53,9 +54,16 @@ class Profiles:
         raise ProfileError(f"no profile '{name}'")
 
     def names(self) -> List[str]:
-        if not self.dir.is_dir():
+        try:
+            st = self.dir.stat()
+        except OSError:
+            self._names_cache = (None, ())
             return []
-        return sorted((d.name for d in self.dir.iterdir() if d.is_dir() and NAME.match(d.name)), key=str.lower)
+        sig = (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_nlink)
+        if self._names_cache[0] != sig:
+            names = sorted((d.name for d in self.dir.iterdir() if d.is_dir() and NAME.match(d.name)), key=str.lower)
+            self._names_cache = (sig, tuple(names))
+        return list(self._names_cache[1])
 
     def list(self) -> List[dict]:
         out = []
@@ -73,6 +81,7 @@ class Profiles:
         except ProfileError:
             pass
         (p / "setups").mkdir(parents=True)
+        self._names_cache = (None, ())
         return p.name
 
     def delete(self, name: str):
@@ -82,6 +91,7 @@ class Profiles:
         if s.is_dir() and any((d / "setup.yaml").is_file() for d in s.iterdir()):
             raise ProfileError(f"profile '{p.name}' still has setups: delete or copy them first")
         shutil.rmtree(p)
+        self._names_cache = (None, ())
 
     def setups_dir(self, name: str) -> Path:
         return self.path(self.find(name)) / "setups"

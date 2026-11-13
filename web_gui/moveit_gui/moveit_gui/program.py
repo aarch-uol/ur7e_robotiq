@@ -999,10 +999,10 @@ class ProgramRunner:
         if t == "record_stop":
             if not self.hooks.recording():
                 return True
-            _ok, msg = self.hooks.record_stop("stopped by the program", wait=True)
+            ok, msg = self.hooks.record_stop("stopped by the program", wait=True)
             self._rec_owned = False
             self.on_log(msg)
-            return True
+            return ok
 
         if t == "set_io":
             return self.bridge.set_digital_out(int(p["pin"]), bool(p["state"]))

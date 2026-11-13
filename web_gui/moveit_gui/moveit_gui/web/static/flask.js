@@ -73,7 +73,7 @@ export function flaskPage(ctx) {
     if (!n) return;
     const w = (F.data && F.data.result && F.data.result.warnings) || [];
     if (w.length && !(await ask(`The fit has warnings:\n\n${w.join("\n")}\n\nSave it anyway?`))) return;
-    run("flask_save", { name: n });
+    return run("flask_save", { name: n });
   }, "Save as a flask profile and make it the fixture \"flask\" that scrape programs use"));
   const fitCard = h("div", { class: "card" }, h("div", { class: "section" }, "Flask"), res, warns, err,
     note("Saved, the flask is the fixture \"flask\": its origin is the bulb centre, Z up the neck.",
@@ -144,7 +144,7 @@ export function flaskPage(ctx) {
       h("span", { class: "k" }, "Speed mm/s / approach mm"), h("div", { class: "row" }, speed, appr)),
     h("div", { class: "row" },
       lease(btn("Check reach", "", () => { reachOut.replaceChildren(h("div", { class: "muted" }, "Checking… (a bent tool takes a few seconds)"));
-        cmd("flask_reach", scrapeArgs()).then((r) => (r.ok ? showReach(r.reach) : reachOut.replaceChildren())); },
+        return cmd("flask_reach", scrapeArgs()).then((r) => { if (r.ok) showReach(r.reach); else reachOut.replaceChildren(); return r; }); },
         "Which poses the tool reaches through the neck. Nothing moves")),
       lease(btn("Make program", "primary", async () => {
         if (!(await ctx.guardProgram("make a flask scrape program"))) return;

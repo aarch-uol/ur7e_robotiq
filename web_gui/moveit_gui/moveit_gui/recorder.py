@@ -22,6 +22,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -84,6 +85,33 @@ def dir_size_mb(path: Path) -> float:
             except OSError:
                 pass
     return total / 1e6
+
+
+def _atomic_write(path: Path, data: bytes):
+    """Publish one complete file or leave the previous file untouched."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                         delete=False) as f:
+            tmp = Path(f.name)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def ros2_bag_spawn(out_dir: Path, topics: List[str], log_path: Path):
@@ -152,6 +180,11 @@ class Recorder:
         self._proc = None
         self._cur: Optional[dict] = None             # the recording in progress
         self._stopping = False
+        self._finalizing = False
+        self._done: Optional[threading.Event] = None
+        self._free_at = 0.0
+        self._free_cached: Optional[float] = None
+        self._free_error = ""
         self.last: Optional[dict] = None             # the last finished recording (its gui_meta)
         self.settings = {"presets": list(DEFAULT_PRESETS), "topics": [], "exclude": [], "auto": False,
                          **DEFAULT_LIMITS}
@@ -185,12 +218,11 @@ class Recorder:
             if not 10 <= float(max_mb) <= 1e6:
                 return False, "the size limit must be 10 MB..1 TB"
             s["max_mb"] = float(max_mb)
-        self.settings = s
         try:
-            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-            self.settings_path.write_text(json.dumps(s, indent=1), encoding="utf-8")
+            _atomic_write(self.settings_path, json.dumps(s, indent=1).encode("utf-8"))
         except OSError as e:
-            return True, f"settings applied but not saved ({e})"
+            return False, f"could not save recording settings ({e})"
+        self.settings = s
         return True, "recording settings saved"
 
     def selected_topics(self, topics: Optional[List[Tuple[str, str]]] = None) -> List[str]:
@@ -256,15 +288,32 @@ class Recorder:
             try:
                 proc = self.spawn(out / "bag", topics, out / "record.log")   # ros2 bag creates bag/ itself
             except (OSError, ValueError) as e:
+                try:
+                    log = out / "record.log"
+                    if log.is_file() and log.stat().st_size == 0:
+                        log.unlink()
+                    out.rmdir()             # only removes it if the failed spawn left it empty
+                except OSError:
+                    pass
                 return False, f"could not start ros2 bag record: {e}"
             self._proc = proc
             self._stopping = False
+            self._finalizing = False
+            self._done = threading.Event()
             self._cur = {"name": out.name, "dir": str(out), "label": label,
                          "source": source, "run": run or {}, "topics": topics, "started": time.time(),
                          "info": dict(info or {}), "presets": list(presets or self.settings["presets"]),
                          "t0": time.monotonic(), "size_mb": 0.0, "limits": {k: self.settings[k]
                                                                            for k in ("max_s", "max_mb")}}
-            self._write_meta(self._cur, ended=None, reason="recording")
+            try:
+                self._write_meta(self._cur, ended=None, reason="recording")
+            except OSError as e:
+                meta_error = e
+            else:
+                meta_error = None
+        if meta_error is not None:
+            self.stop_and_wait(f"cannot save recording metadata: {meta_error}")
+            return False, f"could not start recording: cannot save metadata ({meta_error})"
         self.log(f"recording started: {out.name} ({len(topics)} topics)")
         return True, f"recording {len(topics)} topics to {out}"
 
@@ -285,11 +334,19 @@ class Recorder:
         threading.Thread(target=self._finish, args=(proc,), daemon=True, name="record-stop").start()
         return True, f"stopping the recording ({reason})"
 
-    def stop_and_wait(self, reason: str = "GUI closed", timeout: float = STOP_WAIT_S + 3):
-        self.stop(reason)
-        t0 = time.monotonic()
-        while self._cur is not None and time.monotonic() - t0 < timeout:
-            time.sleep(0.05)
+    def stop_and_wait(self, reason: str = "GUI closed", timeout: float = STOP_WAIT_S + 3) -> Result:
+        with self._lock:
+            done = self._done if self._cur is not None else None
+            name = self._cur["name"] if self._cur is not None else None
+        ok, msg = self.stop(reason)
+        if not ok or done is None:
+            return ok, msg
+        if not done.wait(timeout):
+            return False, f"recording finalization timed out after {timeout:.1f} s"
+        last = self.last
+        if last is None or last.get("name") != name:
+            return False, "recording finalization ended without a result"
+        return bool(last.get("ok")), str(last.get("reason") or "recording finished")
 
     def _finish(self, proc):
         try:
@@ -306,33 +363,66 @@ class Recorder:
 
     def _ended(self, code):
         with self._lock:
-            cur, self._cur, self._proc = self._cur, None, None
-            self._stopping = False
-        if cur is None:
-            return
+            if self._cur is None or self._finalizing:
+                return
+            cur, done = self._cur, self._done
+            self._finalizing = True
+            self._stopping = True
         reason = cur.get("end_reason") or f"the recorder exited by itself (code {code})"
         cur["size_mb"] = dir_size_mb(Path(cur["dir"])) if Path(cur["dir"]).exists() else 0.0
-        ok = Path(cur["dir"], "bag", "metadata.yaml").exists()
-        if not ok:
-            reason += "; no bag was written: see " + str(Path(cur["dir"], "record.log"))
-        self.last = self._write_meta(cur, ended=time.time(), reason=reason, ok=ok)
+        bag_ok = Path(cur["dir"], "bag", "metadata.yaml").is_file()
+        ok = code == 0 and bag_ok
+        if code != 0:
+            reason += f"; recorder exit code {code}" if code is not None else "; recorder did not exit cleanly"
+        if not bag_ok:
+            reason += "; no bag metadata was written: see " + str(Path(cur["dir"], "record.log"))
+        ended = time.time()
+        try:
+            last = self._write_meta(cur, ended=ended, reason=reason, ok=ok)
+        except OSError as e:
+            ok = False
+            reason += f"; metadata save failed: {e}"
+            last = self._metadata(cur, ended=ended, reason=reason, ok=False)[0]
+            try:                         # a transient failure may still let us publish the failure marker
+                self._write_meta(cur, ended=ended, reason=reason, ok=False)
+            except OSError:
+                pass
+        last["ok"] = ok
+        last["reason"] = reason
+        with self._lock:
+            self.last = last
+            self._cur = None
+            self._proc = None
+            self._stopping = False
+            self._finalizing = False
+            self._done = None
+            if done is not None:
+                done.set()
         self.log(f"recording {'saved' if ok else 'FAILED'}: {cur['name']} "
-                 f"({cur['size_mb']:.1f} MB, {time.time() - cur['started']:.0f} s): {reason}")
+                 f"({cur['size_mb']:.1f} MB, {ended - cur['started']:.0f} s): {reason}")
 
-    def _write_meta(self, cur: dict, ended: Optional[float], reason: str, ok: Optional[bool] = None) -> dict:
+    def _metadata(self, cur: dict, ended: Optional[float], reason: str,
+                  ok: Optional[bool] = None) -> Tuple[dict, dict]:
+        elapsed = time.monotonic() - cur["t0"]
         meta = {k: cur[k] for k in ("name", "dir", "source", "run", "topics", "started", "size_mb", "limits")}
-        meta.update(ended=ended, duration_s=round((ended or time.time()) - cur["started"], 1), reason=reason, ok=ok)
+        meta.update(ended=ended, duration_s=round(elapsed, 1), reason=reason, ok=ok,
+                    timebase={"timestamps": "system wall clock", "duration": "monotonic clock"})
         iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t)) if t else None  # noqa: E731
         info = cur.get("info", {})
+        meta.update(operator=info.get("operator", ""), program=info.get("program", ""),
+                    presets=cur.get("presets", []))
         small = {"started": iso(cur["started"]), "stopped": iso(ended), "duration_s": meta["duration_s"],
                  "operator": info.get("operator", ""), "program": info.get("program", ""),
                  "mode": info.get("mode", ""), "note": info.get("note", ""), "presets": cur.get("presets", []),
-                 "topics": cur["topics"], "size_mb": round(cur["size_mb"], 1), "ok": ok, "reason": reason}
-        try:
-            Path(cur["dir"], "gui_meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
-            Path(cur["dir"], "meta.json").write_text(json.dumps(small, indent=1), encoding="utf-8")
-        except OSError:
-            pass
+                 "topics": cur["topics"], "size_mb": round(cur["size_mb"], 1), "ok": ok, "reason": reason,
+                 "timebase": meta["timebase"]}
+        return meta, small
+
+    def _write_meta(self, cur: dict, ended: Optional[float], reason: str, ok: Optional[bool] = None) -> dict:
+        meta, small = self._metadata(cur, ended, reason, ok)
+        out = Path(cur["dir"])
+        _atomic_write(out / "meta.json", json.dumps(small, indent=1).encode("utf-8"))
+        _atomic_write(out / "gui_meta.json", json.dumps(meta, indent=1).encode("utf-8"))  # catalog marker last
         return meta
 
     def poll(self):
@@ -350,8 +440,9 @@ class Recorder:
             cur["size_mb"] = dir_size_mb(Path(cur["dir"])) if Path(cur["dir"]).exists() else 0.0
             try:
                 free = self.free_mb(self.root)
-            except OSError:
-                free = MIN_FREE_MB
+            except OSError as e:
+                self.stop(f"cannot check disk space: {e}")
+                return
             if free < MIN_FREE_MB / 2:
                 self.stop(f"disk almost full ({free:.0f} MB free)")
                 return
@@ -362,6 +453,25 @@ class Recorder:
             self.stop(f"size limit {lim['max_mb']:.0f} MB reached")
 
     # ------------------------------------------------------------- views
+    def _storage_view(self) -> dict:
+        now = time.monotonic()
+        if now - self._free_at >= 1.0:
+            path = self.root if self.root.exists() else self.root.parent
+            try:
+                self._free_cached = float(self.free_mb(path))
+                self._free_error = ""
+            except OSError as e:
+                self._free_cached = None
+                self._free_error = str(e)
+            self._free_at = now
+        free = self._free_cached
+        state = "unknown" if free is None else "critical" if free < MIN_FREE_MB / 2 else "low" if free < MIN_FREE_MB else "healthy"
+        return {"state": state, "free_mb": round(free, 1) if free is not None else None,
+                "free_gb": round(free / 1000.0, 1) if free is not None else None,
+                "can_start": free is not None and free >= MIN_FREE_MB,
+                "start_min_mb": MIN_FREE_MB, "stop_min_mb": MIN_FREE_MB / 2,
+                "error": self._free_error}
+
     def view(self) -> dict:
         cur = self._cur
         live = None
@@ -369,17 +479,107 @@ class Recorder:
             live = {"name": cur["name"], "dir": cur["dir"], "source": cur["source"], "run": cur["run"],
                     "topics": len(cur["topics"]), "elapsed_s": round(time.monotonic() - cur["t0"], 1),
                     "size_mb": round(cur["size_mb"], 1), "limits": cur["limits"], "stopping": self._stopping}
-        return {"recording": live, "settings": dict(self.settings), "last": self.last, "dir": str(self.root)}
+        return {"recording": live, "settings": dict(self.settings), "last": self.last,
+                "storage": self._storage_view(), "dir": str(self.root)}
+
+    def _record_dir(self, name: str) -> Optional[Path]:
+        name = str(name or "")
+        if not name or Path(name).name != name or name in (".", ".."):
+            return None
+        try:
+            root = self.root.resolve()
+            raw = self.root / name
+            if raw.is_symlink():
+                return None
+            path = raw.resolve()
+        except OSError:
+            return None
+        return path if path.parent == root and path.is_dir() else None
+
+    def record_info(self, name: str) -> Optional[dict]:
+        path = self._record_dir(name)
+        if path is None:
+            return None
+        best = None
+        for fn in ("gui_meta.json", "meta.json"):
+            try:
+                data = json.loads((path / fn).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.setdefault("name", path.name)
+                    data.setdefault("dir", str(path))
+                    best = best or data
+                    if data.get("ok") is not None:
+                        return data                         # a finalized meta.json may repair stale start metadata
+            except (OSError, ValueError):
+                pass
+        return best or {"name": path.name, "dir": str(path), "operator": "", "incomplete": True}
+
+    def mcap_path(self, name: str) -> Optional[Path]:
+        path = self._record_dir(name)
+        if path is None:
+            return None
+        with self._lock:
+            if self._cur is not None and self._cur.get("name") == name:
+                return None
+        info = self.record_info(name)
+        if info is None or info.get("incomplete") or ("ok" in info and info.get("ok") is None):
+            return None                                  # never offer a file still being written / not finalized
+        try:
+            files = [f for f in sorted((path / "bag").glob("*.mcap")) if f.is_file() and not f.is_symlink()]
+        except OSError:
+            return None
+        return files[0] if len(files) == 1 else None
+
+    def delete_recording(self, name: str) -> Result:
+        with self._lock:
+            if self._cur is not None and self._cur.get("name") == name:
+                return False, "stop the recording before deleting it"
+        path = self._record_dir(name)
+        if path is None:
+            return False, "recording not found"
+        try:
+            shutil.rmtree(path)
+        except OSError as e:
+            return False, f"could not delete the recording: {e}"
+        return True, f"deleted recording {name}"
 
     def recent(self, n: int = 30) -> List[dict]:
         out = []
         try:
-            metas = sorted(self.root.glob("*/gui_meta.json"), reverse=True)[:n]
+            dirs = sorted((p for p in self.root.iterdir() if p.is_dir() and not p.is_symlink()),
+                          key=lambda p: p.name, reverse=True)[:max(0, int(n))]
         except OSError:
             return out
-        for m in metas:
-            try:
-                out.append(json.loads(m.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
+        with self._lock:
+            active = self._cur.get("name", "") if self._cur is not None else ""
+        for path in dirs:
+            row = self.record_info(path.name)
+            if row is None:
                 continue
+            row = dict(row)
+            row.setdefault("name", path.name)
+            row.setdefault("dir", str(path))
+            row.setdefault("operator", "")
+            row.setdefault("program", "")
+            row.setdefault("source", "")
+            row.setdefault("run", {})
+            row.setdefault("topics", [])
+            row.setdefault("duration_s", 0.0)
+            if not isinstance(row.get("started"), (int, float)):
+                try:
+                    row["started"] = time.mktime(time.strptime(path.name[:15], "%Y%m%d_%H%M%S"))
+                except (ValueError, OSError):
+                    try:
+                        row["started"] = path.stat().st_mtime
+                    except OSError:
+                        row["started"] = 0.0
+            if not isinstance(row.get("size_mb"), (int, float)):
+                row["size_mb"] = round(dir_size_mb(path), 1)
+            row["active"] = path.name == active
+            if not row["active"] and (row.get("incomplete") or ("ok" in row and row.get("ok") is None)):
+                row["ok"] = False
+                row["reason"] = "interrupted or incomplete recording: final metadata was not saved"
+            row.setdefault("reason", "")
+            row["mcap"] = self.mcap_path(path.name) is not None
+            out.append(row)
         return out

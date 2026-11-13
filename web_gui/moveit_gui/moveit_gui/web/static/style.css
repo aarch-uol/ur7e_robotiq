@@ -42,9 +42,20 @@ header select { background: transparent; border: 0; border-bottom: 1px solid var
                 font-weight: 600; padding: 2px 0; }
 header select option { color: var(--text); }
 header .spacer { flex: 1; }
+header .hmini { min-width: 56px; }
+header .hmini .val { font-size: 12px; }
+header .clickable, header .hstat { cursor: pointer; }
+header .hstat { color: var(--on-chrome2); text-decoration: none; white-space: nowrap; }
+header .hstat.rec { color: #f0827a; font-weight: 700; }
+header .storage-low { color: #e3ae5b; }
+header .storage-critical { color: #f0827a; }
 .mode-dt { color: #e3ae5b; } .mode-bad { color: #f0827a; }
 #lease { display: flex; align-items: center; gap: var(--s); }
 #lease .who { color: var(--on-chrome2); font-size: 12px; }
+#h-stackstop { align-self: center; height: 34px; background: transparent; color: var(--on-chrome2);
+               border-color: var(--chrome-line); }
+#h-stackstop:hover:not(:disabled) { color: var(--on-chrome); border-color: var(--on-chrome2); }
+#h-stackstop:disabled { color: var(--on-chrome3); border-color: var(--chrome-line); }
 #stop { align-self: center; background: var(--danger); color: #fff; border: 0; border-radius: var(--r);
         font-weight: 800; padding: 0 18px; height: 34px; letter-spacing: .5px; cursor: pointer; }
 #stop:hover { background: var(--danger-hover); }
@@ -107,6 +118,14 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 0; width: 100%; }
 .btn.quiet:hover:not(:disabled) { color: var(--text); border-color: transparent; text-decoration: underline; }
 .btn.on { background: var(--selected); border-color: var(--accent); }
 .btn.wide { width: 100%; }
+.btn[data-action-state="pending"], .btn[data-action-state="running"] { pointer-events: none; cursor: wait; }
+.btn[data-action-state]::after { margin-left: 6px; font-weight: 700; }
+.btn[data-action-state="pending"]::after { content: "…"; }
+.btn[data-action-state="running"]::after { content: "↻"; }
+.btn[data-action-state="done"]::after { content: "✓"; color: var(--ok); }
+.btn[data-action-state="error"]::after { content: "!"; color: var(--danger); }
+.btn.primary[data-action-state="done"]::after, .btn.danger[data-action-state="done"]::after,
+.btn.primary[data-action-state="error"]::after, .btn.danger[data-action-state="error"]::after { color: inherit; }
 input[type=number], input[type=text], select, textarea {
   height: var(--h); border: 0; border-bottom: 1px solid var(--line-strong); background: transparent; padding: 0 4px;
   min-width: 0; }

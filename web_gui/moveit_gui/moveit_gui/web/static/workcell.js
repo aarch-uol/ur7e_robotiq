@@ -351,7 +351,7 @@ export function workcell(ctx) {
       const n = P.editing || $("#pt-name").value.trim();
       if (!n) return toast("save the part first", false);
       const t = (await askText(`Name of the TCP at the far face of "${n}" (it follows the part when you edit it):`, `${n}_tip`));
-      if (t) cmd("parts_make_tcp", { name: n, tcp: t });
+      if (t) return cmd("parts_make_tcp", { name: n, tcp: t });
     }
     function fill(d) {
       P.data = d;
@@ -502,7 +502,7 @@ export function workcell(ctx) {
       if (!ctx.fake() && !(await ask(`Move through ${C.data?.poses || 0} poses and sample at each?\n\nThe arm turns up to ` +
         `±${$("#he-tilt").value}° about the board (or the tool tip). MoveIt plans each move around the keep-out zones and parts, ` +
         "but check the space around the arm. Keep a hand near STOP."))) return;
-      cmd("handeye_collect");
+      return cmd("handeye_collect");
     }
     async function saveCam() {
       const n = $("#he-name").value.trim();

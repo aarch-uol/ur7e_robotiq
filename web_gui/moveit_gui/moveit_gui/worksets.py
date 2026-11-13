@@ -98,8 +98,13 @@ class WorkSets:
             if old.exists():
                 shutil.rmtree(old)
             d.rename(old)
-            tmp.rename(d)
-            shutil.rmtree(old)
+            try:
+                tmp.rename(d)
+            except Exception:
+                old.rename(d)
+                raise
+            else:
+                shutil.rmtree(old)
         else:
             tmp.rename(d)
         return holds

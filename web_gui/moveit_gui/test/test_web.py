@@ -263,6 +263,21 @@ def test_http_events_stream_state(http):
     assert head.startswith("event: state") and json.loads(data[len("data: "):])["robot_mode"] == "RUNNING"
 
 
+def test_http_events_replay_a_job_result_that_finished_before_reconnect(http):
+    base, s, _ = http
+    tok = s.take_lease("", "alice")["token"]
+    ack = s.command(tok, "move_waypoint", {"name": "ready", "vel": 0.5})
+    assert wait(lambda: any(x["id"] == ack["job"] for x in s.results))
+    got = None
+    with urllib.request.urlopen(base + "/api/events", timeout=5) as r:
+        for _ in range(20):
+            line = r.readline().decode()
+            if line.startswith("event: result"):
+                got = json.loads(r.readline().decode()[len("data: "):])
+                break
+    assert got and got["id"] == ack["job"] and got["ok"]
+
+
 def test_http_camera_mjpeg_and_missing_topic(http):
     base, _, bridge = http
     try:
@@ -275,6 +290,25 @@ def test_http_camera_mjpeg_and_missing_topic(http):
         chunk = r.read(64 * 1024)
     assert b"--frame" in chunk and b"\xff\xd8" in chunk                  # a JPEG
     assert wait(lambda: not bridge.open_images(), 3.0)                  # nobody watches: subscription gone
+
+
+def test_same_camera_uses_the_highest_requested_preview_limits(http):
+    base, _, bridge = http
+    topic = "/camera/camera/color/image_rect_raw"
+    high = urllib.request.urlopen(base + "/api/camera.mjpeg?q=high&topic=" + topic, timeout=5)
+    low = urllib.request.urlopen(base + "/api/camera.mjpeg?q=low&topic=" + topic, timeout=5)
+    try:
+        assert wait(lambda: topic in bridge.open_images(), 2.0)
+        watch = bridge.open_images()[topic]
+        assert watch.max_width == 1280
+        assert abs(watch._period - 1.0 / 30.0) < 1e-6
+        low.close()
+        assert wait(lambda: bridge.open_images().get(topic) is watch, 2.0)
+        assert watch.max_width == 1280
+    finally:
+        high.close()
+        low.close()
+    assert wait(lambda: topic not in bridge.open_images(), 3.0)
 
 
 def test_http_two_cameras_at_once(http):
@@ -334,8 +368,8 @@ def test_a_camera_with_a_compressed_topic_is_offered_both_ways(env, monkeypatch)
     monkeypatch.setattr(b, "image_topics", lambda: [(raw, "sensor_msgs/msg/Image"),
                                                    (raw + "/compressed", "sensor_msgs/msg/CompressedImage")])
     cams = s.command("me", "camera_status", {})["cameras"]
-    i = [c["topic"] for c in cams].index(raw)
-    assert cams[i + 1]["topic"] == raw + "/compressed" and cams[i + 1]["name"].endswith("(compressed)")
+    i = [c["topic"] for c in cams].index(raw + "/compressed")
+    assert cams[i]["name"].endswith("(compressed)") and cams[i + 1]["topic"] == raw
 
 
 def test_an_image_frame_the_preview_drops_is_only_counted():

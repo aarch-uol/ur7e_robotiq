@@ -18,7 +18,11 @@
   </div>
   <div class="grp"><div class="cap">Tool (TCP)</div><select id="h-tcp" data-needs-lease></select></div>
   <div class="grp"><div class="cap">Control</div><div class="val" id="h-mode">—</div></div>
-  <div class="grp h-doing"><div class="cap">GUI is doing</div><div style="display:flex;gap:4px;min-width:0"><a class="pill" id="h-activity" title="What this GUI is doing now. Click to open its page.">Nothing</a><a class="pill rec" id="h-rec" hidden>● Rec</a></div></div>
+  <div class="grp h-doing"><div class="cap">GUI is doing</div><a class="pill" id="h-activity" title="What this GUI is doing now. Click to open its page.">Nothing</a></div>
+  <div class="grp hmini" id="h-camera-grp"><div class="cap">Camera</div><div class="val" id="h-camera">—</div></div>
+  <div class="grp hmini" id="h-record-grp"><div class="cap">Recording</div><a class="val hstat" id="h-rec">Off</a></div>
+  <div class="grp hmini" id="h-storage-grp"><div class="cap">Storage</div><div class="val" id="h-storage">—</div></div>
+  <div class="grp hmini clickable" id="h-profile-grp" title="Your profile: click to change"><div class="cap">Profile</div><div class="val" id="h-profile">—</div></div>
   <div class="grp hlay" id="h-layouts" hidden></div>
   <div class="spacer"></div>
   <div class="grp hinfo"><span class="hchip warn" id="h-conn" hidden></span></div>
@@ -29,6 +33,7 @@
   </div>
   <div class="sep"></div>
   <button class="btn hrec" id="h-recbtn" type="button" title="Record joints, TCP pose, F/T, gripper, controllers and the live cameras (compressed) into one folder">● Record</button>
+  <button class="btn hpower" id="h-stackstop" type="button" title="Stop the driver, MoveIt and cameras and leave the Start page">⏻ <span class="lbl">Stop robot</span></button>
   <div id="lease">
     <button class="hchip users" id="h-users" type="button" title="Who has this GUI open">—</button>
     <span class="hchip view" id="lease-view" title="View only: buttons that move or change the robot are greyed out. Press Take control to operate. STOP always works."><svg class="ic" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="lbl"> View only</span></span>

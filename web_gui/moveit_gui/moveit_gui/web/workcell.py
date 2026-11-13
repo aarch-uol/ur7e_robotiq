@@ -482,12 +482,18 @@ class WorkcellCommands:
             return "a calibration is running"
         return None
 
-    def _restart(self, code: int, why: str):
+    def _restart(self, code: int, why: str) -> bool:
+        if self.restart_code is not None:
+            if code == RESTART_STACK and self.restart_code != RESTART_STACK:
+                self.restart_code = RESTART_STACK            # a stack stop/restart outranks a pending GUI-only restart
+                self.core.bridge.log(f"RESTART upgraded to robot stack + GUI: {why}")
+            return False
         self.restart_code = code
         self.core.bridge.log(f"RESTART ({'robot stack + GUI' if code == RESTART_STACK else 'GUI'}): {why}")
         cb = self.on_restart
         if cb is not None:
             threading.Timer(0.8, cb).start()                 # let this reply reach the browser first
+        return True
 
     def cmd_restart(self, what="gui"):
         why = self._restart_refusal()
@@ -496,7 +502,9 @@ class WorkcellCommands:
         if self.on_restart is None:
             raise P.PartError("this GUI was not started by the launcher (ur7e_gui.sh): restart it by hand")
         code = RESTART_STACK if what == "stack" else RESTART_GUI
-        self._restart(code, "asked in the GUI")
+        if not self._restart(code, "asked in the GUI"):
+            return self._ok("a robot-stack restart is already pending" if self.restart_code == RESTART_STACK
+                            else "a GUI restart is already pending")
         return self._ok("restarting the robot stack and the GUI: this page reconnects by itself (about a minute)"
                         if code == RESTART_STACK else "restarting the GUI: this page reconnects by itself")
 
@@ -508,10 +516,12 @@ class WorkcellCommands:
             raise P.PartError(why)
         if self.on_restart is None:
             raise P.PartError("this GUI was not started by the launcher (ur7e_gui.sh): stop it there")
+        if self.restart_code == RESTART_STACK:
+            return self._ok("the robot stack is already stopping")
         from .idle import marker
         marker(config_dir()).write_text(json.dumps({"by": str(who or "")[:24], "at": time.strftime("%Y-%m-%d %H:%M")}))
         self._restart(RESTART_STACK, f"robot stack stopped{' by ' + str(who)[:24] if who else ''}")
-        return self._ok("stopping the robot stack: this page shows Start when it is down (about 30 s)")
+        return self._ok("stopping the robot stack: this page shows Start when it is down")
 
     def _tcp_link(self, name: str) -> Optional[str]:
         """The robot-model link (a profile TCP's link) a TCP hangs on in the end, None when its chain ends on some
@@ -683,12 +693,13 @@ class WorkcellCommands:
             self.worksets.save(me, base=self.running_base())
             self.core.bridge.log(f"web: the settings in use are now {me}'s (kept in their profile)")
 
-    def _needs_switch(self) -> bool:
+    def _needs_switch(self, owner: Optional[str] = None) -> bool:
         """The one in control does not have their own settings in use (they must switch first)."""
         L = self.lease
         if not L.token or not self.profiles.names():
             return False
-        return (L.profile or "").lower() != self.worksets.active().lower()
+        owner = self.worksets.active() if owner is None else owner
+        return (L.profile or "").lower() != owner.lower()
 
     def _switch_refusal(self) -> str:
         act = self.worksets.active()
@@ -746,24 +757,35 @@ class WorkcellCommands:
             src = (S, str(name), str(info.get("base") or ""))
         if act:
             self.worksets.save(act, base=base_now)         # the settings in use go back to their owner first
-        if self.worksets.has(me):
-            base = str(self.worksets.load(me).get("base") or "")
-            how = "your settings"
-        elif src is not None:
-            S, n, base = src
-            self.worksets.put_setup(S._path(n) / "files")
-            S._mark(n)
-            how = f"setup '{n}'" + (f" of {S.owner}" if S.owner else " (Shared)")
-        else:
-            base = ""
-            how = f"a copy of {act + chr(39) + 's' if act else 'the'} settings"
-        self.worksets.set_active(me)
-        self.worksets.save(me, base=base or base_now)
-        m = self._base_model()
-        stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(self.parts.path), m).values())
-        if base and base in B.BASES and base != base_now:
-            B.write_next(config_dir(), base)
-            stack = True
+        try:
+            if self.worksets.has(me):
+                base = str(self.worksets.load(me).get("base") or "")
+                how = "your settings"
+            elif src is not None:
+                S, n, base = src
+                self.worksets.put_setup(S._path(n) / "files")
+                S._mark(n)
+                how = f"setup '{n}'" + (f" of {S.owner}" if S.owner else " (Shared)")
+            else:
+                base = ""
+                how = f"a copy of {act + chr(39) + 's' if act else 'the'} settings"
+            self.worksets.save(me, base=base or base_now)  # persist the new set before its active marker can change
+            m = self._base_model()
+            stack = bool(m.get("ok")) and any(st != "in_model" for st in P.status(P.PartStore(self.parts.path), m).values())
+            self.worksets.set_active(me)
+            if base and base in B.BASES and base != base_now:
+                B.write_next(config_dir(), base)
+                stack = True
+        except Exception as e:
+            if act and self.worksets.has(act):
+                try:
+                    self.worksets.load(act)
+                    self.worksets.set_active(act)
+                except Exception as rollback:
+                    self.core.bridge.log(f"profile switch rollback FAILED: {rollback}")
+            if isinstance(e, OSError):
+                raise ProfileError(f"could not switch settings: {e}") from None
+            raise
         self._restart(RESTART_STACK if stack else RESTART_GUI, f"{me}'s settings in use ({how})")
         kept = f"{act}'s are kept in their profile; " if act else ""
         return self._ok(f"{me}'s settings in use ({how}): {kept}restarting {'the robot stack and ' if stack else ''}"

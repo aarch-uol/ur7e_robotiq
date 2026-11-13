@@ -357,6 +357,20 @@ def test_launcher_runs_only_the_start_page_while_the_stack_is_stopped(tmp_path):
     assert len(guis) == 1 and "moveit_gui_idle" in log and "Robot stack stopped" in p.stdout
 
 
+
+def test_launcher_shows_the_start_progress_while_the_driver_comes_up(tmp_path):
+    cfg = tmp_path / "home" / "ur7e_data" / "config" / "moveit_gui"
+    cfg.mkdir(parents=True)
+    (cfg / "robot").write_text("robot=ur7e\nmode=real\nip=10.6.203.7\n")
+    p, starts, guis, _ = launch(tmp_path, [], gui_first="true", env_extra={"STUB_GUI_CODE": "0"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    log = (tmp_path / "docker.log").read_text().splitlines()
+    page = [i for i, l in enumerate(log) if "moveit_gui_idle" in l and "--progress" in l]
+    gui = [i for i, l in enumerate(log) if "moveit_gui_web" in l]
+    kill = [i for i, l in enumerate(log) if "stack_progress.pid" in l and "kill" in l]
+    assert len(page) == 1 and kill and page[0] < kill[0] < gui[0]       # stopped before the GUI takes the port
+    assert (cfg / "stack_progress").read_text().startswith("stage=moveit\n")
+
 # ------------------------------------------------------------------ the image rebuild and the overlay
 def ur_repo(tmp_path, deps="h1"):
     """A ~/ur7e_robotiq with docker/deps_hash.sh (prints `deps`), a build.sh that only logs, and one package."""

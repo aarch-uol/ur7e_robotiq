@@ -90,7 +90,7 @@ ADMIN_COMMANDS = frozenset((
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
     "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN))
 # commands allowed while the one in control does not have their own settings in use (worksets.py)
-SWITCH_FREE = frozenset(("profile_activate",))
+SWITCH_FREE = frozenset(("profile_activate", "stack_stop"))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
 ACTIVITY_COMMANDS = {
     **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
@@ -366,8 +366,9 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 self.asking = None                        # answered by taking it (or a new holder: the question is gone)
             out = {**lease.view(), "token": lease.token}
         self._claim_settings(lease)
-        out["needs_switch"] = self._needs_switch()
-        out["settings_owner"] = self.worksets.active()
+        owner = self.worksets.active()
+        out["needs_switch"] = self._needs_switch(owner)
+        out["settings_owner"] = owner
         if not again:                                     # a holder taking again (page reload) is no news
             gift = bool(off and off["uid"] == uid)
             self._act("control", "took over control" if took_from else "took control", self._actor_of(lease),
@@ -433,7 +434,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             o = self.offer = None
         if a and not a["kept"] and not self.lease.token and not o:
             a = self.asking = None                        # the holder left: just take control
-        return {**self.lease.view(), "needs_switch": self._needs_switch(), "settings_owner": self.worksets.active(),
+        owner = self.worksets.active()
+        return {**self.lease.view(), "needs_switch": self._needs_switch(owner), "settings_owner": owner,
                 "ask": {"id": a["uid"], "name": a["name"], "kept": a["kept"], "age_s": round(now - a["at"], 1)} if a else None,
                 "offer": {"id": o["uid"], "name": o["name"]} if o else None}
 
@@ -500,6 +502,8 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
             raise CommandError(self._switch_refusal())
         args = dict(args or {})
         args.pop("local", None)                           # the server says where the browser is, never the page
+        if cmd == "record_delete":
+            args["_role"] = role                          # server-derived role; a browser cannot grant itself admin
         if local_only:
             args["local"] = bool(local)
         rev = args.pop("rev", None)
@@ -554,6 +558,9 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
                 self.core.last_refusal = msg
             self.core.bridge.log(("" if ok else "FAILED: ") + f"{cmd}: {msg}")
             self.results.append({"id": jid, "cmd": cmd, "ok": bool(ok), "msg": msg, "t": time.time()})
+            notify = getattr(self, "on_result", None)
+            if notify:
+                notify()
         self._jobs.submit(run)
         return {"ok": True, "job": jid, "msg": "started"}
 
@@ -744,6 +751,25 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         ok, msg = self.core.recorder.stop("stopped by the operator")
         return self._ok(msg)
     cmd_record_stop.read_only = True
+
+    def record_mcap(self, name=""):
+        return self.core.recorder.mcap_path(str(name or ""))
+
+    def cmd_record_delete(self, name="", _role="viewer"):
+        name = str(name or "")
+        rec = self.core.recorder
+        info = rec.record_info(name)
+        if info is None:
+            raise CommandError("recording not found")
+        owner = str(info.get("operator") or "").strip()
+        mine = str(self.lease.profile or "").strip()
+        if _role != "admin" and (not owner or owner.lower() != mine.lower()):
+            raise CommandError("only the recording owner or an Admin can delete it")
+        ok, msg = rec.delete_recording(name)
+        if not ok:
+            raise CommandError(msg)
+        self._act("record", "deleted recording", details=name)
+        return self._ok(msg)
 
     def cmd_speed_override(self, percent):
         ok, msg = self.core.set_speed_override(float(percent) / 100.0)
@@ -2384,9 +2410,13 @@ class WebService(WorkcellCommands, TeachCommands, BatchCommands, FlaskCommands):
         # the same picture as JPEG (image_transport's <topic>/compressed), where the driver offers it: the GUI passes
         # it to the browser as it is, no decoding or re-encoding, and far less data than the raw picture
         have = {t for t, _ in topics}
-        cams = [x for c in cams for x in ([c] + ([{**c, "name": c["name"] + " (compressed)", "topic": c["topic"] + "/compressed",
-                                                    "compressed": True}]
-                                                  if c["topic"] + "/compressed" in have and "depth" not in c["topic"] else []))]
+        ordered = []
+        for c in cams:
+            if c["topic"] + "/compressed" in have and "depth" not in c["topic"]:
+                ordered.append({**c, "name": c["name"] + " (compressed)",
+                                "topic": c["topic"] + "/compressed", "compressed": True})
+            ordered.append(c)
+        cams = ordered
         return self._ok(error=err, topics=[t for t, _ in topics],
                         cameras=[{**c, "publishers": b.topic_publishers(c["topic"])} for c in cams])
     cmd_camera_status.read_only = True

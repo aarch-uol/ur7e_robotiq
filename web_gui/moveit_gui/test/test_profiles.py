@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from moveit_gui import setups as setups_mod
 from moveit_gui.setups import Setups
 from moveit_gui.user_profiles import PREFS_MAX, ProfileError, Profiles
 from moveit_gui.web.service import CommandError
@@ -40,6 +41,46 @@ def test_profiles_create_find_list_delete(tmp_path):
     with pytest.raises(ProfileError, match="still has setups"):
         p.delete("Cenk")
     p.delete("Ayesha")
+    assert p.names() == ["Cenk"]
+
+
+def test_put_in_place_restores_live_settings_after_mid_copy_failure(tmp_path, monkeypatch):
+    cfg, src = tmp_path / "cfg", tmp_path / "incoming"
+    old_cal = cfg / "calibrations" / "ur7e_lab.yaml"
+    old_bias = cfg / "ft_bias" / "ur7e_lab.json"
+    new_cal = src / "calibrations" / "ur7e_lab.yaml"
+    new_bias = src / "ft_bias" / "ur7e_lab.json"
+    for pth, text in ((old_cal, "old calibration"), (old_bias, "old bias"),
+                      (new_cal, "new calibration"), (new_bias, "new bias")):
+        pth.parent.mkdir(parents=True, exist_ok=True)
+        pth.write_text(text)
+    (src / ".strict").write_text("")
+
+    original = setups_mod.shutil.copy2
+    failed = [False]
+
+    def fail_once(a, b, *args, **kwargs):
+        if not failed[0] and Path(a) == new_bias:
+            failed[0] = True
+            raise OSError("simulated copy failure")
+        return original(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(setups_mod.shutil, "copy2", fail_once)
+    with pytest.raises(OSError, match="simulated copy failure"):
+        setups_mod.put_in_place(cfg, "ur7e_lab", src)
+    assert old_cal.read_text() == "old calibration"
+    assert old_bias.read_text() == "old bias"
+    assert not list(cfg.glob(".settings-rollback-*"))
+
+
+def test_profiles_notice_external_directory_changes(tmp_path):
+    p = Profiles(tmp_path)
+    p.create("Cenk")
+    assert p.names() == ["Cenk"]
+    (p.dir / "Ayesha" / "setups").mkdir(parents=True)
+    assert p.names() == ["Ayesha", "Cenk"]
+    (p.dir / "Ayesha" / "setups").rmdir()
+    (p.dir / "Ayesha").rmdir()
     assert p.names() == ["Cenk"]
 
 
@@ -114,6 +155,37 @@ def test_setups_per_profile_in_use_marker_and_copy(env):
     assert run(s, "setup_preview", name="ayesha_scrape", owner="Ayesha")["changes"] == []
 
 
+def test_profile_switch_restores_old_owner_if_new_profile_save_fails(env, monkeypatch):
+    s, _, tmp = env
+    cfg = tmp / "cfg" / "moveit_gui"
+    box = cfg / "calibrations" / "ur7e_lab.keepout.yaml"
+    s.on_restart = lambda: None
+    for n in ("Cenk", "Ayesha"):
+        run(s, "profile_create", name=n)
+    as_(s, "Cenk")
+    as_(s, "Ayesha")
+    run(s, "profile_activate")
+    run(s, "keepout_save", name="her_box", frame="base_link", size_mm=[100, 100, 100],
+        xyz_mm=[500, 300, 200], rpy_deg=[0, 0, 0])
+    as_(s, "Cenk")
+    run(s, "profile_activate")
+    assert s.worksets.active() == "Cenk" and not box.exists()
+
+    original = s.worksets.save
+
+    def fail_new(name, *args, **kwargs):
+        if str(name).lower() == "ayesha":
+            raise OSError("simulated profile save failure")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(s.worksets, "save", fail_new)
+    as_(s, "Ayesha")
+    with pytest.raises(CommandError, match="could not switch settings"):
+        run(s, "profile_activate")
+    assert s.worksets.active() == "Cenk"
+    assert not box.exists()
+
+
 def test_a_keepout_box_stays_with_the_one_who_added_it(env):
     s, _, tmp = env
     cfg = tmp / "cfg" / "moveit_gui"
@@ -185,6 +257,20 @@ def test_profile_commands_need_no_control_but_delete_and_copy_do(env):
         s.command("me", "profile_delete", {"name": "Cenk"}, role="operator")
 
 
+def test_stack_stop_does_not_require_profile_settings_switch(env):
+    s, _, tmp = env
+    run(s, "profile_create", name="Cenk")
+    run(s, "profile_create", name="Ayesha")
+    as_(s, "Cenk")
+    as_(s, "Ayesha")
+    assert s.state()["lease"]["needs_switch"]
+    s.on_restart = lambda: None
+    out = run(s, "stack_stop", who="Ayesha")
+    assert "stopping" in out["msg"]
+    m = tmp / "cfg" / "moveit_gui" / "stack_off"
+    assert json.loads(m.read_text())["by"] == "Ayesha"
+
+
 def test_stack_stop_writes_the_marker_and_restarts(env):
     s, _, tmp = env
     with pytest.raises(CommandError, match="launcher"):
@@ -196,6 +282,8 @@ def test_stack_stop_writes_the_marker_and_restarts(env):
         run(s, "stack_stop", who="Cenk")
     s.core.busy = False
     run(s, "stack_stop", who="Cenk")
+    again = run(s, "stack_stop", who="Cenk")
+    assert "already stopping" in again["msg"]
     m = tmp / "cfg" / "moveit_gui" / "stack_off"
     assert json.loads(m.read_text())["by"] == "Cenk"
     assert wait(lambda: got == [RESTART_STACK], 3)
@@ -223,7 +311,7 @@ def test_the_start_page_removes_the_marker_and_exits_75(tmp_path):
                 break
             except OSError:
                 time.sleep(0.05)
-        assert "Start robot stack" in page and "Stopped by Cenk" in page
+        assert "Start robot" in page and "Stopped by Cenk at 17:00" in page
         with pytest.raises(urllib.error.HTTPError) as e:
             urllib.request.urlopen(url + "/api/info")
         assert e.value.code == 503 and json.loads(e.value.read())["stack"] == "stopped"
@@ -234,7 +322,16 @@ def test_the_start_page_removes_the_marker_and_exits_75(tmp_path):
         assert e.value.code == 403 and (cfg / "stack_off").exists()
         ok = urllib.request.Request(url + "/api/stack_start", data=b"{}", method="POST",
                                     headers={"Content-Type": "application/json"})
-        assert json.loads(urllib.request.urlopen(ok).read())["ok"]
+        first = json.loads(urllib.request.urlopen(ok).read())
+        assert first["ok"] and first["starting"]
+        again = urllib.request.Request(url + "/api/stack_start", data=b"{}", method="POST",
+                                       headers={"Content-Type": "application/json"})
+        second = json.loads(urllib.request.urlopen(again).read())
+        assert second["ok"] and second["starting"] and "already" in second["msg"].lower()
+        try:
+            urllib.request.urlopen(url + "/api/info")
+        except urllib.error.HTTPError as e:
+            assert e.code == 503 and json.loads(e.read())["stack"] == "starting"
         assert p.wait(5) == RESTART_STACK and not (cfg / "stack_off").exists()
     finally:
         if p.poll() is None:
@@ -275,3 +372,85 @@ def test_programs_per_profile(env):
             s.command(a, "program_open", {"name": bad, "owner": "Cenk"})
     with pytest.raises(CommandError, match="no profile"):
         s.command(a, "program_list", {"owner": "../etc"})
+
+
+def test_a_failed_first_switch_puts_the_settings_back(env, monkeypatch):
+    """Nobody's settings in use yet (from before profiles): a failed switch has no owner to load, so the snapshot
+    taken before the switch is put back."""
+    s, _, tmp = env
+    cfg = tmp / "cfg" / "moveit_gui"
+    box = cfg / "calibrations" / "ur7e_lab.keepout.yaml"
+    s.on_restart = lambda: None
+    run(s, "profile_create", name="Cenk")
+    as_(s, "Cenk")
+    run(s, "keepout_save", name="old_box", frame="base_link", size_mm=[100, 100, 100], xyz_mm=[500, 0, 200],
+        rpy_deg=[0, 0, 0])
+    run(s, "setup_save", name="with_old_box")                       # a shared setup
+    run(s, "keepout_save", name="new_box", frame="base_link", size_mm=[100, 100, 100], xyz_mm=[500, 300, 200],
+        rpy_deg=[0, 0, 0])
+    (cfg / "profiles" / "active.yaml").unlink(missing_ok=True)       # the settings from before profiles: no owner
+    before = box.read_text()
+    assert s.worksets.active() == "" and "new_box" in before
+
+    def fail(name):
+        raise OSError("simulated marker failure")
+    monkeypatch.setattr(s.worksets, "set_active", fail)
+    with pytest.raises(CommandError, match="could not switch settings"):
+        run(s, "profile_activate", start="setup", owner="", name="with_old_box")
+    assert box.read_text() == before and s.worksets.active() == ""
+    assert not list((cfg / "profiles").glob(".switch-*"))
+
+
+def test_two_restart_requests_at_once_restart_once(env):
+    s, _, _ = env
+    calls = []
+    s.on_restart = lambda: calls.append(1)
+    import threading as th
+    go, got = th.Barrier(8), []
+
+    def ask(i):
+        go.wait()
+        got.append(s._restart(RESTART_STACK if i % 2 else 76, f"t{i}"))
+    ts = [th.Thread(target=ask, args=(i,)) for i in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert got.count(True) == 1
+    assert wait(lambda: calls == [1], 3) and s.restart_code in (RESTART_STACK, 76)
+
+
+def test_the_progress_page_shows_how_far_the_start_is(tmp_path):
+    cfg = tmp_path / "moveit_gui"
+    cfg.mkdir()
+    (cfg / "stack_progress").write_text("stage=driver\nlog=launch_20261111_080000.log\n")
+    port = _free_port()
+    envv = dict(os.environ, XDG_CONFIG_HOME=str(tmp_path), PYTHONPATH=str(ROOT))
+    p = subprocess.Popen(["python3", "-m", "moveit_gui.web.idle", "--port", str(port), "--progress"], env=envv,
+                         cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        url = f"http://127.0.0.1:{port}"
+
+        def info():
+            with pytest.raises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(url + "/api/info")
+            return e.value.code, json.loads(e.value.read())
+        for _ in range(100):
+            try:
+                page = urllib.request.urlopen(url + "/").read().decode()
+                break
+            except OSError:
+                time.sleep(0.05)
+        assert 'id="st-driver"' in page and "initiallyStarting=true" in page
+        assert info() == (503, {"ok": False, "stack": "starting", "starting": True, "stage": "driver",
+                                "log": "launch_20261111_080000.log"})
+        (cfg / "stack_progress").write_text("stage=moveit\nlog=../../etc/passwd\n")
+        assert info()[1]["stage"] == "moveit" and "log" not in info()[1]
+        ok = urllib.request.Request(url + "/api/stack_start", data=b"{}", method="POST",
+                                    headers={"Content-Type": "application/json"})
+        assert "already" in json.loads(urllib.request.urlopen(ok).read())["msg"].lower()
+        p.terminate()
+        assert p.wait(5) == 0
+    finally:
+        if p.poll() is None:
+            p.kill()

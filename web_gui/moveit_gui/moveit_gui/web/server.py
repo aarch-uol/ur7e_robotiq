@@ -111,11 +111,40 @@ class Hub:
         self.period = 1.0 / hz
         self.cond = threading.Condition()
         self.version = 0
+        self.result_version = 0
         self.state_json = "{}"
+        self._camera_lock = threading.Lock()
+        self._camera_requests = {}                         # topic -> token -> (fps, width)
         self.running = True
         self._last_err = -1e9
+        self.service.on_result = self.wake
         self._thread = threading.Thread(target=self._loop, daemon=True, name="web-tick")
         self._thread.start()
+
+    def wake(self):
+        """A background job finished: wake SSE now instead of waiting for the next 10 Hz state tick."""
+        with self.cond:
+            self.result_version += 1
+            self.cond.notify_all()
+
+    def camera_request(self, topic, watch, fps, width):
+        token = object()
+        with self._camera_lock:
+            req = self._camera_requests.setdefault(topic, {})
+            req[token] = (float(fps), int(width))
+            watch.set_limits(max(v[0] for v in req.values()), max(v[1] for v in req.values()))
+        return token
+
+    def camera_release(self, topic, watch, token):
+        with self._camera_lock:
+            req = self._camera_requests.get(topic)
+            if not req:
+                return
+            req.pop(token, None)
+            if req:
+                watch.set_limits(max(v[0] for v in req.values()), max(v[1] for v in req.values()))
+            else:
+                self._camera_requests.pop(topic, None)
 
     def _loop(self):
         while self.running:
@@ -148,6 +177,7 @@ class Hub:
 
     def stop(self):
         self.running = False
+        self.service.on_result = None
         with self.cond:
             self.cond.notify_all()
 
@@ -293,6 +323,10 @@ def make_handler(hub: Hub, allow_hosts=()):
                     return self._camera(q.get("topic", [""])[0], q.get("q", ["low"])[0])
                 if path == "/api/robot_model":
                     return self._json(200, service.robot_model())
+                if path == "/api/record.mcap":
+                    q = parse_qs(url.query)
+                    file = service.record_mcap(q.get("name", [""])[0])
+                    return self._download(file) if file is not None else self._json(404, {"ok": False, "msg": "MCAP not found"})
                 if path.startswith("/mesh/"):
                     return self._mesh(unquote(path[len("/mesh/"):]))
                 self._json(404, {"ok": False, "msg": "not found"})
@@ -314,6 +348,21 @@ def make_handler(hub: Hub, allow_hosts=()):
                 self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
+
+        def _download(self, path: Path):
+            size = path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{path.name.replace(chr(34), "")}"')
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
 
         def _mesh(self, rest: str):
             """/mesh/<package>/<path>: a mesh or texture from that package's share directory, nothing else.
@@ -349,18 +398,23 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             self.close_connection = True
-            seen_version, log_seq = -1, 0
+            seen_version = hub.version if hub.state_json == "{}" else -1
+            seen_result, log_seq = (-1 if service.results else hub.result_version), 0
             if uid:                                           # this page's own public id (to find itself in "users")
                 self.wfile.write(f"event: hello\ndata: {json.dumps({'id': uid})}\n\n".encode())
                 self.wfile.flush()
-            res_id = max((r["id"] for r in service.results), default=0)
+            # Replay the small result history on reconnect. The browser ignores jobs it did not start, and this lets
+            # a command that finished during an SSE interruption resolve instead of leaving its button pending forever.
+            res_id = 0
             if service.logs:                                  # last lines of history on connect
                 log_seq = max(0, service.logs[-1][0] - 200)
             while hub.running:
                 with hub.cond:
-                    hub.cond.wait_for(lambda: hub.version != seen_version or not hub.running, timeout=5.0)
-                    seen_version, js = hub.version, hub.state_json
-                out = [f"event: state\ndata: {js}\n\n"]
+                    hub.cond.wait_for(lambda: hub.version != seen_version or hub.result_version != seen_result
+                                             or not hub.running, timeout=5.0)
+                    state_changed = hub.version != seen_version
+                    seen_version, seen_result, js = hub.version, hub.result_version, hub.state_json
+                out = [f"event: state\ndata: {js}\n\n"] if state_changed else []
                 logs = [[seq, line] for seq, line in list(service.logs) if seq > log_seq]
                 if logs:
                     log_seq = logs[-1][0]                      # the page dedupes by these sequence numbers
@@ -368,8 +422,9 @@ def make_handler(hub: Hub, allow_hosts=()):
                 for r in [r for r in list(service.results) if r["id"] > res_id]:
                     res_id = r["id"]
                     out.append(f"event: result\ndata: {json.dumps(r)}\n\n")
-                self.wfile.write("".join(out).encode())
-                self.wfile.flush()
+                if out:
+                    self.wfile.write("".join(out).encode())
+                    self.wfile.flush()
 
         def _camera(self, topic: str, quality: str = "low"):
             """One camera window: an MJPEG stream of one topic. Each topic has one subscription, shared by all
@@ -379,8 +434,8 @@ def make_handler(hub: Hub, allow_hosts=()):
             w, msg = bridge.open_image(topic) if topic else (None, "no topic")
             if w is None:
                 return self._json(404, {"ok": False, "msg": msg})
+            token = hub.camera_request(topic, w, fps, width)
             try:
-                w.set_limits(fps, width)                         # the last window to open on this topic sets it
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
                 self.send_header("Cache-Control", "no-store")
@@ -398,6 +453,7 @@ def make_handler(hub: Hub, allow_hosts=()):
                             self.wfile.flush()
                     time.sleep(1.0 / fps)
             finally:
+                hub.camera_release(topic, w, token)
                 bridge.close_image(topic)
 
         # -------------------------------------------------------------- POST

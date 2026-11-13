@@ -215,6 +215,20 @@ def test_a_recording_the_operator_started_is_left_alone(s):
     assert recording(s) is None
 
 
+def test_record_stop_step_propagates_finalization_failure(s, monkeypatch):
+    assert cmd(s, "record_start", preset="all")["ok"]
+    original = s.core.recorder.stop_and_wait
+
+    def fail_after_stop(reason, *args, **kwargs):
+        original(reason, *args, **kwargs)
+        return False, "recording finalization failed"
+
+    monkeypatch.setattr(s.core.recorder, "stop_and_wait", fail_after_stop)
+    ok, _msg = run(s, [{"type": "record_stop"}])
+    assert not ok
+    assert recording(s) is None
+
+
 def test_record_stop_then_start_again_makes_two_recordings(s):
     ok, msg = run(s, [{"type": "record_start", "note": "a"}, {"type": "wait", "seconds": 0.2}, {"type": "record_stop"},
                       {"type": "record_start", "note": "b"}, {"type": "wait", "seconds": 0.2}])

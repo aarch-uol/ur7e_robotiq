@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -10,7 +11,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from moveit_gui.core import RobotCore  # noqa: E402
 from moveit_gui.fake_bridge import FakeBridge  # noqa: E402
 from moveit_gui.profile import RobotProfile  # noqa: E402
+from moveit_gui import recorder as recorder_mod  # noqa: E402
 from moveit_gui.recorder import FakeBagProcess, Recorder, preset_topics  # noqa: E402
+from moveit_gui.web.server import Server  # noqa: E402
 from moveit_gui.web.service import CommandError, WebService  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -79,6 +82,7 @@ def test_start_stop_writes_a_bag_folder_with_metadata(tmp_path):
     assert (d / "bag" / "metadata.yaml").exists()
     meta = json.loads((d / "gui_meta.json").read_text())
     assert meta["ok"] and meta["reason"] == "done" and meta["topics"][0] == "/ft_data" and meta["size_mb"] > 0
+    assert "operator" in meta and "program" in meta and "timebase" in meta
     assert r.recent()[0]["name"] == live["name"]
 
 
@@ -105,11 +109,187 @@ def test_limits_and_disk_space_end_a_recording(tmp_path):
     assert not recorder(tmp_path, free=100).start()[0]              # refused when the disk is nearly full
 
 
+def test_storage_status_is_cached_and_uses_recording_thresholds(tmp_path):
+    free = [5000.0]
+    calls = []
+
+    def space():
+        calls.append(1)
+        return free[0]
+
+    r = recorder(tmp_path, free=space)
+    a = r.view()["storage"]
+    b = r.view()["storage"]
+    assert a["state"] == "healthy" and a["can_start"] and a["free_gb"] == 5.0
+    assert b == a and len(calls) == 1
+
+    r._free_at = 0
+    free[0] = 1500.0
+    low = r.view()["storage"]
+    assert low["state"] == "low" and not low["can_start"]
+
+    r._free_at = 0
+    free[0] = 500.0
+    critical = r.view()["storage"]
+    assert critical["state"] == "critical" and not critical["can_start"]
+
+
+def test_record_path_download_and_delete_are_confined_to_recording_root(tmp_path):
+    r = recorder(tmp_path)
+    assert r.start(name="safe")[0]
+    name = r.view()["recording"]["name"]
+    assert not r.delete_recording(name)[0]
+    assert r.mcap_path(name) is None                                      # never download a file still being written
+    assert r.stop_and_wait("done")[0]
+    mcap = r.mcap_path(name)
+    assert mcap is not None and mcap.suffix == ".mcap"
+    assert r.record_info(name)["name"] == name
+    assert r.mcap_path("../outside") is None
+    assert not r.delete_recording("../outside")[0]
+    assert r.delete_recording(name)[0]
+    assert r.record_info(name) is None
+
+
+def test_recent_surfaces_interrupted_folders_and_recovers_final_meta(tmp_path):
+    r = recorder(tmp_path)
+    r.root.mkdir(parents=True)
+
+    orphan = r.root / "20260102_030405_orphan"
+    (orphan / "bag").mkdir(parents=True)
+    (orphan / "bag" / "partial.mcap").write_bytes(b"partial")
+
+    stale = r.root / "20260103_040506_stale"
+    (stale / "bag").mkdir(parents=True)
+    (stale / "bag" / "partial.mcap").write_bytes(b"partial")
+    start = {"name": stale.name, "dir": str(stale), "started": 1.0, "topics": [], "size_mb": 0.1,
+             "duration_s": 0.0, "operator": "Ada", "program": "", "ok": None, "reason": "recording started"}
+    (stale / "gui_meta.json").write_text(json.dumps(start))
+    (stale / "meta.json").write_text(json.dumps(start))
+
+    repaired = r.root / "20260104_050607_repaired"
+    (repaired / "bag").mkdir(parents=True)
+    (repaired / "bag" / "done.mcap").write_bytes(b"done")
+    start2 = dict(start, name=repaired.name, dir=str(repaired), started=2.0)
+    final2 = dict(start2, ok=True, reason="done", duration_s=2.0)
+    (repaired / "gui_meta.json").write_text(json.dumps(start2))
+    (repaired / "meta.json").write_text(json.dumps(final2))
+
+    rows = {x["name"]: x for x in r.recent()}
+    assert rows[orphan.name]["ok"] is False and not rows[orphan.name]["mcap"]
+    assert "interrupted or incomplete" in rows[orphan.name]["reason"]
+    assert rows[stale.name]["ok"] is False and not rows[stale.name]["mcap"]
+    assert rows[repaired.name]["ok"] is True and rows[repaired.name]["mcap"]
+
+
 def test_nothing_published_is_refused(tmp_path):
     r = Recorder(tmp_path / "rec", "t", lambda: [], print, spawn=FakeBagProcess, free_mb=lambda p: 1e6,
                  settings_path=tmp_path / "s.json")
     ok, msg = r.start()
     assert not ok and "nothing to record" in msg
+
+
+def test_atomic_write_failure_keeps_previous_file_and_cleans_temp(tmp_path, monkeypatch):
+    path = tmp_path / "state.json"
+    path.write_bytes(b"old")
+
+    def fail(_src, _dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(recorder_mod.os, "replace", fail)
+    with pytest.raises(OSError, match="replace failed"):
+        recorder_mod._atomic_write(path, b"new")
+    assert path.read_bytes() == b"old"
+    assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+
+def test_configure_write_failure_keeps_previous_settings(tmp_path, monkeypatch):
+    r = recorder(tmp_path)
+    before = dict(r.settings)
+
+    def fail(_path, _data):
+        raise OSError("disk write failed")
+
+    monkeypatch.setattr(recorder_mod, "_atomic_write", fail)
+    ok, msg = r.configure(auto=True)
+    assert not ok and "could not save" in msg
+    assert r.settings == before
+
+
+def test_failed_spawn_does_not_leave_an_empty_recording_folder(tmp_path):
+    def fail(_out, _topics, log_path):
+        Path(log_path).touch()
+        raise OSError("spawn failed")
+
+    r = Recorder(tmp_path / "rec", "test", lambda: TOPICS, lambda _msg: None, spawn=fail,
+                 free_mb=lambda _p: 1e6, settings_path=tmp_path / "s.json")
+    ok, msg = r.start()
+    assert not ok and "could not start" in msg
+    assert list((tmp_path / "rec").iterdir()) == []
+
+
+def test_nonzero_recorder_exit_is_not_reported_as_saved(tmp_path):
+    class BadExit(FakeBagProcess):
+        def wait(self, timeout=None):
+            super().wait(timeout)
+            self.returncode = 7
+            return self.returncode
+
+    r = Recorder(tmp_path / "rec", "test", lambda: TOPICS, lambda _msg: None, spawn=BadExit,
+                 free_mb=lambda _p: 1e6, settings_path=tmp_path / "s.json")
+    assert r.start()[0]
+    ok, msg = r.stop_and_wait("done")
+    assert not ok and "exit code 7" in msg
+    assert r.last["ok"] is False
+    assert Path(r.last["dir"], "bag", "metadata.yaml").is_file()
+
+
+def test_stop_and_wait_waits_for_final_metadata(tmp_path, monkeypatch):
+    r = recorder(tmp_path)
+    assert r.start()[0]
+    original = r._write_meta
+
+    def slow(cur, ended, reason, ok=None):
+        if ended is not None:
+            time.sleep(0.15)
+        return original(cur, ended, reason, ok)
+
+    monkeypatch.setattr(r, "_write_meta", slow)
+    t0 = time.monotonic()
+    ok, _ = r.stop_and_wait("done")
+    assert ok
+    assert time.monotonic() - t0 >= 0.14
+    assert not r.recording and r.last["ok"] is True
+
+
+def test_metadata_write_failure_makes_finalization_fail(tmp_path, monkeypatch):
+    r = recorder(tmp_path)
+    assert r.start()[0]
+
+    def fail(_path, _data):
+        raise OSError("metadata disk error")
+
+    monkeypatch.setattr(recorder_mod, "_atomic_write", fail)
+    ok, msg = r.stop_and_wait("done")
+    assert not ok and "metadata save failed" in msg
+    assert not r.recording and r.last["ok"] is False
+
+
+def test_disk_probe_failure_stops_recording(tmp_path):
+    calls = 0
+
+    def free():
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise OSError("disk disappeared")
+        return 5000.0
+
+    r = recorder(tmp_path, free=free)
+    assert r.start()[0]
+    r._cur["_size_t"] = 0
+    r.poll()
+    assert wait(lambda: not r.recording, 5)
+    assert "cannot check disk space" in r.last["reason"]
 
 
 # ------------------------------------------------------------------ web service + auto-record
@@ -149,6 +329,43 @@ def test_web_commands_and_state(s, tmp_path):
     assert s.state()["record"]["last"]["ok"]
     with pytest.raises(CommandError, match="60 characters"):
         cmd(s, "record_start", name="x" * 61)
+
+
+def test_record_delete_needs_owner_or_admin_and_download_streams_mcap(s):
+    import urllib.parse
+    import urllib.request
+
+    s.core.operator = lambda: "Ada"
+    ok, _ = s.core.record_start(name="owned")
+    assert ok
+    name = s.core.recorder.view()["recording"]["name"]
+    time.sleep(0.1)
+    assert s.core.recorder.stop_and_wait("done")[0]
+
+    token = s.lease.token
+    s.lease.profile = "Bob"
+    with pytest.raises(CommandError, match="owner or an Admin"):
+        s.command(token, "record_delete", {"name": name}, role="operator")
+
+    srv = Server(s, "127.0.0.1", 0).start()
+    try:
+        url = f"http://127.0.0.1:{srv.port}/api/record.mcap?name=" + urllib.parse.quote(name)
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            body = resp.read()
+            assert body and resp.headers["Content-Disposition"].startswith("attachment;")
+    finally:
+        srv.stop()
+
+    s.lease.profile = "Ada"
+    assert s.command(token, "record_delete", {"name": name}, role="operator")["ok"]
+    assert s.core.recorder.record_info(name) is None
+
+    s.core.operator = lambda: "Ada"
+    assert s.core.record_start(name="admin-owned")[0]
+    admin_name = s.core.recorder.view()["recording"]["name"]
+    assert s.core.recorder.stop_and_wait("done")[0]
+    s.lease.profile = "Bob"
+    assert s.command(token, "record_delete", {"name": admin_name}, role="admin")["ok"]
 
 
 def test_stop_does_not_end_a_recording(s):

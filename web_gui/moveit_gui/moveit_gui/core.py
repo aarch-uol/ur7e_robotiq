@@ -32,7 +32,7 @@ from .policy_executor import PolicyExecutor
 from .profile import RobotProfile, reorder_joints
 from .batch import BatchRunner
 from .program import ProgramHooks, ProgramRunner, RunState
-from .recorder import NAME_RE, FakeBagProcess, Recorder
+from .recorder import MIN_FREE_MB, NAME_RE, FakeBagProcess, Recorder, _atomic_write
 from .ft_bias import FtBias
 from .ft_guard import FtGuard
 from .gains import Gains
@@ -237,12 +237,14 @@ class RobotCore:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         tag = NAME_RE.sub("_", (label or "photo").strip())[:60].strip("_") or "photo"
         try:
+            if self.recorder.free_mb(self.recorder.root.parent) < MIN_FREE_MB / 2:
+                return False, f"cannot save the photo: less than {MIN_FREE_MB / 2:.0f} MB free"
             folder.mkdir(parents=True, exist_ok=True)
             path, n = folder / f"{stamp}_{tag}.jpg", 1
             while path.exists():
                 n += 1
                 path = folder / f"{stamp}_{tag}~{n}.jpg"
-            path.write_bytes(jpeg)
+            _atomic_write(path, jpeg)
         except OSError as e:
             return False, f"cannot save the photo in {folder}: {e}"
         return True, f"photo saved: {path}"
@@ -1210,8 +1212,7 @@ class _CoreProgramHooks(ProgramHooks):
 
     def record_stop(self, reason, wait=False):
         if wait:
-            self.core.recorder.stop_and_wait(reason)
-            return True, "recording finished"
+            return self.core.recorder.stop_and_wait(reason)
         return self.core.recorder.stop(reason)
 
     def recording(self):
